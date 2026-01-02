@@ -1,0 +1,99 @@
+<robot name="chain_3">
+  <link name="link_0">
+    <inertial>
+      <mass value="1.552"/>
+      <inertia ixx="0.0155" ixy="0" ixz="0" iyy="0.0155" iyz="0" izz="0.0155"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+      <box size="0.100 0.092 0.074"/>
+      </geometry>
+      <material name="gray"><color rgba="0.7 0.7 0.7 1"/></material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+      <box size="0.100 0.092 0.074"/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="link_1">
+    <inertial>
+      <mass value="1.206"/>
+      <inertia ixx="0.0121" ixy="0" ixz="0" iyy="0.0121" iyz="0" izz="0.0121"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+      <cylinder radius="0.078" length="0.271"/>
+      </geometry>
+      <material name="gray"><color rgba="0.7 0.7 0.7 1"/></material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+      <cylinder radius="0.078" length="0.271"/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="link_2">
+    <inertial>
+      <mass value="0.974"/>
+      <inertia ixx="0.0097" ixy="0" ixz="0" iyy="0.0097" iyz="0" izz="0.0097"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+      <box size="0.192 0.059 0.045"/>
+      </geometry>
+      <material name="gray"><color rgba="0.7 0.7 0.7 1"/></material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+      <box size="0.192 0.059 0.045"/>
+      </geometry>
+    </collision>
+  </link>
+  <link name="link_3">
+    <inertial>
+      <mass value="1.118"/>
+      <inertia ixx="0.0112" ixy="0" ixz="0" iyy="0.0112" iyz="0" izz="0.0112"/>
+    </inertial>
+    <visual>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+      <cylinder radius="0.028" length="0.256"/>
+      </geometry>
+      <material name="gray"><color rgba="0.7 0.7 0.7 1"/></material>
+    </visual>
+    <collision>
+      <origin xyz="0 0 0" rpy="0 0 0"/>
+      <geometry>
+      <cylinder radius="0.028" length="0.256"/>
+      </geometry>
+    </collision>
+  </link>
+  <joint name="joint_0" type="revolute">
+    <parent link="link_0"/>
+    <child link="link_1"/>
+    <origin xyz="0.205 0.000 0.000" rpy="0.000 0.000 0.000"/>
+    <axis xyz="-0.7230 -0.6843 -0.0947"/>
+    <limit lower="-3.1416" upper="3.1416" effort="5" velocity="5"/>
+  </joint>
+  <joint name="joint_1" type="revolute">
+    <parent link="link_1"/>
+    <child link="link_2"/>
+    <origin xyz="0.251 0.000 0.000" rpy="0.000 0.000 0.000"/>
+    <axis xyz="0.5730 0.5954 0.5632"/>
+    <limit lower="-3.1416" upper="3.1416" effort="5" velocity="5"/>
+  </joint>
+  <joint name="joint_2" type="revolute">
+    <parent link="link_2"/>
+    <child link="link_3"/>
+    <origin xyz="0.244 0.000 0.000" rpy="0.000 0.000 0.000"/>
+    <axis xyz="-0.4816 0.2850 -0.8288"/>
+    <limit lower="-3.1416" upper="3.1416" effort="5" velocity="5"/>
+  </joint>
+</robot>
