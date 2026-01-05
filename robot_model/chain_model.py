@@ -112,9 +112,45 @@ def _parse_meshes_from_urdf(urdf_path: str, device: torch.device) -> Dict[str, t
         else:
             continue
 
+        origin = visual.find('origin')
+        if origin is not None and origin.get('xyz') is not None:
+            ox, oy, oz = map(float, origin.get('xyz').split())
+            trans = trimesh.transformations.translation_matrix([ox, oy, oz])
+            mesh.apply_transform(trans)
+
         meshes[name] = mesh
     return meshes
 
+
+def _parse_joint_axes_from_urdf(urdf_path: str, device: torch.device) -> List[Dict[str, torch.Tensor]]:
+    """Collect joint axis vectors and their child links from URDF."""
+    tree = ET.parse(urdf_path)
+    root = tree.getroot()
+
+    joints: List[Dict[str, torch.Tensor]] = []
+    for joint in root.findall('joint'):
+        joint_type = joint.get('type', '')
+        if joint_type not in ('revolute', 'continuous', 'prismatic'):
+            continue
+
+        axis_el = joint.find('axis')
+        if axis_el is not None and axis_el.get('xyz') is not None:
+            axis = np.fromstring(axis_el.get('xyz'), sep=' ', dtype=float)
+        else:
+            axis = np.array([1.0, 0.0, 0.0], dtype=float)
+            print(f"Warning: Joint '{joint.get('name')}' has no axis specified; defaulting to [1,0,0].")
+
+        child_el = joint.find('child')
+        if child_el is None:
+            continue
+        child_name = child_el.get('link')
+        joints.append({
+            'name': joint.get('name', child_name),
+            'child': child_name,
+            'axis': torch.as_tensor(axis, dtype=torch.float32, device=device),
+        })
+
+    return joints
 
 class ChainModel:
     def __init__(
@@ -131,6 +167,7 @@ class ChainModel:
         self.dof = len(self.pk_chain.get_joint_parameter_names())
 
         self.meshes = _parse_meshes_from_urdf(self.urdf_path, device)
+        self.joint_axes = _parse_joint_axes_from_urdf(self.urdf_path, device)
         self.link_points = self._sample_rest_pose_points(self.meshes, samples_per_link)
         self.frame_status = None
 
@@ -190,14 +227,51 @@ class ChainModel:
         return pc
 
     # Mesh export
-    def get_trimesh_q(self, idx: int) -> trimesh.Trimesh:
-        scene = trimesh.Scene()
+    def get_trimesh_q(self, idx: int, boolean_merged: bool=True) -> trimesh.Trimesh:
+        """Return mesh for configuration ``idx``; optionally boolean-merge to avoid overlaps."""
+        transformed_meshes = []
         for link_name, mesh in self.meshes.items():
             tf = self.frame_status[link_name].get_matrix()[idx].cpu().numpy()
-            scene.add_geometry(mesh, transform=tf)
+            m = mesh.copy()
+            m.apply_transform(tf)
+            transformed_meshes.append(m)
+        if boolean_merged:
+            try:
+                merged = trimesh.boolean.union(transformed_meshes)
+                if merged is not None:
+                    return merged
+            except Exception as exc:
+                print(f"[get_trimesh_q] boolean union failed, falling back to concat: {exc}")
 
-        combined = trimesh.util.concatenate(scene.dump())
-        return combined
+        return trimesh.util.concatenate(transformed_meshes)
+
+    def get_joint_axes_world(self, axis_length: float = 0.08) -> List[Dict[str, torch.Tensor]]:
+        """Return world-frame joint axes for the current configuration.
+
+        Call ``update_status`` before this to ensure ``frame_status`` is valid.
+        """
+        if self.frame_status is None:
+            raise RuntimeError('Call update_status() before requesting joint axes.')
+
+        axes_world: List[Dict[str, torch.Tensor]] = []
+        for joint in self.joint_axes:
+            child_name = joint['child']
+            tf = self.frame_status[child_name].get_matrix()  # (B,4,4)
+            rot = tf[:, :3, :3]
+            pos = tf[:, :3, 3]
+
+            axis_local = joint['axis'].to(self.device).view(1, 3, 1).expand(tf.shape[0], -1, -1)
+            axis_world = torch.matmul(rot, axis_local).squeeze(-1)
+            axis_world = axis_world / torch.linalg.norm(axis_world, dim=1, keepdim=True).clamp_min(1e-8)
+
+            axes_world.append({
+                'name': joint['name'],
+                'start': pos,
+                'direction': axis_world,
+                'length': float(axis_length),
+            })
+
+        return axes_world
 
 
 def visualize_chain_pc(
@@ -205,6 +279,8 @@ def visualize_chain_pc(
         link_names: List[str],
         point_size: float = 0.003,
         mesh: trimesh.Trimesh = None,
+        joint_axes: Optional[List[Dict[str, torch.Tensor]]] = None,
+        axis_radius: float = 0.003,
         host: str = '127.0.0.1',
         port: int = 9100,
     ) -> viser.ViserServer:
@@ -237,20 +313,90 @@ def visualize_chain_pc(
             faces=faces,
             color=(0.7, 0.7, 0.9),
             )
+
+    if joint_axes is not None:
+        for j_idx, joint in enumerate(joint_axes):
+            start = joint['start'][0]
+            direction = joint['direction'][0]
+            direction = direction / direction.norm().clamp_min(1e-8)
+
+            # Build an orientation whose X-axis aligns with the joint axis.
+            up = torch.tensor([0.0, 0.0, 1.0], device=direction.device)
+            if torch.abs(torch.dot(direction, up)) > 0.95:
+                up = torch.tensor([0.0, 1.0, 0.0], device=direction.device)
+            y_axis = torch.cross(up, direction)
+            y_axis = y_axis / y_axis.norm().clamp_min(1e-8)
+            z_axis = torch.cross(direction, y_axis)
+            rot = torch.stack([direction, y_axis, z_axis], dim=1)  # columns
+            quat = matrix_to_quaternion(rot.unsqueeze(0)).squeeze(0)
+
+            server.scene.add_frame(
+                f'joint_axis_{j_idx}_{joint["name"]}',
+                position=start.detach().cpu().numpy(),
+                wxyz=quat.detach().cpu().numpy(),
+                show_axes=['x'],
+                axes_length=float(joint['length']),
+                axes_radius=axis_radius,
+            )
     return server
 
+def generate_linkage_datasets(
+        urdf_path: str | Path,
+        data_save_dir: str | Path,
+        B: int = 10,
+        visualize: bool = False,
+    ) -> Tuple[torch.Tensor, trimesh.Trimesh]:
+    """Generate point cloud dataset for a chain model defined by the URDF.
 
-if __name__ == '__main__':
-    urdf_path = "out_chains/chain_0.urdf"
+    Returns:
+        pc: (B, N, 4) point clouds with link indices in last channel.
+        merged_mesh: boolean-merged trimesh of the entire chain at rest pose.
+    """
     model = ChainModel(
         urdf_path,
         samples_per_link=256,
     )
-    q_sample = model.sample_q(B=1)
+    q_sample = model.sample_q(B=B)
+    # q_sample = torch.zeros_like(q_sample)  # all zeros for testing
     link_names = list(model.link_points.keys())
     
     model.update_status(q_sample)
-    chain_pc = model.get_transformed_links_pc(None, num_points=256)
-    chain_mesh = model.get_trimesh_q(0)
+    meshes = []
+    for b in range(B):
+        meshes.append(model.get_trimesh_q(b, boolean_merged=True))
+        if visualize:
+            joint_axes = model.get_joint_axes_world(axis_length=0.06)
+            chain_pc = model.get_transformed_links_pc(None, num_points=256)
+            server = visualize_chain_pc(
+                chain_pc,
+                link_names,
+                mesh=meshes[-1],
+                joint_axes=joint_axes,
+                host='127.0.0.1',
+                port=9100,
+            )
+    
+    for idx, mesh in enumerate(meshes):
+        mesh.export(Path(data_save_dir) / f"{Path(urdf_path).stem}_{idx}.obj")
+    np.savez(
+        Path(data_save_dir) / f"{Path(urdf_path).stem}_q.npz",
+        q=q_sample.cpu().numpy(),
+    )
 
-    server = visualize_chain_pc(chain_pc, link_names, mesh=chain_mesh, host='127.0.0.1', port=9100)
+    
+
+if __name__ == '__main__':
+    urdf_dir = "data/out_chains/"
+    data_save_dir = "data/chain_meshes/"
+    Path(data_save_dir).mkdir(parents=True, exist_ok=True)
+    num_links = 1100
+    num_configs = 100
+    for i in range(num_links):
+        urdf_path = Path(urdf_dir) / f"chain_{i}.urdf"
+        generate_linkage_datasets(
+            urdf_path,
+            data_save_dir,
+            B=num_configs,
+            visualize=False,
+        )
+        print(f"Saved chain {i} data to {data_save_dir}")
