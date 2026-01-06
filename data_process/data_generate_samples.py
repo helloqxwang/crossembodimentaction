@@ -180,7 +180,6 @@ def generate_samples(args, datadir, dest, instances, pid=None):
             
     iprint("Done.")
 
-
 def main(args):
     """Launch the (parallel) generation of data samples."""
     np.random.seed(args.seed)
@@ -216,7 +215,6 @@ def main(args):
             p.join()
 
     print(f"Results saved in {dest}")
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate data samples for meshes.")
