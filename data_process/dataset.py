@@ -111,24 +111,34 @@ class SDFSamples(torch.utils.data.Dataset):
         self.data_source = data_source
 
         self.npzfiles = []
+        self.chain_qs = []
+        self.chain_properties_z = []
 
         for class_idx in indices:
-            for intance_idx in range(num_instances):
+            chain_qs = np.load(os.path.join(
+                data_source, f'chain_meshes',
+                f"chain_{class_idx}_q.npz",))['q']
+            chain_properties = np.load(os.path.join(
+                data_source, f'out_chains',
+                f"chain_{class_idx}_properties.npz"), allow_pickle=True)
+            self.chain_qs.append(chain_qs)
+            self.chain_properties_z.append(chain_properties)
+            for instance_idx in range(num_instances):
                 filename = os.path.join(
-                    data_source,
-                    f'chain_{class_idx}_{intance_idx}',
+                    data_source,'chain_samples',
+                    f'chain_{class_idx}_{instance_idx}',
                     f"deepsdf.npz",
                 )
                 if not os.path.isfile(filename):
                     continue
                     raise FileNotFoundError(filename)
-                self.npzfiles.append(filename)
+                self.npzfiles.append((filename, class_idx, instance_idx))
 
         self.load_ram = load_ram
 
         if load_ram:
             self.loaded_data = []
-            for filename in tqdm(self.npzfiles):
+            for filename, class_idx, instance_idx in tqdm(self.npzfiles):
                 npz = np.load(filename)
                 pos_tensor = remove_nans(torch.from_numpy(npz["pos"]))
                 neg_tensor = remove_nans(torch.from_numpy(npz["neg"]))
@@ -143,41 +153,136 @@ class SDFSamples(torch.utils.data.Dataset):
         return len(self.npzfiles)
 
     def __getitem__(self, idx):
-        filename = self.npzfiles[idx]
-        if self.load_ram:
-            return (
-                unpack_sdf_samples_from_ram(self.loaded_data[idx], self.subsample),
-                idx,
-            )
-        else:
-            return unpack_sdf_samples(filename, self.subsample), idx
+        filename, class_idx, instance_idx = self.npzfiles[idx]
+        sdf = unpack_sdf_samples_from_ram(self.loaded_data[idx], self.subsample) if self.load_ram else unpack_sdf_samples(filename, self.subsample), # Torch.Tensor
+        q = torch.tensor(self.chain_qs[class_idx][instance_idx]).float()
+        link_features = torch.tensor(self.chain_properties_z[class_idx]['links_property']).float()
+        joint_features = torch.tensor(self.chain_properties_z[class_idx]['joints_property']).float()
+        
+        link_bps_info = self.chain_properties_z[class_idx]['bpses']
+        link_bps_scdistances = [np.concatenate([np.array((bp_info['scale_to_unit'], )), bp_info['distances']]) for bp_info in link_bps_info]
+        link_bps_scdistances = torch.tensor(np.stack(link_bps_scdistances, axis=0)).float()
+        return {
+            'sdf_samples': sdf[0], # Torch.Tensor of shape (subsample, 4)
+            'chain_q': q, # Torch.Tensor of shape (num_links m - 1, )
+            'link_features': link_features, # Torch.Tensor of shape (num_links m, 4)
+            'joint_features': joint_features, # Torch.Tensor of shape (num_links m - 1, 9)
+            'link_bps_scdistances': link_bps_scdistances, # Torch.Tensor of shape (num_links m, 257)
+            'class_idx': class_idx, # scalar int
+            'instance_idx': instance_idx, # scalar int
+        }
+
+def make_collate_fn(max_num_links: int):
+    def collate_fn(batch):
+        B = len(batch)
+        # infer shapes
+        sdf_shape = batch[0]["sdf_samples"].shape  # (subsample, 4)
+        link_feat_dim = batch[0]["link_features"].shape[-1]          # 4
+        joint_feat_dim = batch[0]["joint_features"].shape[-1]        # 9
+        bps_dim = batch[0]["link_bps_scdistances"].shape[-1]         # 257
+
+        # allocate
+        sdf_samples = torch.stack([b["sdf_samples"] for b in batch], dim=0)
+        chain_q = torch.zeros(B, max_num_links - 1, dtype=torch.float32)
+        link_features = torch.zeros(B, max_num_links, link_feat_dim, dtype=torch.float32)
+        joint_features = torch.zeros(B, max_num_links - 1, joint_feat_dim, dtype=torch.float32)
+        link_bps = torch.zeros(B, max_num_links, bps_dim, dtype=torch.float32)
+
+        masks = torch.zeros(B, 3 * max_num_links - 2, dtype=torch.bool)
+
+        class_idx = []
+        instance_idx = []
+
+        for i, b in enumerate(batch):
+            n_links = b["link_features"].shape[0]
+            if n_links > max_num_links:
+                raise ValueError(f"n_links {n_links} exceeds max_num_links {max_num_links}")
+            n_joints = n_links - 1
+
+            chain_q[i, :n_joints] = b["chain_q"]
+            link_features[i, :n_links] = b["link_features"]
+            joint_features[i, :n_joints] = b["joint_features"]
+            link_bps[i, :n_links] = b["link_bps_scdistances"]
+
+            masks[i, :3 * n_links - 2] = True
+
+            class_idx.append(b["class_idx"])
+            instance_idx.append(b["instance_idx"])
+
+        return {
+            "sdf_samples": sdf_samples,                 # (B, subsample, 4)
+            "chain_q": chain_q,                         # (B, max_num_links-1)
+            "link_features": link_features,             # (B, max_num_links, 4)
+            "joint_features": joint_features,           # (B, max_num_links-1, 9)
+            "link_bps_scdistances": link_bps,           # (B, max_num_links, 257)
+            "class_idx": class_idx,                     # list of scalars
+            "instance_idx": instance_idx,               # list of scalars
+            "mask": masks,                               # (B, 3*max_num_links-2)
+        }
+    return collate_fn
+
+
+def get_dataloader(
+    data_source: str,
+    indices,
+    num_instances: int,
+    subsample: int,
+    batch_size: int,
+    max_num_links: int,
+    load_ram: bool = False,
+    shuffle: bool = True,
+    num_workers: int = 0,
+    drop_last: bool = True,
+):
+    dataset = SDFSamples(
+        data_source=data_source,
+        indices=indices,
+        num_instances=num_instances,
+        subsample=subsample,
+        load_ram=load_ram,
+    )
+    collate_fn = make_collate_fn(max_num_links)
+    loader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        drop_last=drop_last,
+        collate_fn=collate_fn,
+    )
+    return loader
 
 if __name__ == "__main__":
     ### Test the dataset loading.
-    data_source = "./data/chain_samples/"
+    data_source = "./data/"
     indices = list(range(100))
     num_instances = 100
     subsample = 16384
-    dataset = SDFSamples(
-        data_source,
-        indices,
-        num_instances,
-        subsample,
-        load_ram=False,
-    )
-    print(f"Dataset size: {len(dataset)}")
-    a = dataset[0]
-    print(f"Sample shape: {a[0].shape}, index: {a[1]}")
+    batch_size = 64
+    max_num_links = 5
+    num_workers = 0
 
-    sdf_loader = torch.utils.data.DataLoader(
-        dataset,
-        batch_size= 64,
+    loader = get_dataloader(
+        data_source=data_source,
+        indices=indices,
+        num_instances=num_instances,
+        subsample=subsample,
+        batch_size=batch_size,
+        max_num_links=max_num_links,
+        load_ram=False,
         shuffle=True,
-        num_workers=8,
+        num_workers=num_workers,
         drop_last=True,
     )
-    for i, data in enumerate(tqdm(sdf_loader)):
-        samples, indices = data
-        print(f"Batch {i}: samples shape: {samples.shape}, indices: {indices}")
-    
+
+    print(f"Dataset size: {len(loader.dataset)}")
+    for i, batch in enumerate(tqdm(loader)):
+        print("Batch keys:", batch.keys())
+        print("sdf_samples:", batch["sdf_samples"].shape)
+        print("chain_q:", batch["chain_q"].shape)
+        print("link_features:", batch["link_features"].shape)
+        print("joint_features:", batch["joint_features"].shape)
+        print("link_bps_scdistances:", batch["link_bps_scdistances"].shape)
+        print("mask:", batch["mask"].shape)
+
     print("Done")
