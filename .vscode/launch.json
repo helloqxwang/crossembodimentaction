@@ -42,7 +42,7 @@
             ]
         },
         {
-            "name": "train_sdf",
+            "name": "Train_sdf",
             "type": "debugpy",
             "request": "launch",
             "program": "${workspaceFolder}/train_sdf.py",

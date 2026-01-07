@@ -1,8 +1,10 @@
 from typing import Dict, Tuple
+import os
 
 import wandb
 import hydra
 import torch
+from tqdm import tqdm
 from hydra.utils import to_absolute_path
 from omegaconf import DictConfig
 
@@ -173,8 +175,9 @@ def main(cfg: DictConfig) -> None:
     torch.manual_seed(0)
 
     lr = getattr(cfg.training, "lr", 1e-4)
-    num_epochs = getattr(cfg.training, "num_epochs", 1)
+    num_epochs = int(getattr(cfg.training, "num_epochs", 1e8))
     use_wandb = getattr(cfg.training, "wandb", {}).get("enabled", False)
+    save_interval = getattr(cfg.training, "save_interval", 50)
 
     indices = list(range(cfg.data.indices.start, cfg.data.indices.end))
     val_indices = list(range(cfg.data.val_indices.start, cfg.data.val_indices.end))
@@ -202,15 +205,19 @@ def main(cfg: DictConfig) -> None:
         max_num_links=cfg.data.max_num_links,
         load_ram=cfg.data.load_ram,
         shuffle=False,
-        num_workers=cfg.data.num_workers,
+        num_workers=0,
         drop_last=False,
     )
+    val_iter = iter(val_loader)
 
     models = build_models(cfg, device)
     optimizer = torch.optim.Adam(
         [p for m in models.values() for p in m.parameters()], lr=lr
     )
     loss_fn = torch.nn.L1Loss()
+
+    save_dir = os.path.join(cfg.training.wandb.save_dir, cfg.training.wandb.run_name)
+    os.makedirs(save_dir, exist_ok=True)
 
     if use_wandb:
         wandb.init(
@@ -222,7 +229,7 @@ def main(cfg: DictConfig) -> None:
     global_step = 0
 
     for epoch in range(num_epochs):
-        for batch in sdf_loader:
+        for batch in tqdm(sdf_loader, desc=f"Epoch {epoch+1}/{num_epochs}"):
             optimizer.zero_grad()
             latent, sdf_pred = inference(batch, models, device=device)
             sdf_gt = batch["sdf_samples"].to(device)[..., 3].unsqueeze(-1)
@@ -236,15 +243,33 @@ def main(cfg: DictConfig) -> None:
 
         print(f"Epoch {epoch+1}/{num_epochs} loss: {loss.item():.4f}")
 
-        # single-batch validation per epoch
+        # single validation batch per epoch, cycling through the loader
         with torch.no_grad():
-            val_batch = next(iter(val_loader))
+            try:
+                val_batch = next(val_iter)
+            except StopIteration:
+                val_iter = iter(val_loader)
+                val_batch = next(val_iter)
             _, val_pred = inference(val_batch, models, device=device)
             val_gt = val_batch["sdf_samples"].to(device)[..., 3].unsqueeze(-1)
             val_loss = loss_fn(val_pred, val_gt).item()
+
         print(f"Validation loss: {val_loss:.4f}")
         if use_wandb:
             wandb.log({"val/loss": val_loss, "epoch": epoch})
+
+        if (epoch + 1) % save_interval == 0:
+            ckpt_path = os.path.join(save_dir, f"epoch_{epoch+1}.pth")
+            torch.save(
+                {
+                    "epoch": epoch + 1,
+                    "models": {k: m.state_dict() for k, m in models.items()},
+                    "optimizer": optimizer.state_dict(),
+                    "config": dict(cfg),
+                },
+                ckpt_path,
+            )
+            print(f"Saved checkpoint to {ckpt_path}")
 
     if use_wandb:
         wandb.finish()

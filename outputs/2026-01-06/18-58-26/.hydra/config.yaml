@@ -1,6 +1,3 @@
-defaults:
-  - _self_
-
 data:
   data_source: ./data/
   indices:
@@ -18,26 +15,30 @@ data:
   shuffle: true
   num_workers: 8
   drop_last: true
-
 models:
   joint_encoder:
     input_dim: 9
     output_dim: 128
-    hidden_dims: [128, 128]
+    hidden_dims:
+    - 128
+    - 128
     activation: gelu
     dropout: 0.0
     use_layer_norm: false
   link_encoder:
     input_dim: 257
     output_dim: 128
-    hidden_dims: [256, 256]
+    hidden_dims:
+    - 256
+    - 256
     activation: gelu
     dropout: 0.0
     use_layer_norm: false
   joint_value_encoder:
     embed_dim: 128
     use_positional: true
-    mlp_hidden: [128]
+    mlp_hidden:
+    - 128
     activation: gelu
     dropout: 0.0
     use_layer_norm: false
@@ -57,22 +58,46 @@ models:
     final_layer_norm: true
   decoder:
     latent_size: 128
-    dims: [512, 512, 512, 512, 512, 512, 512, 512]
-    dropout: [0, 1, 2, 3, 4, 5, 6, 7]
+    dims:
+    - 512
+    - 512
+    - 512
+    - 512
+    - 512
+    - 512
+    - 512
+    - 512
+    dropout:
+    - 0
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+    - 6
+    - 7
     dropout_prob: 0.2
-    norm_layers: [0, 1, 2, 3, 4, 5, 6, 7]
-    latent_in: [4]
+    norm_layers:
+    - 0
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+    - 6
+    - 7
+    latent_in:
+    - 4
     xyz_in_all: false
     use_tanh: false
     latent_dropout: false
     weight_norm: true
-
 training:
   device: cuda
   dtype: float32
   debug_batch: true
-  lr: 1e-4
-  num_epochs: 1e8
+  lr: 0.0001
+  num_epochs: 100000000.0
   wandb:
     enabled: true
     project: action_repr

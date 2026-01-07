@@ -112,21 +112,26 @@ class SDFSamples(torch.utils.data.Dataset):
 
         self.npzfiles = []
         self.chain_qs = []
-        self.chain_properties_z = []
+        self.links_properties = []
+        self.joints_properties = []
+        self.bpses = []
 
-        for class_idx in indices:
+        for class_idx, class_real_idx in enumerate(indices):
             chain_qs = np.load(os.path.join(
                 data_source, f'chain_meshes',
-                f"chain_{class_idx}_q.npz",))['q']
+                f"chain_{class_real_idx}_q.npz",))['q']
             chain_properties = np.load(os.path.join(
                 data_source, f'out_chains',
-                f"chain_{class_idx}_properties.npz"), allow_pickle=True)
+                f"chain_{class_real_idx}_properties.npz"), allow_pickle=True)
             self.chain_qs.append(chain_qs)
-            self.chain_properties_z.append(chain_properties)
+            self.links_properties.append(chain_properties['links_property'])
+            self.joints_properties.append(chain_properties['joints_property'])
+            self.bpses.append(chain_properties['bpses'])
+
             for instance_idx in range(num_instances):
                 filename = os.path.join(
                     data_source,'chain_samples',
-                    f'chain_{class_idx}_{instance_idx}',
+                    f'chain_{class_real_idx}_{instance_idx}',
                     f"deepsdf.npz",
                 )
                 if not os.path.isfile(filename):
@@ -156,10 +161,10 @@ class SDFSamples(torch.utils.data.Dataset):
         filename, class_idx, instance_idx = self.npzfiles[idx]
         sdf = unpack_sdf_samples_from_ram(self.loaded_data[idx], self.subsample) if self.load_ram else unpack_sdf_samples(filename, self.subsample), # Torch.Tensor
         q = torch.tensor(self.chain_qs[class_idx][instance_idx]).float()
-        link_features = torch.tensor(self.chain_properties_z[class_idx]['links_property']).float()
-        joint_features = torch.tensor(self.chain_properties_z[class_idx]['joints_property']).float()
+        link_features = torch.tensor(self.links_properties[class_idx]).float()
+        joint_features = torch.tensor(self.joints_properties[class_idx]).float()
         
-        link_bps_info = self.chain_properties_z[class_idx]['bpses']
+        link_bps_info = self.bpses[class_idx]
         link_bps_scdistances = [np.concatenate([np.array((bp_info['scale_to_unit'], )), bp_info['distances']]) for bp_info in link_bps_info]
         link_bps_scdistances = torch.tensor(np.stack(link_bps_scdistances, axis=0)).float()
         return {

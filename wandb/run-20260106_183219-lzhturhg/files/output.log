@@ -1,0 +1,33 @@
+Epoch 1/1:  12%|████                             | 35/282 [00:06<00:44,  5.50it/s]
+Error executing job with overrides: []
+Traceback (most recent call last):
+  File "/home/qianxu/Project/crossembodimentaction/train_sdf.py", line 226, in main
+    for batch in tqdm(sdf_loader, desc=f"Epoch {epoch+1}/{num_epochs}"):
+  File "/home/qianxu/miniconda3/envs/repr/lib/python3.10/site-packages/tqdm/std.py", line 1181, in __iter__
+    for obj in iterable:
+  File "/home/qianxu/miniconda3/envs/repr/lib/python3.10/site-packages/torch/utils/data/dataloader.py", line 732, in __next__
+    data = self._next_data()
+  File "/home/qianxu/miniconda3/envs/repr/lib/python3.10/site-packages/torch/utils/data/dataloader.py", line 1506, in _next_data
+    return self._process_data(data, worker_id)
+  File "/home/qianxu/miniconda3/envs/repr/lib/python3.10/site-packages/torch/utils/data/dataloader.py", line 1541, in _process_data
+    data.reraise()
+  File "/home/qianxu/miniconda3/envs/repr/lib/python3.10/site-packages/torch/_utils.py", line 769, in reraise
+    raise exception
+zipfile.BadZipFile: Caught BadZipFile in DataLoader worker process 3.
+Original Traceback (most recent call last):
+  File "/home/qianxu/miniconda3/envs/repr/lib/python3.10/site-packages/torch/utils/data/_utils/worker.py", line 349, in _worker_loop
+    data = fetcher.fetch(index)  # type: ignore[possibly-undefined]
+  File "/home/qianxu/miniconda3/envs/repr/lib/python3.10/site-packages/torch/utils/data/_utils/fetch.py", line 52, in fetch
+    data = [self.dataset[idx] for idx in possibly_batched_index]
+  File "/home/qianxu/miniconda3/envs/repr/lib/python3.10/site-packages/torch/utils/data/_utils/fetch.py", line 52, in <listcomp>
+    data = [self.dataset[idx] for idx in possibly_batched_index]
+  File "/home/qianxu/Project/crossembodimentaction/data_process/dataset.py", line 159, in __getitem__
+    link_features = torch.tensor(self.chain_properties_z[class_idx]['links_property']).float()
+  File "/home/qianxu/miniconda3/envs/repr/lib/python3.10/site-packages/numpy/lib/_npyio_impl.py", line 249, in __getitem__
+    bytes = self.zip.open(key)
+  File "/home/qianxu/miniconda3/envs/repr/lib/python3.10/zipfile.py", line 1586, in open
+    raise BadZipFile(f"Overlapped entries: {zinfo.orig_filename!r} (possible zip bomb)")
+zipfile.BadZipFile: Overlapped entries: 'links_property.npy' (possible zip bomb)
+
+
+Set the environment variable HYDRA_FULL_ERROR=1 for a complete stack trace.
