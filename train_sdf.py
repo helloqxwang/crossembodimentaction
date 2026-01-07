@@ -161,13 +161,25 @@ def inference(
     transformer_out = transformer(
         token_tensor,
         key_padding_mask=key_padding_mask,
-        causal=False,
+        causal=True,
     )
 
-    latent = pooled_latent(transformer_out[:, ::3], mask[:, ::3], mode="mean")
+    latent = pooled_latent(transformer_out[:, ::3], mask[:, ::3], mode="max")
     sdf_pred = decoder_forward(decoder, latent, sdf_samples)
 
     return latent, sdf_pred
+
+
+def _compute_lr(schedule_cfg, epoch: int, default_lr: float) -> float:
+    if schedule_cfg is None:
+        return default_lr
+    sched_type = str(schedule_cfg.Type).lower()
+    if sched_type == "step":
+        initial = float(schedule_cfg.Initial)
+        interval = int(schedule_cfg.Interval)
+        factor = float(schedule_cfg.Factor)
+        return initial * (factor ** (epoch // max(interval, 1)))
+    raise ValueError(f"Unsupported LR schedule type: {schedule_cfg.Type}")
 
 @hydra.main(config_path="conf", config_name="config", version_base="1.3")
 def main(cfg: DictConfig) -> None:
@@ -175,6 +187,8 @@ def main(cfg: DictConfig) -> None:
     torch.manual_seed(0)
 
     lr = getattr(cfg.training, "lr", 1e-4)
+    schedules = cfg.training.get("lr_schedules", []) if hasattr(cfg.training, "lr_schedules") else []
+    active_schedule = schedules[0] if len(schedules) > 0 else None
     num_epochs = int(getattr(cfg.training, "num_epochs", 1e8))
     use_wandb = getattr(cfg.training, "wandb", {}).get("enabled", False)
     save_interval = getattr(cfg.training, "save_interval", 50)
@@ -211,8 +225,9 @@ def main(cfg: DictConfig) -> None:
     val_iter = iter(val_loader)
 
     models = build_models(cfg, device)
+    init_lr = _compute_lr(active_schedule, 0, lr)
     optimizer = torch.optim.Adam(
-        [p for m in models.values() for p in m.parameters()], lr=lr
+        [p for m in models.values() for p in m.parameters()], lr=init_lr
     )
     loss_fn = torch.nn.L1Loss()
 
@@ -229,6 +244,11 @@ def main(cfg: DictConfig) -> None:
     global_step = 0
 
     for epoch in range(num_epochs):
+        # step LR per epoch
+        new_lr = _compute_lr(active_schedule, epoch, lr)
+        for g in optimizer.param_groups:
+            g["lr"] = new_lr
+
         for batch in tqdm(sdf_loader, desc=f"Epoch {epoch+1}/{num_epochs}"):
             optimizer.zero_grad()
             latent, sdf_pred = inference(batch, models, device=device)

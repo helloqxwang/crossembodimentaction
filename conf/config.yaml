@@ -79,3 +79,8 @@ training:
     run_name: sdf-transformer
     save_interval: 50
     save_dir: ./checkpoints
+  lr_schedules:
+    - Type: Step
+      Initial: 0.0005
+      Interval: 500
+      Factor: 0.5

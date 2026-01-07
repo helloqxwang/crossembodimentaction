@@ -1,2 +1,5 @@
 pytorch3d/
 data/
+wandb/
+outputs/
+checkpoints/
