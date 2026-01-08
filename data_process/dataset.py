@@ -131,7 +131,7 @@ class SDFSamples(torch.utils.data.Dataset):
 
             for instance_idx in range(num_instances):
                 filename = os.path.join(
-                    data_source,'chain_samples_normalized',
+                    data_source,'chain_samples',
                     f'chain_{class_real_idx}_{instance_idx}',
                     f"deepsdf.npz",
                 )
@@ -164,6 +164,7 @@ class SDFSamples(torch.utils.data.Dataset):
             sdf, scale_to = unpack_sdf_samples_from_ram(self.loaded_data[idx], self.subsample)
         else:
             sdf, scale_to = unpack_sdf_samples(filename, self.subsample)
+        scale_to = 1
 
         q = torch.tensor(self.chain_qs[class_idx][instance_idx]).float()
         link_features = torch.tensor(self.links_properties[class_idx]).float()

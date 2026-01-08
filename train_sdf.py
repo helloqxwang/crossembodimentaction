@@ -161,10 +161,10 @@ def inference(
     transformer_out = transformer(
         token_tensor,
         key_padding_mask=key_padding_mask,
-        causal=True,
+        causal=False,
     )
 
-    latent = pooled_latent(transformer_out[:, ::3], mask[:, ::3], mode="max")
+    latent = pooled_latent(transformer_out[:, ::3], mask[:, ::3], mode="mean")
     sdf_pred = decoder_forward(decoder, latent, sdf_samples)
 
     return latent, sdf_pred

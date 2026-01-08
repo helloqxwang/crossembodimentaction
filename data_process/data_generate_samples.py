@@ -284,6 +284,7 @@ if __name__ == "__main__":
     parser.add_argument("--max-instances", default=-1, type=int, help="maximum number of instances to process, -1 for all")
     parser.add_argument("--debug", action="store_true", help="run in debug mode (do not save results)")
     parser.add_argument("--visualize", action="store_true", help="visualize samples in debug mode (requires --debug)")
+    parser.add_argument("--size-normalization", action="store_true", help="normalize mesh size to fit in unit sphere")
 
     args = parser.parse_args()
 
