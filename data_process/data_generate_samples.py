@@ -14,6 +14,7 @@ import trimesh
 # sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import torch
 import igl
+from visualize_samples import visualize_sdf
 
 def get_sdf_mesh(mesh, xyz):
     """Return the SDF of the mesh at the queried positions, using IGL."""
@@ -129,7 +130,7 @@ def make_deepsdf_samples(nearsurface_fn, uniform_fn, n_uniform=25000):
 # Main
 ######
 
-def generate_samples(args, datadir, dest, instances, pid=None):
+def generate_samples(args, datadir, dest, instances, pid=None, debug=False):
     """Generate data samples for the given meshes."""
     if pid is not None:  # print with process id
         def iprint(*args, **kwargs):
@@ -155,20 +156,31 @@ def generate_samples(args, datadir, dest, instances, pid=None):
             sample_fn = os.path.join(destdir, "surface.npy")
             if args.overwrite or not os.path.isfile(sample_fn):
                 samples = sample_surface(mesh, args.n_samples, dirty_mesh=args.mesh_to_sdf)
-                np.save(sample_fn, samples)
+                if not debug:
+                    np.save(sample_fn, samples)
         
         ## SDF samples
         # Near-surface
         sample_fn = os.path.join(destdir, "nearsurface.npz")
         if args.overwrite or not os.path.isfile(sample_fn):
             results = sample_sdf_nearsurface(mesh, args.n_samples, dirty_mesh=args.mesh_to_sdf)
-            np.savez(sample_fn, **results)
+            if not debug:
+                np.savez(sample_fn, **results)
+            elif debug and args.visualize:
+                # Visualize near-surface samples
+                sdf_samples = np.concatenate([results['pos'], results['neg']], axis=0)
+                visualize_sdf(mesh=mesh, sdf_samples=sdf_samples, downsample_ratio=0.001, title=f"Near-surface: {instance}")
 
         # Uniform
         sample_fn = os.path.join(destdir, "uniform.npz")
         if args.overwrite or not os.path.isfile(sample_fn):
             results = sample_sdf_uniform(mesh, args.n_samples, dirty_mesh=args.mesh_to_sdf)
-            np.savez(sample_fn, **results)
+            if not debug:
+                np.savez(sample_fn, **results)
+            elif debug and args.visualize:
+                # Visualize uniform samples
+                sdf_samples = np.concatenate([results['pos'], results['neg']], axis=0)
+                visualize_sdf(mesh=mesh, sdf_samples=sdf_samples, downsample_ratio=0.001, title=f"Uniform: {instance}")
         
         # DeepSDF-like samples (~95% near-surface, 5% uniform)
         sample_fn = os.path.join(destdir, "deepsdf.npz")
@@ -176,7 +188,12 @@ def generate_samples(args, datadir, dest, instances, pid=None):
             results = make_deepsdf_samples(os.path.join(destdir, "nearsurface.npz"),
                                            os.path.join(destdir, "uniform.npz"),
                                            n_uniform=args.n_samples // 10)
-            np.savez(sample_fn, **results)
+            if not debug:
+                np.savez(sample_fn, **results)
+            elif debug and args.visualize:
+                # Visualize DeepSDF  samples
+                sdf_samples = np.concatenate([results['pos'], results['neg']], axis=0)
+                visualize_sdf(mesh=mesh, sdf_samples=sdf_samples, downsample_ratio=0.001, title=f"DeepSDF: {instance}")
             
     iprint("Done.")
 
@@ -195,7 +212,7 @@ def main(args):
     os.makedirs(dest, exist_ok=True)
 
     if args.nproc == 0:
-        generate_samples(args, datadir, dest, instances)
+        generate_samples(args, datadir, dest, instances, debug=args.debug)
     else:
         # Divide shapes into chunks
         instance_chunks = []
@@ -227,6 +244,8 @@ if __name__ == "__main__":
     parser.add_argument("--overwrite", action="store_true", help="overwrite existing results, if any")
     parser.add_argument("--seed", default=0, type=int, help="seed for the RNGs")
     parser.add_argument("--max-instances", default=-1, type=int, help="maximum number of instances to process, -1 for all")
+    parser.add_argument("--debug", action="store_true", help="run in debug mode (do not save results)")
+    parser.add_argument("--visualize", action="store_true", help="visualize samples in debug mode (requires --debug)")
 
     args = parser.parse_args()
 

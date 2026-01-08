@@ -15,14 +15,16 @@
             "name": "Generate Samples",
             "type": "debugpy",
             "request": "launch",
-            "program": "${workspaceFolder}/data_generation/data_generate_samples.py",
+            "program": "${workspaceFolder}/data_process/data_generate_samples.py",
             "args": [
             "${workspaceFolder}/data",
             "--nproc",
             "0",
             "--overwrite",
             "--max-instances",
-            "1"
+            "-1",
+            "--debug",
+            "--visualize"
             ],
             "console": "integratedTerminal"
         },
@@ -30,7 +32,7 @@
             "name": "Visualize Samples",
             "type": "debugpy",
             "request": "launch",
-            "program": "${workspaceFolder}/data_generation/visualize_samples.py",
+            "program": "${workspaceFolder}/data_process/visualize_samples.py",
             "console": "integratedTerminal",
             "args": [
                 "--mesh", "data/chain_meshes/chain_0_0.obj",

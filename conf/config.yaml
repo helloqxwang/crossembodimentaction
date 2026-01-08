@@ -28,7 +28,7 @@ models:
     dropout: 0.0
     use_layer_norm: false
   link_encoder:
-    input_dim: 257
+    input_dim: 1024
     output_dim: 128
     hidden_dims: [256, 256]
     activation: gelu
@@ -76,7 +76,7 @@ training:
   wandb:
     enabled: true
     project: action_repr
-    run_name: sdf-transformer
+    run_name: sdf-transformer_2
     save_interval: 50
     save_dir: ./checkpoints
   lr_schedules:

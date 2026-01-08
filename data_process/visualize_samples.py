@@ -1,11 +1,6 @@
-"""Quick visualization for mesh + SDF samples (e.g., deepsdf.npz).
+"""Visualization for mesh + SDF samples and predictions.
 
-Usage example:
-    python scripts/visualize_samples.py \
-        --mesh dataset/meshes/000.obj \
-        --samples dataset/samples/000/deepsdf.npz \
-        --surface dataset/samples/000/surface.npy \
-        --downsample 0.02
+Provides reusable functions for 3D visualization of meshes and SDF values.
 """
 
 import argparse
@@ -17,7 +12,7 @@ import trimesh
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
 
-def _downsample(points: np.ndarray, ratio: float, max_points: int | None, rng: np.random.Generator):
+def downsample(points: np.ndarray, ratio: float, max_points: int | None, rng: np.random.Generator) -> np.ndarray:
     """Return a random subset of points according to ratio/max_points."""
     if points is None or len(points) == 0:
         return points
@@ -32,15 +27,29 @@ def _downsample(points: np.ndarray, ratio: float, max_points: int | None, rng: n
 
 
 def load_samples(path: str, ratio: float, max_points: int | None, rng: np.random.Generator):
+    """Load and downsample pos/neg samples from npz file."""
     data = np.load(path)
     pos = data.get("pos")
     neg = data.get("neg")
-    pos = _downsample(pos, ratio, max_points, rng) if pos is not None else None
-    neg = _downsample(neg, ratio, max_points, rng) if neg is not None else None
+    pos = downsample(pos, ratio, max_points, rng) if pos is not None else None
+    neg = downsample(neg, ratio, max_points, rng) if neg is not None else None
     return pos, neg
 
 
-def plot_mesh(ax, mesh: trimesh.Trimesh, color: str = "lightgray", alpha: float = 0.3):
+def load_surface(surface_path: str, ratio: float, max_points: int | None, rng: np.random.Generator) -> np.ndarray | None:
+    """Load and downsample surface points from npy file."""
+    if surface_path is None:
+        return None
+    if not os.path.isfile(surface_path):
+        raise FileNotFoundError(surface_path)
+    pts = np.load(surface_path)
+    pts = pts[:, :3]  # drop normals
+    pts = downsample(pts, ratio, max_points, rng)
+    return pts
+
+
+def plot_mesh(ax, mesh: trimesh.Trimesh, color: str = "lightgray", alpha: float = 0.3) -> None:
+    """Add mesh to 3D axes."""
     faces = mesh.faces
     verts = mesh.vertices
     tri_vertices = verts[faces]
@@ -48,27 +57,73 @@ def plot_mesh(ax, mesh: trimesh.Trimesh, color: str = "lightgray", alpha: float 
     ax.add_collection3d(collection)
 
 
-def plot_points(ax, pts: np.ndarray, cmap, label: str, size: int):
-    if pts is None or len(pts) == 0:
+def visualize_sdf(
+    mesh: trimesh.Trimesh,
+    sdf_samples: np.ndarray,
+    title: str = "SDF Visualization",
+    downsample_ratio: float = 0.1,
+    max_points: int = 50000,
+    marker_size: int = 3,
+    seed: int = 0,
+) -> None:
+    """Visualize mesh with SDF samples.
+    
+    Args:
+        mesh: trimesh object.
+        sdf_samples: SDF points, shape (N, 4) with [x, y, z, sdf].
+                     Positive SDF → blue, Negative SDF → red.
+                     Color intensity by absolute SDF value.
+        title: Plot title.
+        downsample_ratio: Fraction of points to visualize [0, 1].
+        max_points: Cap on visualized points after downsampling.
+        marker_size: Scatter marker size.
+        seed: Random seed for subsampling.
+    """
+    rng = np.random.default_rng(seed)
+    sdf_samples = downsample(sdf_samples, downsample_ratio, max_points, rng)
+    
+    if sdf_samples is None or len(sdf_samples) == 0:
         return
-    xyz = pts[:, :3]
-    sdf = pts[:, 3] if pts.shape[1] > 3 else np.zeros(len(pts))
-    sc = ax.scatter(xyz[:, 0], xyz[:, 1], xyz[:, 2], c=sdf, cmap=cmap, s=size, alpha=0.8, label=label)
-    return sc
 
+    fig = plt.figure(figsize=(10, 8))
+    ax = fig.add_subplot(111, projection='3d')
 
-def load_surface(surface_path: str, ratio: float, max_points: int | None, rng: np.random.Generator):
-    if surface_path is None:
-        return None
-    if not os.path.isfile(surface_path):
-        raise FileNotFoundError(surface_path)
-    pts = np.load(surface_path)
-    pts = pts[:, :3]  # drop normals
-    pts = _downsample(pts, ratio, max_points, rng)
-    return pts
+    plot_mesh(ax, mesh)
+
+    # Split into positive and negative SDF
+    xyz = sdf_samples[:, :3]
+    sdf = sdf_samples[:, 3]
+    
+    pos_mask = sdf >= 0
+    neg_mask = sdf < 0
+    
+    # Plot positive SDF with blue (deeper = larger abs value)
+    if pos_mask.sum() > 0:
+        ax.scatter(
+            xyz[pos_mask, 0], xyz[pos_mask, 1], xyz[pos_mask, 2],
+            c=sdf[pos_mask], cmap="Blues", s=marker_size, alpha=0.8, label="sdf >= 0"
+        )
+    
+    # Plot negative SDF with red (deeper = larger abs value)
+    if neg_mask.sum() > 0:
+        ax.scatter(
+            xyz[neg_mask, 0], xyz[neg_mask, 1], xyz[neg_mask, 2],
+            c=-sdf[neg_mask], cmap="Reds", s=marker_size, alpha=0.8, label="sdf < 0"
+        )
+
+    ax.set_xlabel("X")
+    ax.set_ylabel("Y")
+    ax.set_zlabel("Z")
+    ax.set_box_aspect([1, 1, 1])
+    ax.view_init(elev=20, azim=35)
+    ax.legend(loc="upper right")
+    ax.set_title(title)
+    plt.tight_layout()
+    plt.show()
 
 
 def main():
+    """CLI: visualize SDF samples from DeepSDF npz files."""
     parser = argparse.ArgumentParser(description="Visualize mesh with sampled SDF points.")
     parser.add_argument("--mesh", required=True, help="Path to the mesh .obj")
     parser.add_argument("--samples", required=True, help="Path to the npz file (e.g., deepsdf.npz)")
@@ -92,30 +147,38 @@ def main():
     ax = fig.add_subplot(111, projection='3d')
 
     plot_mesh(ax, mesh)
-    pos_sc = plot_points(ax, pos, cmap="Blues", label="pos (sdf>=0)", size=args.marker_size)
-    neg_sc = plot_points(ax, neg, cmap="Reds", label="neg (sdf<0)", size=args.marker_size)
+
+    # Combine pos/neg samples for visualization
+    samples = []
+    if pos is not None:
+        samples.append(pos)
+    if neg is not None:
+        samples.append(neg)
+    if samples:
+        combined = np.vstack(samples)
+        xyz = combined[:, :3]
+        sdf = combined[:, 3]
+        
+        pos_mask = sdf >= 0
+        if pos_mask.sum() > 0:
+            ax.scatter(xyz[pos_mask, 0], xyz[pos_mask, 1], xyz[pos_mask, 2],
+                      c=sdf[pos_mask], cmap="Blues", s=args.marker_size, alpha=0.8, label="sdf >= 0")
+        
+        neg_mask = sdf < 0
+        if neg_mask.sum() > 0:
+            ax.scatter(xyz[neg_mask, 0], xyz[neg_mask, 1], xyz[neg_mask, 2],
+                      c=-sdf[neg_mask], cmap="Reds", s=args.marker_size, alpha=0.8, label="sdf < 0")
 
     if surf_pts is not None and len(surf_pts) > 0:
-        ax.scatter(surf_pts[:, 0], surf_pts[:, 1], surf_pts[:, 2], c="green", s=args.marker_size, alpha=0.5, label="surface")
+        ax.scatter(surf_pts[:, 0], surf_pts[:, 1], surf_pts[:, 2], 
+                  c="green", s=args.marker_size, alpha=0.5, label="surface")
 
     ax.set_xlabel("X")
     ax.set_ylabel("Y")
     ax.set_zlabel("Z")
     ax.set_box_aspect([1, 1, 1])
     ax.view_init(elev=20, azim=35)
-
-    handles = []
-    labels = []
-    for sc in [pos_sc, neg_sc]:
-        if sc is not None:
-            handles.append(sc)
-            labels.append(sc.get_label())
-    if surf_pts is not None and len(surf_pts) > 0:
-        handles.append(ax.scatter([], [], [], c="green", s=args.marker_size, alpha=0.5))
-        labels.append("surface")
-    if handles:
-        ax.legend(handles, labels, loc="upper right")
-
+    ax.legend(loc="upper right")
     ax.set_title(os.path.basename(args.samples))
     plt.tight_layout()
     plt.show()

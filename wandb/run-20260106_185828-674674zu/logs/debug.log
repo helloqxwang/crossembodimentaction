@@ -19,3 +19,5 @@ config: {'data': {'data_source': './data/', 'indices': {'start': 0, 'end': 100},
 2026-01-06 18:58:28,866 INFO    MainThread:1029745 [wandb_run.py:_redirect():2438] Wrapping output streams.
 2026-01-06 18:58:28,866 INFO    MainThread:1029745 [wandb_run.py:_redirect():2461] Redirects installed.
 2026-01-06 18:58:28,873 INFO    MainThread:1029745 [wandb_init.py:init():1081] run started, returning control to user process
+2026-01-07 00:47:51,210 INFO    wandb-AsyncioManager-main:1029745 [service_client.py:_forward_responses():80] Reached EOF.
+2026-01-07 00:47:51,210 INFO    wandb-AsyncioManager-main:1029745 [mailbox.py:close():137] Closing mailbox, abandoning 1 handles.

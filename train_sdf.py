@@ -225,7 +225,8 @@ def main(cfg: DictConfig) -> None:
     val_iter = iter(val_loader)
 
     models = build_models(cfg, device)
-    init_lr = _compute_lr(active_schedule, 0, lr)
+    # init_lr = _compute_lr(active_schedule, 0, lr)
+    init_lr = lr
     optimizer = torch.optim.Adam(
         [p for m in models.values() for p in m.parameters()], lr=init_lr
     )
@@ -245,9 +246,9 @@ def main(cfg: DictConfig) -> None:
 
     for epoch in range(num_epochs):
         # step LR per epoch
-        new_lr = _compute_lr(active_schedule, epoch, lr)
-        for g in optimizer.param_groups:
-            g["lr"] = new_lr
+        # new_lr = _compute_lr(active_schedule, epoch, lr)
+        # for g in optimizer.param_groups:
+        #     g["lr"] = new_lr
 
         for batch in tqdm(sdf_loader, desc=f"Epoch {epoch+1}/{num_epochs}"):
             optimizer.zero_grad()

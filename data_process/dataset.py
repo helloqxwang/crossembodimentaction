@@ -135,9 +135,9 @@ class SDFSamples(torch.utils.data.Dataset):
                     f"deepsdf.npz",
                 )
                 if not os.path.isfile(filename):
-                    continue
+                    # continue
                     raise FileNotFoundError(filename)
-                self.npzfiles.append((filename, class_idx, instance_idx))
+                self.npzfiles.append((filename, class_real_idx, class_idx, instance_idx))
 
         self.load_ram = load_ram
 
@@ -158,22 +158,23 @@ class SDFSamples(torch.utils.data.Dataset):
         return len(self.npzfiles)
 
     def __getitem__(self, idx):
-        filename, class_idx, instance_idx = self.npzfiles[idx]
+        filename, class_real_idx, class_idx, instance_idx = self.npzfiles[idx]
         sdf = unpack_sdf_samples_from_ram(self.loaded_data[idx], self.subsample) if self.load_ram else unpack_sdf_samples(filename, self.subsample), # Torch.Tensor
         q = torch.tensor(self.chain_qs[class_idx][instance_idx]).float()
         link_features = torch.tensor(self.links_properties[class_idx]).float()
         joint_features = torch.tensor(self.joints_properties[class_idx]).float()
         
         link_bps_info = self.bpses[class_idx]
-        link_bps_scdistances = [np.concatenate([np.array((bp_info['scale_to_unit'], )), bp_info['distances']]) for bp_info in link_bps_info]
-        link_bps_scdistances = torch.tensor(np.stack(link_bps_scdistances, axis=0)).float()
+        link_bps_scdistances = [np.concatenate([bp_info['offsets'], torch.ones((bp_info['offsets'].shape[0], 1)) * bp_info['scale_to_unit']], axis=-1) for bp_info in link_bps_info]
+        # link_bps_scdistances = [np.concatenate([np.array((bp_info['scale_to_unit'], )), bp_info['distances']]) for bp_info in link_bps_info]
+        link_bps_scdistances = torch.tensor(np.stack(link_bps_scdistances, axis=0)).float().flatten(1)
         return {
             'sdf_samples': sdf[0], # Torch.Tensor of shape (subsample, 4)
             'chain_q': q, # Torch.Tensor of shape (num_links m - 1, )
             'link_features': link_features, # Torch.Tensor of shape (num_links m, 4)
             'joint_features': joint_features, # Torch.Tensor of shape (num_links m - 1, 9)
             'link_bps_scdistances': link_bps_scdistances, # Torch.Tensor of shape (num_links m, 257)
-            'class_idx': class_idx, # scalar int
+            'class_idx': class_real_idx, # scalar int
             'instance_idx': instance_idx, # scalar int
         }
 
