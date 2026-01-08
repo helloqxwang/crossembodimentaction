@@ -53,6 +53,7 @@ def unpack_sdf_samples(filename, subsample=None):
         return npz
     pos_tensor = remove_nans(torch.from_numpy(npz["pos"]))
     neg_tensor = remove_nans(torch.from_numpy(npz["neg"]))
+    scale_to = npz.get("scale_to", 1.0)
 
     # split the sample into half
     half = int(subsample / 2)
@@ -65,7 +66,7 @@ def unpack_sdf_samples(filename, subsample=None):
 
     samples = torch.cat([sample_pos, sample_neg], 0)
 
-    return samples
+    return samples, scale_to
 
 
 def unpack_sdf_samples_from_ram(data, subsample=None):
@@ -130,12 +131,12 @@ class SDFSamples(torch.utils.data.Dataset):
 
             for instance_idx in range(num_instances):
                 filename = os.path.join(
-                    data_source,'chain_samples',
+                    data_source,'chain_samples_normalized',
                     f'chain_{class_real_idx}_{instance_idx}',
                     f"deepsdf.npz",
                 )
                 if not os.path.isfile(filename):
-                    # continue
+                    continue
                     raise FileNotFoundError(filename)
                 self.npzfiles.append((filename, class_real_idx, class_idx, instance_idx))
 
@@ -159,13 +160,27 @@ class SDFSamples(torch.utils.data.Dataset):
 
     def __getitem__(self, idx):
         filename, class_real_idx, class_idx, instance_idx = self.npzfiles[idx]
-        sdf = unpack_sdf_samples_from_ram(self.loaded_data[idx], self.subsample) if self.load_ram else unpack_sdf_samples(filename, self.subsample), # Torch.Tensor
+        if self.load_ram:
+            sdf, scale_to = unpack_sdf_samples_from_ram(self.loaded_data[idx], self.subsample)
+        else:
+            sdf, scale_to = unpack_sdf_samples(filename, self.subsample)
+
         q = torch.tensor(self.chain_qs[class_idx][instance_idx]).float()
         link_features = torch.tensor(self.links_properties[class_idx]).float()
         joint_features = torch.tensor(self.joints_properties[class_idx]).float()
+        # scale joint origins to match normalized mesh coordinates
+        joint_features[:, :3] = joint_features[:, :3] * float(scale_to)
         
         link_bps_info = self.bpses[class_idx]
-        link_bps_scdistances = [np.concatenate([bp_info['offsets'], torch.ones((bp_info['offsets'].shape[0], 1)) * bp_info['scale_to_unit']], axis=-1) for bp_info in link_bps_info]
+        # Offsets are already in normalized (unit-sphere) coordinates from generation; keep them.
+        # Adjust scale_to_unit to account for the runtime normalization scale_to from SDF samples.
+        link_bps_scdistances = [
+            np.concatenate(
+                [bp_info['offsets'], torch.ones((bp_info['offsets'].shape[0], 1)) * (bp_info['scale_to_unit'] * (1.0 / float(scale_to)))],
+                axis=-1,
+            )
+            for bp_info in link_bps_info
+        ]
         # link_bps_scdistances = [np.concatenate([np.array((bp_info['scale_to_unit'], )), bp_info['distances']]) for bp_info in link_bps_info]
         link_bps_scdistances = torch.tensor(np.stack(link_bps_scdistances, axis=0)).float().flatten(1)
         return {

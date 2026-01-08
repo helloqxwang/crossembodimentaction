@@ -10,11 +10,42 @@ from multiprocessing import Process
 
 import numpy as np
 import trimesh
+from trimesh.nsphere import minimum_nsphere
 
 # sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 import torch
 import igl
 from visualize_samples import visualize_sdf
+
+
+def normalize_mesh_to_sphere(mesh: trimesh.Trimesh, radius: float = 1.0):
+    """Center mesh at origin and scale it so it fits in a sphere of radius `radius`.
+
+    Uses trimesh's minimal enclosing sphere over vertices (center, r) for tighter scaling
+    than vertex-mean heuristics. Returns a copy of the normalized mesh plus the applied scale.
+    """
+    if mesh.is_empty or len(mesh.vertices) == 0:
+        return mesh.copy(), 1.0
+
+    # Minimal enclosing sphere of vertices
+    sphere_center, sphere_radius = minimum_nsphere(mesh.vertices)
+    normalized = mesh.copy()
+    normalized.apply_translation(-sphere_center)
+
+    sphere_radius = float(sphere_radius)
+    scale = radius / sphere_radius if sphere_radius > 0 else 1.0
+    normalized.apply_scale(scale)
+
+    return normalized, scale
+
+
+def _chain_sort_key(name: str):
+    """Sort key for names like 'chain_{class_idx}_{instance_idx}' (both ints)."""
+    parts = name.split("_")
+    try:
+        return (int(parts[1]), int(parts[2]))
+    except Exception:
+        return (float("inf"), float("inf"))
 
 def get_sdf_mesh(mesh, xyz):
     """Return the SDF of the mesh at the queried positions, using IGL."""
@@ -74,7 +105,7 @@ def _prepare_sdf_results(mesh, xyz, dirty_mesh=False):
 def sample_sdf_nearsurface(mesh, n_samples, var=0.005, dirty_mesh=False):
     """Sample points near the surface of the given mesh."""
     # Scale noise by mesh radius so sampling adapts to mesh size.
-    base_radius = 1.0 / 1.03
+    base_radius = 0.9
     radius = float(np.linalg.norm(mesh.vertices, axis=1).max())
     scale_ratio = radius / base_radius if radius > 0 else 1.0
     sigma1 = sqrt(var) * scale_ratio
@@ -90,7 +121,7 @@ def sample_sdf_nearsurface(mesh, n_samples, var=0.005, dirty_mesh=False):
 
 def sample_sdf_uniform(mesh, n_samples, dirty_mesh=False):
     """Sample points uniformly in the full domain."""
-    base_radius = 1.0 / 1.03
+    base_radius = 0.9
     radius = float(np.linalg.norm(mesh.vertices, axis=1).max())
     scale_ratio = radius / base_radius if radius > 0 else 1.0
     rng = 1.0 * scale_ratio
@@ -106,8 +137,12 @@ def make_deepsdf_samples(nearsurface_fn, uniform_fn, n_uniform=25000):
         - 25K uniform points
     """
     # Load the samples files
-    surf_npz = np.load(nearsurface_fn)
-    unif_npz = np.load(uniform_fn)
+    if isinstance(nearsurface_fn, str):
+        surf_npz = np.load(nearsurface_fn)
+        unif_npz = np.load(uniform_fn)
+    else:
+        surf_npz = nearsurface_fn
+        unif_npz = uniform_fn
 
     # Sample 25K from uniform
     uniform = np.concatenate([unif_npz['pos'], unif_npz['neg']], 0)
@@ -145,8 +180,8 @@ def generate_samples(args, datadir, dest, instances, pid=None, debug=False):
         if (i+1) % max(1, n_shapes//5) == 0:
             iprint(f"Generating for shape {i+1}/{n_shapes}...")
 
-        mesh = trimesh.load(os.path.join(datadir, "chain_meshes", instance + ".obj"))
-
+        mesh_original = trimesh.load(os.path.join(datadir, "chain_meshes", instance + ".obj"))
+        mesh, scale_to = normalize_mesh_to_sphere(mesh_original, radius=0.9)
         destdir = os.path.join(dest, instance)
         os.makedirs(destdir, exist_ok=True)
 
@@ -163,31 +198,35 @@ def generate_samples(args, datadir, dest, instances, pid=None, debug=False):
         # Near-surface
         sample_fn = os.path.join(destdir, "nearsurface.npz")
         if args.overwrite or not os.path.isfile(sample_fn):
-            results = sample_sdf_nearsurface(mesh, args.n_samples, dirty_mesh=args.mesh_to_sdf)
+            results_nearsurface = sample_sdf_nearsurface(mesh, args.n_samples, dirty_mesh=args.mesh_to_sdf)
             if not debug:
-                np.savez(sample_fn, **results)
+                np.savez(sample_fn, **results_nearsurface)
             elif debug and args.visualize:
                 # Visualize near-surface samples
-                sdf_samples = np.concatenate([results['pos'], results['neg']], axis=0)
-                visualize_sdf(mesh=mesh, sdf_samples=sdf_samples, downsample_ratio=0.001, title=f"Near-surface: {instance}")
+                sdf_samples = np.concatenate([results_nearsurface['pos'], results_nearsurface['neg']], axis=0)
+                # visualize_sdf(mesh=mesh, sdf_samples=sdf_samples, downsample_ratio=0.001, title=f"Near-surface: {instance}")
 
         # Uniform
         sample_fn = os.path.join(destdir, "uniform.npz")
         if args.overwrite or not os.path.isfile(sample_fn):
-            results = sample_sdf_uniform(mesh, args.n_samples, dirty_mesh=args.mesh_to_sdf)
+            results_uniform = sample_sdf_uniform(mesh, args.n_samples, dirty_mesh=args.mesh_to_sdf)
             if not debug:
-                np.savez(sample_fn, **results)
+                np.savez(sample_fn, **results_uniform)
             elif debug and args.visualize:
                 # Visualize uniform samples
-                sdf_samples = np.concatenate([results['pos'], results['neg']], axis=0)
-                visualize_sdf(mesh=mesh, sdf_samples=sdf_samples, downsample_ratio=0.001, title=f"Uniform: {instance}")
+                sdf_samples = np.concatenate([results_uniform['pos'], results_uniform['neg']], axis=0)
+                # visualize_sdf(mesh=mesh, sdf_samples=sdf_samples, downsample_ratio=0.001, title=f"Uniform: {instance}")
         
         # DeepSDF-like samples (~95% near-surface, 5% uniform)
         sample_fn = os.path.join(destdir, "deepsdf.npz")
         if args.overwrite or not os.path.isfile(sample_fn):
-            results = make_deepsdf_samples(os.path.join(destdir, "nearsurface.npz"),
-                                           os.path.join(destdir, "uniform.npz"),
+            # results = make_deepsdf_samples(os.path.join(destdir, "nearsurface.npz"),
+            #                                os.path.join(destdir, "uniform.npz"),
+            #                                n_uniform=args.n_samples // 10)
+            results = make_deepsdf_samples(results_nearsurface,
+                                           results_uniform,
                                            n_uniform=args.n_samples // 10)
+            results["scale_to"] = scale_to
             if not debug:
                 np.savez(sample_fn, **results)
             elif debug and args.visualize:
@@ -202,13 +241,12 @@ def main(args):
     np.random.seed(args.seed)
 
     datadir = args.datadir
-    filenames = sorted(os.listdir(os.path.join(datadir, "chain_meshes")))
-    filenames = [fn for fn in filenames if fn.endswith('.obj')]
+    filenames = [fn for fn in os.listdir(os.path.join(datadir, "chain_meshes")) if fn.endswith('.obj')]
     instances = [os.path.splitext(fn)[0] for fn in filenames]
-    instances.sort()
+    instances.sort(key=_chain_sort_key)
     if args.max_instances > 0:
         instances = instances[:args.max_instances]
-    dest = os.path.join(datadir, "chain_samples")
+    dest = os.path.join(datadir, "chain_samples_normalized")
     os.makedirs(dest, exist_ok=True)
 
     if args.nproc == 0:
