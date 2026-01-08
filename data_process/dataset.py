@@ -184,7 +184,7 @@ class SDFSamples(torch.utils.data.Dataset):
         # link_bps_scdistances = [np.concatenate([np.array((bp_info['scale_to_unit'], )), bp_info['distances']]) for bp_info in link_bps_info]
         link_bps_scdistances = torch.tensor(np.stack(link_bps_scdistances, axis=0)).float().flatten(1)
         return {
-            'sdf_samples': sdf[0], # Torch.Tensor of shape (subsample, 4)
+            'sdf_samples': sdf, # Torch.Tensor of shape (subsample, 4)
             'chain_q': q, # Torch.Tensor of shape (num_links m - 1, )
             'link_features': link_features, # Torch.Tensor of shape (num_links m, 4)
             'joint_features': joint_features, # Torch.Tensor of shape (num_links m - 1, 9)

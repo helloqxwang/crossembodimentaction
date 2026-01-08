@@ -16,7 +16,7 @@ data:
   max_num_links: 5
   load_ram: false
   shuffle: true
-  num_workers: 0
+  num_workers: 16
   drop_last: true
 
 models:
@@ -76,7 +76,7 @@ training:
   wandb:
     enabled: true
     project: action_repr
-    run_name: sdf-transformer_2
+    run_name: sdf-transformer_norm
     save_interval: 50
     save_dir: ./checkpoints
   lr_schedules:
