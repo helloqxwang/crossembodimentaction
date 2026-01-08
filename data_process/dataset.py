@@ -242,7 +242,6 @@ def make_collate_fn(max_num_links: int):
         }
     return collate_fn
 
-
 def get_dataloader(
     data_source: str,
     indices,

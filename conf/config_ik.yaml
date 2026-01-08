@@ -34,13 +34,6 @@ models:
     activation: gelu
     dropout: 0.0
     use_layer_norm: false
-  joint_value_encoder:
-    embed_dim: 128
-    use_positional: true
-    mlp_hidden: [128]
-    activation: gelu
-    dropout: 0.0
-    use_layer_norm: false
   transformer:
     input_dim: 128
     model_dim: 128
@@ -55,28 +48,22 @@ models:
     max_length: 32
     norm_first: true
     final_layer_norm: true
-  decoder:
-    latent_size: 128
-    dims: [512, 512, 512, 512, 512, 512, 512, 512]
-    dropout: [0, 1, 2, 3, 4, 5, 6, 7]
-    dropout_prob: 0.2
-    norm_layers: [0, 1, 2, 3, 4, 5, 6, 7]
-    latent_in: [4]
-    xyz_in_all: false
-    use_tanh: false
-    latent_dropout: false
-    weight_norm: true
+  joint_value_decoder:
+    input_dim: 128
+    hidden_dims: [256, 128]
+    activation: gelu
+    dropout: 0.0
+    use_layer_norm: false
 
 training:
   device: cuda
   dtype: float32
-  debug_batch: true
   lr: 1e-4
   num_epochs: 1e8
   wandb:
     enabled: true
     project: action_repr
-    run_name: sdf-transformer_2
+    run_name: ik-transformer
     save_interval: 50
     save_dir: ./checkpoints
   lr_schedules:
@@ -84,3 +71,5 @@ training:
       Initial: 0.0005
       Interval: 500
       Factor: 0.5
+  pretrained_ckpt: null   # set path to a train_sdf checkpoint to warm start joint/link encoders
+  freeze_pretrained: false

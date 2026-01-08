@@ -10,7 +10,7 @@ import trimesh
 import viser
 
 from data_process.dataset import get_dataloader
-from data_process.visualize_samples import visualize_sdf, plot_mesh, plot_points
+from data_process.visualize_samples import visualize_sdf, plot_mesh
 from train_sdf import build_models, inference
 import time
 import numpy as np
@@ -299,6 +299,7 @@ def _validate_once(
     instance_indices = batch["instance_idx"]
     gt_meshes = [trimesh.load(os.path.join(cfg.data.data_source, f"chain_meshes", f"chain_{class_idx}_{instance_idx}.obj"), force="mesh") for class_idx, instance_idx in zip(class_indices, instance_indices)]
     radius = [float(np.linalg.norm(mesh.vertices, axis=1).max()) for mesh in gt_meshes]
+    
     max_mesh_num = int(getattr(cfg.validation, "max_mesh_per_batch", 0))
     if max_mesh_num > 0:
         save_root = to_absolute_path(cfg.validation.save_mesh_dir)
@@ -314,7 +315,7 @@ def _validate_once(
                 out_path=out_path,
                 N=mesh_cfg.N,
                 max_batch=mesh_cfg.max_batch,
-                grid_scale=radius[i] * 1.1,
+                grid_scale=2,
                 offset=mesh_cfg.get("offset", None),
                 scale=mesh_cfg.get("scale", None),
             )

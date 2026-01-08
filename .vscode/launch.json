@@ -53,5 +53,30 @@
                 "WANDB_MODE": "disabled"
             }
         },
+        {
+            "name": "Train_ik",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/train_ik.py",
+            "console": "integratedTerminal",
+            "env": {
+                "WANDB_MODE": "disabled"
+            }
+        },
+        {
+            "name": "Process SDF",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/process_sdf.py",
+            "console": "integratedTerminal",
+            "args": [
+                "--config", "conf/config.yaml",
+                "--checkpoint", "${workspaceFolder}/checkpoints/sdf-transformer_norm/epoch_300.pt",
+                "--save_dir", "${workspaceFolder}/data/sdf_tokens",
+                "--device", "cuda",
+                "--num_workers", "4",
+                "--batch_size", "32"
+            ]
+        }
     ]
 }
