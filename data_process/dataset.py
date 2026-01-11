@@ -104,12 +104,13 @@ class SDFSamples(torch.utils.data.Dataset):
         num_instances,
         subsample,
         load_ram=False,
-
+        ik=False,
     ):
         self.subsample = subsample
         self.indices = indices
         self.num_instances = num_instances
         self.data_source = data_source
+        self.ik = ik
 
         self.npzfiles = []
         self.chain_qs = []
@@ -117,6 +118,7 @@ class SDFSamples(torch.utils.data.Dataset):
         self.joints_properties = []
         self.bpses = []
 
+        sdf_tokens_ls = []
         for class_idx, class_real_idx in enumerate(indices):
             chain_qs = np.load(os.path.join(
                 data_source, f'chain_meshes',
@@ -129,6 +131,7 @@ class SDFSamples(torch.utils.data.Dataset):
             self.joints_properties.append(chain_properties['joints_property'])
             self.bpses.append(chain_properties['bpses'])
 
+            sdf_tokens_instance_ls = []
             for instance_idx in range(num_instances):
                 filename = os.path.join(
                     data_source,'chain_samples',
@@ -136,10 +139,19 @@ class SDFSamples(torch.utils.data.Dataset):
                     f"deepsdf.npz",
                 )
                 if not os.path.isfile(filename):
-                    continue
+                    # continue
                     raise FileNotFoundError(filename)
+                if self.ik:
+                    sdf_tokens_instance_ls.append(torch.load(os.path.join(
+                        data_source,'sdf_tokens',
+                        f'cls{class_real_idx}_inst{instance_idx}.pt',
+                    ), weights_only=False))
                 self.npzfiles.append((filename, class_real_idx, class_idx, instance_idx))
-
+            if self.ik:
+                sdf_tokens_ls.append(torch.stack(sdf_tokens_instance_ls, dim=0))
+        
+        if self.ik:
+            self.sdf_tokens = torch.stack(sdf_tokens_ls, dim=0).float()  # (num_classes, num_instances, token_dim)
         self.load_ram = load_ram
 
         if load_ram:
@@ -190,6 +202,7 @@ class SDFSamples(torch.utils.data.Dataset):
             'link_features': link_features, # Torch.Tensor of shape (num_links m, 4)
             'joint_features': joint_features, # Torch.Tensor of shape (num_links m - 1, 9)
             'link_bps_scdistances': link_bps_scdistances, # Torch.Tensor of shape (num_links m, 257)
+            'sdf_tokens': self.sdf_tokens[class_idx, instance_idx] if self.ik else None, # Torch.Tensor of shape (token_dim, )
             'class_idx': class_real_idx, # scalar int
             'instance_idx': instance_idx, # scalar int
         }
@@ -237,6 +250,7 @@ def make_collate_fn(max_num_links: int):
             "link_features": link_features,             # (B, max_num_links, 4)
             "joint_features": joint_features,           # (B, max_num_links-1, 9)
             "link_bps_scdistances": link_bps,           # (B, max_num_links, 257)
+            "sdf_tokens": torch.stack([b["sdf_tokens"] for b in batch], dim=0) if batch[0]["sdf_tokens"] is not None else None, # (B, token_dim)
             "class_idx": class_idx,                     # list of scalars
             "instance_idx": instance_idx,               # list of scalars
             "mask": masks,                               # (B, 3*max_num_links-2)
@@ -254,6 +268,7 @@ def get_dataloader(
     shuffle: bool = True,
     num_workers: int = 0,
     drop_last: bool = True,
+    ik=False,
 ):
     dataset = SDFSamples(
         data_source=data_source,
@@ -261,6 +276,7 @@ def get_dataloader(
         num_instances=num_instances,
         subsample=subsample,
         load_ram=load_ram,
+        ik=ik,
     )
     collate_fn = make_collate_fn(max_num_links)
     loader = torch.utils.data.DataLoader(

@@ -103,7 +103,7 @@ def _load_pretrained(
         print(f"Pretrained checkpoint not found: {ckpt_path}")
         return
 
-    state = torch.load(ckpt_path, map_location=device)
+    state = torch.load(ckpt_path, map_location=device, weights_only=False)
     state_models = state.get("models", state)
 
     for key in ("joint_encoder", "link_encoder"):
@@ -121,7 +121,7 @@ def _load_pretrained(
         print("Frozen pretrained joint and link encoders")
 
 
-def inference(
+def inference_ik(
     batch: Dict[str, torch.Tensor],
     models: Dict[str, torch.nn.Module],
     device: torch.device = torch.device("cpu"),
@@ -136,6 +136,7 @@ def inference(
     link_features = batch["link_bps_scdistances"].to(device)  # (B, L, 1024)
     joint_features = batch["joint_features"].to(device)  # (B, L-1, 9)
     mask = batch["mask"].to(device)  # (B, 3*L-2)
+    geometry_tokens = batch["sdf_tokens"].to(device)  # (B, token_dim)
 
     joint_fts = joint_encoder(joint_features)          # (B, L-1, D)
     link_fts = link_encoder(link_features)             # (B, L, D)
@@ -147,7 +148,7 @@ def inference(
     placeholder_tokens = placeholder_vec.unsqueeze(1).expand(-1, max_num_links - 1, -1)
 
     # Place holder
-    geometry_token = torch.randn(batch_size, token_dim, device=device)
+    # geometry_tokens = torch.randn(batch_size, token_dim, device=device)
 
     tokens = []
     joint_value_token_indices = []
@@ -159,7 +160,7 @@ def inference(
             tokens.append(placeholder_tokens[:, i])
             joint_value_token_indices.append(len(tokens) - 1)
 
-    tokens.append(geometry_token)
+    tokens.append(geometry_tokens)
 
     token_tensor = torch.stack(tokens, dim=1)  # (B, T, D)
 
@@ -172,16 +173,16 @@ def inference(
     transformer_out = transformer(
         token_tensor,
         key_padding_mask=key_padding_mask,
-        causal=True,
+        causal=False,
     )
 
     joint_token_out = transformer_out[:, joint_value_token_indices]  # (B, L-1, D)
     joint_mask = token_mask[:, joint_value_token_indices]            # (B, L-1)
 
     joint_raw = joint_value_decoder(joint_token_out).squeeze(-1)     # (B, L-1)
-    joint_preds = torch.tanh(joint_raw) * torch.pi                   # squash to [-pi, pi]
+    # joint_preds = torch.tanh(joint_raw) * torch.pi                   # squash to [-pi, pi]
 
-    return joint_preds, joint_mask
+    return joint_raw, joint_mask
 
 
 def masked_l1(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
@@ -230,6 +231,7 @@ def main(cfg: DictConfig) -> None:
         shuffle=cfg.data.shuffle,
         num_workers=cfg.data.num_workers,
         drop_last=cfg.data.drop_last,
+        ik=True,
     )
 
     val_loader = get_dataloader(
@@ -243,6 +245,7 @@ def main(cfg: DictConfig) -> None:
         shuffle=False,
         num_workers=0,
         drop_last=False,
+        ik=True,
     )
     val_iter = iter(val_loader)
 
@@ -272,13 +275,13 @@ def main(cfg: DictConfig) -> None:
     global_step = 0
 
     for epoch in range(num_epochs):
-        new_lr = _compute_lr(active_schedule, epoch, lr) if active_schedule is not None else lr
-        for g in optimizer.param_groups:
-            g["lr"] = new_lr
+        # new_lr = _compute_lr(active_schedule, epoch, lr) if active_schedule is not None else lr
+        # for g in optimizer.param_groups:
+        #     g["lr"] = new_lr
 
         for batch in tqdm(ik_loader, desc=f"Epoch {epoch+1}/{num_epochs}"):
             optimizer.zero_grad()
-            joint_pred, joint_mask = inference(batch, models, device=device)
+            joint_pred, joint_mask = inference_ik(batch, models, device=device)
             joint_gt = batch["chain_q"].to(device)
             loss = masked_l1(joint_pred, joint_gt, joint_mask)
             loss.backward()
@@ -296,7 +299,7 @@ def main(cfg: DictConfig) -> None:
             except StopIteration:
                 val_iter = iter(val_loader)
                 val_batch = next(val_iter)
-            val_pred, val_mask = inference(val_batch, models, device=device)
+            val_pred, val_mask = inference_ik(val_batch, models, device=device)
             val_gt = val_batch["chain_q"].to(device)
             val_loss = masked_l1(val_pred, val_gt, val_mask).item()
 

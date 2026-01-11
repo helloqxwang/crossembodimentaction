@@ -7,12 +7,12 @@ data:
     start: 0
     end: 100
   val_indices:
-    start: 100
+    start: 101
     end: 110
   num_instances: 100
   subsample: 16384
-  batch_size: 4
-  val_batch_size: 32
+  batch_size: 64
+  val_batch_size: 64
   max_num_links: 5
   load_ram: false
   shuffle: true
@@ -63,7 +63,7 @@ training:
   wandb:
     enabled: true
     project: action_repr
-    run_name: ik-transformer
+    run_name: ik-transformer_v1_tanh
     save_interval: 50
     save_dir: ./checkpoints
   lr_schedules:
@@ -71,5 +71,6 @@ training:
       Initial: 0.0005
       Interval: 500
       Factor: 0.5
-  pretrained_ckpt: null   # set path to a train_sdf checkpoint to warm start joint/link encoders
-  freeze_pretrained: false
+  pretrained_ckpt: ./checkpoints/sdf-transformer_2/epoch_1500.pth
+  test_ckpt: ./checkpoints/ik-transformer_v1/epoch_400.pth
+  freeze_pretrained: true

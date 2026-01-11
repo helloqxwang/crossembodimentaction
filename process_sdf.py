@@ -44,12 +44,12 @@ def _load_models(cfg: DictConfig, device: torch.device, checkpoint: str) -> Tupl
 
 def _parse_args() -> argparse.Namespace:
 	parser = argparse.ArgumentParser(description="Extract SDF latents for an entire dataset")
-	parser.add_argument("--config", default="conf/config.yaml", help="Path to Hydra config used for data/model params")
-	parser.add_argument("--checkpoint", required=True, help="Path to checkpoint from train_sdf.py")
+	parser.add_argument("--config", default="conf/config_v2_unnormed.yaml", help="Path to Hydra config used for data/model params")
+	parser.add_argument("--checkpoint", default="checkpoints/sdf-transformer_2/epoch_1500.pth", help="Path to checkpoint from train_sdf.py")
 	parser.add_argument("--save_dir", default="./data/sdf_tokens", help="Directory to store latent .pt files")
 	parser.add_argument("--device", default=None, help="Override device (cpu/cuda). If unset, use cfg.training.device")
 	parser.add_argument("--num_workers", type=int, default=None, help="Override dataloader workers")
-	parser.add_argument("--batch_size", type=int, default=None, help="Override batch size")
+	parser.add_argument("--batch_size", type=int, default=4, help="Override batch size")
 	return parser.parse_args()
 
 

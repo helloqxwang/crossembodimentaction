@@ -1,11 +1,11 @@
 defaults:
-  - config_v1_unnormed
+  - config_v2_unnormed
   - _self_
 
 data:
   data_source: ./data/
   val_indices:
-    start: 1
+    start: 0
     end: 110
   num_instances: 100
   subsample: 16384
@@ -17,7 +17,7 @@ data:
 
 validation:
   device: cuda
-  checkpoint: ./checkpoints/sdf-transformer_2/epoch_1500.pth
+  checkpoint: ./checkpoints/sdf-transformer_2/epoch_1300.pth
   num_batches: null       # set to an integer to limit batches, or null for all
   save_mesh_dir: ./outputs/val_meshes
   max_mesh_per_batch: 4

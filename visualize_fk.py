@@ -11,7 +11,7 @@ import viser
 
 from data_process.dataset import get_dataloader
 from data_process.visualize_samples import visualize_sdf, plot_mesh
-from train_sdf import build_models, inference
+from train_fk import build_models, inference
 import time
 import numpy as np
 import plyfile
@@ -221,7 +221,7 @@ def _resolve_gt_mesh_path(template: Optional[str], class_idx: int, instance_idx:
 
 def visualize_meshes(
     pred_mesh_path: str,
-    gt_mesh_path: Optional[str] = None,
+    gt_mesh: Optional[trimesh.Trimesh] = None,
     port: int = 8080,
     show_pred_only: bool = False,
 ):
@@ -235,13 +235,34 @@ def visualize_meshes(
         mesh=pred_mesh,
         # material=viser.materials.MeshStandardMaterial(color=(0.2, 0.7, 1.0), opacity=0.9),
     )
+    # Calculate mesh bounds and shift distance
+    pred_bounds = pred_mesh.bounds
+    pred_size = pred_bounds[1] - pred_bounds[0]
+    shift_distance = pred_size[0] * 1.2  # 20% padding
 
-    if gt_mesh_path and not show_pred_only and os.path.isfile(gt_mesh_path):
-        gt_mesh = trimesh.load(gt_mesh_path, force="mesh")
+    # Shift gt_mesh along x-axis
+    if gt_mesh is not None and not show_pred_only:
+        gt_mesh_shifted = gt_mesh.copy()
+        gt_mesh_shifted.apply_translation([shift_distance, 0, 0])
         server.scene.add_mesh_trimesh(
             name="gt_mesh",
-            mesh=gt_mesh,
-            # material=viser.materials.MeshStandardMaterial(color=(1.0, 0.45, 0.25), opacity=0.5),
+            mesh=gt_mesh_shifted,
+        )
+        
+        # Visualize world frames
+        server.scene.add_frame(
+            name="pred_frame",
+            wxyz=np.array([1, 0, 0, 0]),
+            position=np.array([0, 0, 0]),
+            axes_length=shift_distance * 0.3,
+            axes_radius=0.005,
+        )
+        server.scene.add_frame(
+            name="gt_frame",
+            wxyz=np.array([1, 0, 0, 0]),
+            position=np.array([shift_distance, 0, 0]),
+            axes_length=shift_distance * 0.3,
+            axes_radius=0.005,
         )
     logging.info(f"Viser running on http://localhost:{port}")
 
@@ -315,25 +336,19 @@ def _validate_once(
                 out_path=out_path,
                 N=mesh_cfg.N,
                 max_batch=mesh_cfg.max_batch,
-                grid_scale=2,
+                grid_scale=radius[i] * 1.1,
                 offset=mesh_cfg.get("offset", None),
                 scale=mesh_cfg.get("scale", None),
             )
 
             vis_cfg = cfg.validation.visualize
-            if getattr(vis_cfg, "enable", False) and mesh_counter == 0 and i == 0:
-                gt_path = _resolve_gt_mesh_path(
-                    vis_cfg.get("gt_mesh_template", None), cls, inst
+            if getattr(vis_cfg, "enable", False):
+                visualize_meshes(
+                    pred_mesh_path=out_path + ".ply",
+                    gt_mesh=gt_meshes[i],
+                    port=vis_cfg.port,
+                    show_pred_only=vis_cfg.get("show_pred_only", False),
                 )
-                try:
-                    visualize_meshes(
-                        pred_mesh_path=out_path + ".ply",
-                        gt_mesh_path=gt_path,
-                        port=vis_cfg.port,
-                        show_pred_only=vis_cfg.get("show_pred_only", False),
-                    )
-                except Exception as err:
-                    logging.error(f"viser visualization failed: {err}")
 
     return mesh_counter + latent.shape[0]
 
