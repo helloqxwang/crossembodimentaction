@@ -11,13 +11,15 @@ or dataset tweaks, e.g. ``python visualize_ik.py training.pretrained_ckpt=...``.
 from typing import Dict, Optional, Tuple
 import logging
 import os
-
+import numpy as np
 import hydra
 import torch
 import trimesh
 import viser
+import matplotlib.pyplot as plt
 from hydra.utils import to_absolute_path
 from omegaconf import DictConfig
+from networks.transformer import plot_token_dependency
 
 from data_process.dataset import get_dataloader
 from robot_model.chain_model import ChainModel
@@ -65,35 +67,44 @@ def _get_chain(chain_cache: Dict[int, ChainModel], data_root: str, class_idx: in
 
 
 def visualize_meshes(
-    pred_mesh: trimesh.Trimesh,
-    gt_mesh: Optional[trimesh.Trimesh] = None,
-    *,
-    port: int = 8100,
-    show_pred_only: bool = False,
+	pred_mesh: trimesh.Trimesh,
+	gt_mesh: Optional[trimesh.Trimesh] = None,
+	*,
+	port: int = 8100,
+	show_pred_only: bool = False,
 ):
-    server = viser.ViserServer(port=port)
-    # World frame at origin.
-    # server.scene.add_frame(name="world", wxyz=[1.0, 0.0, 0.0, 0.0], position=[0.0, 0.0, 0.0], axes_radius=0.005)
-    server.scene.add_mesh_trimesh(name="pred_mesh", mesh=pred_mesh)
+	server = viser.ViserServer(port=port)
+	pred_mesh_vis = pred_mesh.copy()
+	# Viser lacks a color kwarg; bake vertex colors directly into the mesh.
+	pred_mesh_vis.visual.face_colors = [51, 179, 255, 255]  # RGBA ~ (0.2, 0.7, 1.0)
+	server.scene.add_mesh_trimesh(name="pred_mesh", mesh=pred_mesh_vis)
 
-    # Shift GT mesh to the +X direction so both are visible together.
-    if gt_mesh is not None and not show_pred_only:
-        bounds = pred_mesh.bounds
-        size_x = float((bounds[1] - bounds[0])[0])
-        shift = size_x * 1.2 if size_x > 0 else 0.2
-        gt_shifted = gt_mesh.copy()
-        gt_shifted.apply_translation([shift, 0, 0])
-        server.scene.add_mesh_trimesh(name="gt_mesh", mesh=gt_shifted)
-        # Frame for the shifted GT mesh.
-        # server.scene.add_frame(
-        #     name="world_shifted",
-        #     wxyz=[1.0, 0.0, 0.0, 0.0],
-        #     position=[shift, 0.0, 0.0],
-		# 	axes_radius=0.005,
-        # )
+	# Shift GT mesh to the +X direction so both are visible together.
+	if gt_mesh is not None and not show_pred_only:
+		bounds = pred_mesh.bounds
+		size_x = float((bounds[1] - bounds[0])[0])
+		shift = size_x * 1.4 if size_x > 0 else 0.2
+		gt_shifted = gt_mesh.copy()
+		gt_shifted.apply_translation([shift, 0, 0])
+		gt_shifted.visual.face_colors = [255, 77, 77, 255]  # RGBA ~ (1.0, 0.3, 0.3)
+		server.scene.add_mesh_trimesh(name="gt_mesh", mesh=gt_shifted)
+		server.scene.add_frame(
+            name="pred_frame",
+            wxyz=np.array([1, 0, 0, 0]),
+            position=np.array([0, 0, 0]),
+            axes_length=shift * 0.3,
+            axes_radius=0.005,
+        )
+		server.scene.add_frame(
+				name="gt_frame",
+				wxyz=np.array([1, 0, 0, 0]),
+				position=np.array([shift, 0, 0]),
+				axes_length=shift * 0.3,
+				axes_radius=0.005,
+			)
 
-    logging.info(f"Viser running on http://localhost:{port}")
-    return server
+	logging.info(f"Viser running on http://localhost:{port}")
+	return server
 
 
 def _pred_q_for_sample(
@@ -121,7 +132,21 @@ def main(cfg: DictConfig) -> None:
 
 	val_loader = get_dataloader(
 		data_source=data_root,
-		indices=val_indices,
+		indices=[1, ],
+		num_instances=cfg.data.num_instances,
+		subsample=cfg.data.subsample,
+		batch_size=cfg.data.val_batch_size,
+		max_num_links=cfg.data.max_num_links,
+		load_ram=cfg.data.load_ram,
+		shuffle=False,
+		num_workers=cfg.data.num_workers,
+		drop_last=False,
+		ik=True,
+	)
+
+	val_loader_another = get_dataloader(
+		data_source=data_root,
+		indices=[2, ],
 		num_instances=cfg.data.num_instances,
 		subsample=cfg.data.subsample,
 		batch_size=cfg.data.val_batch_size,
@@ -135,14 +160,20 @@ def main(cfg: DictConfig) -> None:
 
 	vis_cfg = getattr(cfg, "visualize", {})
 	max_mesh = int(getattr(vis_cfg, "max_mesh", 64))
-	port = int(getattr(vis_cfg, "port", 8100))
+	port = int(getattr(vis_cfg, "port", 9010))
 	show_pred_only = bool(getattr(vis_cfg, "show_pred_only", False))
+	plot_dependency = bool(getattr(vis_cfg, "plot_dependency", False))
+	dep_plot_path = getattr(vis_cfg, "dependency_plot_path", "outputs/dependency.png")
 
 	chain_cache: Dict[int, ChainModel] = {}
 	shown = 0
 
-	for batch in val_loader:
-		joint_pred, joint_mask = inference_ik(batch, models, device=device)
+	for batch, batch_another in zip(val_loader, val_loader_another):
+		batch["sdf_tokens"] = batch_another["sdf_tokens"]
+		if plot_dependency:
+			joint_pred, joint_mask, dependencies = inference_ik(batch, models, device=device, return_dependency=True)
+		else:
+			joint_pred, joint_mask = inference_ik(batch, models, device=device)
 
 		class_indices = batch["class_idx"]
 		instance_indices = batch["instance_idx"]
@@ -160,7 +191,7 @@ def main(cfg: DictConfig) -> None:
 			chain.update_status(q_pred.unsqueeze(0).detach().to(chain.device))
 			pred_mesh = chain.get_trimesh_q(idx=0, boolean_merged=True)
 
-			gt_mesh_path = _resolve_gt_mesh_path(data_root, cls, inst)
+			gt_mesh_path = _resolve_gt_mesh_path(data_root, batch_another["class_idx"][i], batch_another["instance_idx"][i])
 			gt_mesh = trimesh.load(gt_mesh_path, force="mesh") if gt_mesh_path else None
 
 			visualize_meshes(
@@ -170,12 +201,21 @@ def main(cfg: DictConfig) -> None:
 				show_pred_only=show_pred_only,
 			)
 
+			if plot_dependency and shown == 0:
+				os.makedirs(os.path.dirname(dep_plot_path), exist_ok=True)
+				fig, _ = plot_token_dependency(
+					dependencies[i],
+					title=f"Token dependency class {cls} instance {inst}",
+				)
+				fig.savefig(dep_plot_path, dpi=150)
+				plt.close(fig)
+				logging.info(f"Saved dependency plot to {dep_plot_path}")
+
 			logging.info(f"Visualized class {cls} instance {inst} (sample {shown+1}/{max_mesh})")
 			shown += 1
 
 		if shown >= max_mesh:
 			break
-
 
 if __name__ == "__main__":
 	main()

@@ -9,7 +9,10 @@ import random
 import torch
 import torch.utils.data
 from tqdm import tqdm
-
+from pathlib import Path
+import sys
+sys.path.append(str(Path(__file__).resolve().parent.parent / ""))
+from robot_model.chain_model import ChainModel, visualize_sdf_viser
 
 class NoMeshFileError(RuntimeError):
     """Raised when a mesh file is not found in a shape directory"""
@@ -54,6 +57,7 @@ def unpack_sdf_samples(filename, subsample=None):
     pos_tensor = remove_nans(torch.from_numpy(npz["pos"]))
     neg_tensor = remove_nans(torch.from_numpy(npz["neg"]))
     scale_to = npz.get("scale_to", 1.0)
+    q = npz.get("q", None)
 
     # split the sample into half
     half = int(subsample / 2)
@@ -66,7 +70,7 @@ def unpack_sdf_samples(filename, subsample=None):
 
     samples = torch.cat([sample_pos, sample_neg], 0)
 
-    return samples, scale_to
+    return samples, scale_to, q
 
 
 def unpack_sdf_samples_from_ram(data, subsample=None):
@@ -120,13 +124,9 @@ class SDFSamples(torch.utils.data.Dataset):
 
         sdf_tokens_ls = []
         for class_idx, class_real_idx in enumerate(indices):
-            chain_qs = np.load(os.path.join(
-                data_source, f'chain_meshes',
-                f"chain_{class_real_idx}_q.npz",))['q']
             chain_properties = np.load(os.path.join(
-                data_source, f'out_chains',
+                data_source, f'out_chains_v2',
                 f"chain_{class_real_idx}_properties.npz"), allow_pickle=True)
-            self.chain_qs.append(chain_qs)
             self.links_properties.append(chain_properties['links_property'])
             self.joints_properties.append(chain_properties['joints_property'])
             self.bpses.append(chain_properties['bpses'])
@@ -134,8 +134,9 @@ class SDFSamples(torch.utils.data.Dataset):
             sdf_tokens_instance_ls = []
             for instance_idx in range(num_instances):
                 filename = os.path.join(
-                    data_source,'chain_samples',
-                    f'chain_{class_real_idx}_{instance_idx}',
+                    data_source,'chain_samples_v2',
+                    f'chain_{class_real_idx}',
+                    f'config_{instance_idx}',
                     f"deepsdf.npz",
                 )
                 if not os.path.isfile(filename):
@@ -175,10 +176,10 @@ class SDFSamples(torch.utils.data.Dataset):
         if self.load_ram:
             sdf, scale_to = unpack_sdf_samples_from_ram(self.loaded_data[idx], self.subsample)
         else:
-            sdf, scale_to = unpack_sdf_samples(filename, self.subsample)
+            sdf, scale_to, q = unpack_sdf_samples(filename, self.subsample)
         scale_to = 1
 
-        q = torch.tensor(self.chain_qs[class_idx][instance_idx]).float()
+        q = torch.from_numpy(q).float()
         link_features = torch.tensor(self.links_properties[class_idx]).float()
         joint_features = torch.tensor(self.joints_properties[class_idx]).float()
         # scale joint origins to match normalized mesh coordinates
@@ -321,5 +322,20 @@ if __name__ == "__main__":
         print("joint_features:", batch["joint_features"].shape)
         print("link_bps_scdistances:", batch["link_bps_scdistances"].shape)
         print("mask:", batch["mask"].shape)
+
+        ### Visulization code
+        # vis_cls = batch["class_idx"][0]
+        # urdf_path = Path(f"data/out_chains_v2/chain_{vis_cls}.urdf")
+        # model = ChainModel(urdf_path, samples_per_link=128)
+        # q = batch["chain_q"][0] # Here is padded q. So need some inspection to get the real q.
+        # model.update_status(q)
+
+        # visualize_sdf_viser(
+        #     mesh=model.get_trimesh_q(0, boolean_merged=True),
+        #     sdf_samples=batch["sdf_samples"][0].cpu().numpy(),
+        #     host="127.0.0.1",
+        #     port=9200,
+        #     downsample_ratio=0.03
+        # )
 
     print("Done")

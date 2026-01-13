@@ -11,12 +11,30 @@ import numpy as np
 import math
 import random
 import trimesh
+import viser
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Union
 
 
-CLEARANCE = 0.0  # gap between consecutive links (meters)
+CLEARANCE = 0.00  # gap between consecutive links (meters)
+
+# Unified sampling ranges and visualization spacing (tuned for end-effector links).
+# Boxes emulate palms/fingers: thin thickness, moderate length.
+BOX_SIZE_X_RANGE = (0.06, 0.16)   # along +X
+BOX_SIZE_Y_RANGE = (0.020, 0.040) # thickness
+BOX_SIZE_Z_RANGE = (0.020, 0.140) # width
+
+# Capsules emulate slender finger segments.
+CAPS_RADIUS_RANGE = (0.010, 0.035)
+CAPS_LENGTH_RANGE = (0.050, 0.160)
+
+JOINT_LIMIT_RAD = math.radians(120.0)
+
+# Layout for visualization helper.
+VIS_X_START = -0.30
+VIS_X_SPACING = 0.40
+VIS_ROW_Y_OFFSET = 0.18
 
 
 @dataclass
@@ -72,17 +90,19 @@ class JointSpec:
 
 def random_box() -> Box:
 	# Dimensions in meters; keep within a sensible range for stability.
+	# Allow thin-but-wide palms/fingers by broadening ranges on Y/Z and
+	# permitting thinner X thickness.
 	return Box(
-		size_x=random.uniform(0.08, 0.25),
-		size_y=random.uniform(0.04, 0.12),
-		size_z=random.uniform(0.04, 0.12),
+		size_x=random.uniform(*BOX_SIZE_X_RANGE),
+		size_y=random.uniform(*BOX_SIZE_Y_RANGE),
+		size_z=random.uniform(*BOX_SIZE_Z_RANGE),
 	)
 
 
 def random_capsule() -> Capsule:
 	return Capsule(
-		radius=random.uniform(0.02, 0.08),
-		length=random.uniform(0.10, 0.30),
+		radius=random.uniform(*CAPS_RADIUS_RANGE),
+		length=random.uniform(*CAPS_LENGTH_RANGE),
 	)
 
 
@@ -264,9 +284,35 @@ def joint_block(joint: JointSpec) -> str:
 		f"    <child link=\"{joint.child}\"/>\n"
 		f"    <origin xyz=\"{ox:.3f} {oy:.3f} {oz:.3f}\" rpy=\"{rx:.3f} {ry:.3f} {rz:.3f}\"/>\n"
 		f"    <axis xyz=\"{ax_x:.4f} {ax_y:.4f} {ax_z:.4f}\"/>\n"
-		f"    <limit lower=\"-3.1416\" upper=\"3.1416\" effort=\"5\" velocity=\"5\"/>\n"
+		f"    <limit lower=\"{-JOINT_LIMIT_RAD:.4f}\" upper=\"{JOINT_LIMIT_RAD:.4f}\" effort=\"5\" velocity=\"5\"/>\n"
 		f"  </joint>\n"
 	)
+
+
+def visualize_link_extents(port: int = 9400) -> viser.ViserServer:
+	"""Visualize min/max boxes and capsules allowed by the current sampling ranges."""
+
+	box_min = Box(size_x=BOX_SIZE_X_RANGE[0], size_y=BOX_SIZE_Y_RANGE[0], size_z=BOX_SIZE_Z_RANGE[0])
+	box_max = Box(size_x=BOX_SIZE_X_RANGE[1], size_y=BOX_SIZE_Y_RANGE[1], size_z=BOX_SIZE_Z_RANGE[1])
+	caps_min = Capsule(radius=CAPS_RADIUS_RANGE[0], length=CAPS_LENGTH_RANGE[0])
+	caps_max = Capsule(radius=CAPS_RADIUS_RANGE[1], length=CAPS_LENGTH_RANGE[1])
+
+	server = viser.ViserServer(port=port)
+
+	items = [
+		("box_min", link_to_trimesh(box_min), (VIS_X_START, 0.0, 0.0), (0.7, 0.9, 1.0, 140)),
+		("box_max", link_to_trimesh(box_max), (VIS_X_START + VIS_X_SPACING, 0.0, 0.0), (0.2, 0.7, 1.0, 120)),
+		("caps_min", link_to_trimesh(caps_min), (VIS_X_START + 0.20, VIS_ROW_Y_OFFSET, 0.0), (1.0, 0.6, 0.3, 140)),
+		("caps_max", link_to_trimesh(caps_max), (VIS_X_START + 0.20 + VIS_X_SPACING, VIS_ROW_Y_OFFSET, 0.0), (1.0, 0.3, 0.3, 120)),
+	]
+
+	for name, mesh, offset, rgba in items:
+		mesh_vis = mesh.copy()
+		mesh_vis.apply_translation(offset)
+		mesh_vis.visual.face_colors = [int(rgba[0] * 255), int(rgba[1] * 255), int(rgba[2] * 255), int(rgba[3])]
+		server.scene.add_mesh_trimesh(name=name, mesh=mesh_vis)
+
+	return server
 
 
 def robot_urdf(name: str, links: List[LinkSpec], joints: List[JointSpec]) -> str:
@@ -307,11 +353,13 @@ def generate_multiple(count: int, min_len: int, max_len: int, out_dir: Path) -> 
 	return paths
 
 if __name__ == "__main__":
-	store_dir = "./data/out_chains"
+	visualize_link_extents(port=9400)
+	store_dir = "./data/out_chains_v2"
 	seed = 42
 	min_len = 2
 	max_len = 5
-	num_chains = int(1e3 + 1e2)
+	num_chains = int(1e4 + 1e2)
+	# num_chains = int(1e1)
 
 	random.seed(seed)
 	paths = generate_multiple(num_chains, min_len, max_len, Path(store_dir))

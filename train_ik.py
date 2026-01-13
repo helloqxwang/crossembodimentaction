@@ -10,7 +10,7 @@ from tqdm import tqdm
 
 from data_process.dataset import get_dataloader
 from networks.mlp import MLP
-from networks.transformer import TransformerEncoder
+from networks.transformer import TransformerEncoder, compute_token_dependency
 
 
 def _prepare_device(device_str: str) -> torch.device:
@@ -125,7 +125,9 @@ def inference_ik(
     batch: Dict[str, torch.Tensor],
     models: Dict[str, torch.nn.Module],
     device: torch.device = torch.device("cpu"),
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    *,
+    return_dependency: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     joint_encoder = models["joint_encoder"]
     link_encoder = models["link_encoder"]
     transformer = models["transformer"]
@@ -138,8 +140,20 @@ def inference_ik(
     mask = batch["mask"].to(device)  # (B, 3*L-2)
     geometry_tokens = batch["sdf_tokens"].to(device)  # (B, token_dim)
 
-    joint_fts = joint_encoder(joint_features)          # (B, L-1, D)
-    link_fts = link_encoder(link_features)             # (B, L, D)
+    # Compute encoded features to extract statistics
+    joint_encoded = joint_encoder(joint_features)          # (B, L-1, D)
+    link_encoded = link_encoder(link_features)             # (B, L, D)
+
+    # Gaussian noise with same mean/std as encoded features
+    joint_mean = joint_encoded.mean(dim=(1, 2), keepdim=True)
+    joint_std = joint_encoded.std(dim=(1, 2), keepdim=True).clamp(min=1e-6)
+    joint_fts = torch.randn_like(joint_encoded) 
+    # joint_fts = joint_encoded
+
+    link_mean = link_encoded.mean(dim=(1, 2), keepdim=True)
+    link_std = link_encoded.std(dim=(1, 2), keepdim=True).clamp(min=1e-6)
+    link_fts = torch.randn_like(link_encoded)
+    # link_fts = link_encoded
 
     max_num_links = link_features.size(1)
     batch_size, token_dim = link_fts.shape[0], link_fts.shape[-1]
@@ -176,12 +190,23 @@ def inference_ik(
         causal=False,
     )
 
+    dependency = None
+    if return_dependency:
+        dependency = compute_token_dependency(
+            transformer,
+            token_tensor,
+            key_padding_mask=key_padding_mask,
+            causal=False,
+        )
+
     joint_token_out = transformer_out[:, joint_value_token_indices]  # (B, L-1, D)
     joint_mask = token_mask[:, joint_value_token_indices]            # (B, L-1)
 
     joint_raw = joint_value_decoder(joint_token_out).squeeze(-1)     # (B, L-1)
     # joint_preds = torch.tanh(joint_raw) * torch.pi                   # squash to [-pi, pi]
 
+    if return_dependency:
+        return joint_raw, joint_mask, dependency
     return joint_raw, joint_mask
 
 

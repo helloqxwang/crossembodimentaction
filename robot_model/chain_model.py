@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import math
 import colorsys
+import os
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
@@ -74,12 +75,19 @@ def generate_distinct_colors(n: int, saturation: float = 0.65, value: float = 0.
     return colors
 
 
-def _parse_meshes_from_urdf(urdf_path: str, device: torch.device) -> Dict[str, trimesh.Trimesh]:
-    """Parse link geometries (box or capsule) directly from generated URDF."""
+def _parse_meshes_from_urdf(urdf_path: str, device: torch.device) -> Tuple[Dict[str, trimesh.Trimesh], Dict[str, Dict[str, torch.Tensor]]]:
+    """Parse link geometries (box/capsule/cylinder) and return mesh plus analytic params.
+
+    Returns a tuple: (meshes, geom_specs) where geom_specs[link] stores ``type``,
+    ``params`` (tensor), and ``tf`` (4x4 transform from link frame to geom frame).
+    """
+
     tree = ET.parse(urdf_path)
     root = tree.getroot()
 
     meshes: Dict[str, trimesh.Trimesh] = {}
+    geom_specs: Dict[str, Dict[str, torch.Tensor]] = {}
+
     for link in root.findall('link'):
         name = link.get('name')
         visual = link.find('visual')
@@ -92,23 +100,36 @@ def _parse_meshes_from_urdf(urdf_path: str, device: torch.device) -> Dict[str, t
         box = geometry.find('box')
         cylinder = geometry.find('cylinder')
         capsule = geometry.find('capsule')
+
+        geom_tf = np.eye(4)
+        geom_type: Optional[str] = None
+        params: Optional[torch.Tensor] = None
+
         if box is not None:
             sx, sy, sz = map(float, box.get('size').split())
             mesh = trimesh.creation.box(extents=(sx, sy, sz))
+            geom_type = 'box'
+            params = torch.tensor([sx * 0.5, sy * 0.5, sz * 0.5], dtype=torch.float32, device=device)
         elif cylinder is not None:
             radius = float(cylinder.get('radius'))
             length = float(cylinder.get('length'))
             mesh = trimesh.creation.cylinder(radius=radius, height=length)
-            # Align cylinder to +X (trimesh cylinder is along +Z by default).
-            rot = trimesh.transformations.rotation_matrix(math.pi / 2, [0, 1, 0])
+            rot = trimesh.transformations.rotation_matrix(math.pi / 2, [0, 1, 0])  # align axis to +X
             mesh.apply_transform(rot)
+            geom_tf = rot @ geom_tf
+            geom_type = 'cylinder'
+            params = torch.tensor([length * 0.5, radius], dtype=torch.float32, device=device)  # half-length, radius
         elif capsule is not None:
             radius = float(capsule.get('radius'))
-            length = float(capsule.get('length'))  # cylindrical part
+            length = float(capsule.get('length'))
             mesh = trimesh.creation.capsule(radius=radius, height=length)
-            # Align capsule to +X (trimesh capsule is along +Z by default).
-            rot = trimesh.transformations.rotation_matrix(math.pi / 2, [0, 1, 0])
+            rot = trimesh.transformations.rotation_matrix(math.pi / 2, [0, 1, 0])  # align axis to +X
+            # word_frame = trimesh.creation.axis(origin_size=0.02)
             mesh.apply_transform(rot)
+            # Derive half-length from the actual mesh extent to stay consistent with URDF semantics.
+            # geom_tf = rot @ geom_tf
+            geom_type = 'capsule'
+            params = torch.tensor([length, radius], dtype=torch.float32, device=device)  # cyl half-length, radius
         else:
             continue
 
@@ -117,9 +138,21 @@ def _parse_meshes_from_urdf(urdf_path: str, device: torch.device) -> Dict[str, t
             ox, oy, oz = map(float, origin.get('xyz').split())
             trans = trimesh.transformations.translation_matrix([ox, oy, oz])
             mesh.apply_transform(trans)
+            geom_tf = trans @ geom_tf
+        else:
+            raise KeyError(f"Visual origin missing for link '{name}' in URDF.")
+
+        if geom_type is None or params is None:
+            continue
 
         meshes[name] = mesh
-    return meshes
+        geom_specs[name] = {
+            'type': geom_type,
+            'params': params,
+            'tf': torch.tensor(geom_tf, dtype=torch.float32, device=device),
+        }
+
+    return meshes, geom_specs
 
 
 def _parse_joint_axes_from_urdf(urdf_path: str, device: torch.device) -> List[Dict[str, torch.Tensor]]:
@@ -166,7 +199,7 @@ class ChainModel:
         self.pk_chain = pk.build_chain_from_urdf(open(self.urdf_path).read()).to(dtype=torch.float32, device=device)
         self.dof = len(self.pk_chain.get_joint_parameter_names())
 
-        self.meshes = _parse_meshes_from_urdf(self.urdf_path, device)
+        self.meshes, self.geom_specs = _parse_meshes_from_urdf(self.urdf_path, device)
         self.joint_axes = _parse_joint_axes_from_urdf(self.urdf_path, device)
         self.link_points = self._sample_rest_pose_points(self.meshes, samples_per_link)
         self.frame_status = None
@@ -190,6 +223,134 @@ class ChainModel:
             raise ValueError(f"Expected last dim {self.dof}, got {q.shape[-1]}")
         self.q = q.to(self.device)
         self.frame_status = self.pk_chain.forward_kinematics(self.q)
+
+    # SDF sampling and queries
+    def sample_query_points(self, n: int, var: float = 0.0025, near_surface_ratio: float = 0.95) -> torch.Tensor:
+        """Sample query points for each pose in the current batch.
+
+        Args:
+            n: total number of query points per batch element.
+            var: variance used for near-surface Gaussian noise (mirrors data_generate_samples.py).
+            near_surface_ratio: fraction of points sampled near the surface; rest are uniform in a bounding sphere.
+
+        Returns:
+            (B, n, 3) tensor on ``self.device`` matching the batch size of the last ``update_status`` call.
+        """
+
+        if self.frame_status is None:
+            raise RuntimeError('Call update_status() before sampling query points.')
+
+        if not (0.0 < near_surface_ratio < 1.0):
+            raise ValueError('near_surface_ratio must be in (0, 1).')
+
+        n_near = int(n * near_surface_ratio)
+        n_uniform = n - n_near
+
+        pc_full = self.get_transformed_links_pc(num_points=None)  # (B, N, 4)
+        B, M, _ = pc_full.shape
+
+        all_batches = []
+        for b in range(B):
+            pts = pc_full[b, :, :3]
+
+            radius = float(pts.norm(dim=-1).max().item())
+            base_radius = 0.9
+            scale_ratio = radius / base_radius if base_radius > 0 else 1.0
+
+            sigma1 = math.sqrt(var) * scale_ratio
+            sigma2 = math.sqrt(var / 10.0) * scale_ratio
+
+            # Sample base surface points with replacement to allow large n.
+            idx = torch.randint(0, M, (max(1, n_near),), device=self.device)
+            base = pts[idx]
+
+            near_pts = torch.cat([
+                base + torch.randn_like(base) * sigma1,
+                base + torch.randn_like(base) * sigma2,
+            ], dim=0)[:n_near]
+
+            if n_uniform > 0:
+                dir_vec = torch.randn(n_uniform, 3, device=self.device)
+                dir_vec = dir_vec / dir_vec.norm(dim=-1, keepdim=True).clamp_min(1e-9)
+                radii = torch.rand(n_uniform, 1, device=self.device) ** (1.0 / 3.0)
+                uniform_pts = dir_vec * radii * radius
+                all_pts = torch.cat([near_pts, uniform_pts], dim=0)
+            else:
+                all_pts = near_pts
+
+            all_batches.append(all_pts)
+
+        return torch.stack(all_batches, dim=0)
+
+    def query_sdf(self, points: torch.Tensor) -> torch.Tensor:
+        """Compute signed distance for ``points`` (B,N,3 or N,3) to the articulated chain.
+
+        Uses analytic SDFs per link geometry (box/cylinder/capsule) and returns the
+        minimum distance over links for each point.
+        """
+
+        if self.frame_status is None:
+            raise RuntimeError('Call update_status() before querying SDF.')
+
+        if points.dim() == 2:
+            points = points.unsqueeze(0)
+        if points.size(0) != self.q.size(0):
+            raise ValueError(f'Batch mismatch: points batch {points.size(0)} vs q batch {self.q.size(0)}')
+
+        B, N, _ = points.shape
+        device = self.device
+        dtype = points.dtype
+        points = points.to(device)
+
+        sdf_all_links = []
+        for link_name, spec in self.geom_specs.items():
+            tf_world = self.frame_status[link_name].get_matrix().to(device=device, dtype=dtype)  # world_T_link (B,4,4)
+            tf_world_inv = torch.linalg.inv(tf_world)  # link_T_world
+
+            tf_geom = spec['tf'].to(device=device, dtype=dtype)  # link_T_geom (4,4)
+            tf_geom_inv = torch.linalg.inv(tf_geom)              # geom_T_link (4,4)
+
+            # world -> link -> geom
+            homog = torch.cat([points, torch.ones(B, N, 1, device=device, dtype=dtype)], dim=-1)  # (B,N,4)
+            p_link = torch.matmul(homog, tf_world_inv.transpose(1, 2))
+            p_geom = torch.matmul(p_link, tf_geom_inv.transpose(0, 1))[:, :, :3]
+
+            gtype = spec['type']
+            params = spec['params'].to(device=device, dtype=dtype)
+
+            if gtype == 'box':
+                half_extents = params  # (3,)
+                qv = p_geom.abs() - half_extents
+                outside = torch.clamp(qv, min=0.0)
+                outside_norm = torch.linalg.norm(outside, dim=-1)
+                inside = torch.clamp(qv.max(dim=-1).values, max=0.0)
+                sdf = outside_norm + inside
+            elif gtype == 'capsule':
+                height, radius = params[0], params[1]
+                px = p_geom[..., 0].clamp(-height * 0.5, height * 0.5)
+                closest = torch.stack([px, torch.zeros_like(px), torch.zeros_like(px)], dim=-1)
+                sdf = torch.linalg.norm(p_geom - closest, dim=-1) - radius
+            elif gtype == 'cylinder':
+                raise ValueError(f'Unsupported geometry type: {gtype}')
+                half_len, radius = params[0], params[1]
+                radial = torch.linalg.norm(p_geom[..., 1:], dim=-1) - radius
+                axial = p_geom[..., 0].abs() - half_len
+                h = torch.stack([radial, axial], dim=-1)
+                outside = torch.clamp(h, min=0.0)
+                outside_norm = torch.linalg.norm(outside, dim=-1)
+                inside = torch.clamp(h.max(dim=-1).values, max=0.0)
+                sdf = outside_norm + inside
+            else:
+                raise ValueError(f'Unsupported geometry type: {gtype}')
+
+            sdf_all_links.append(sdf)
+
+        if not sdf_all_links:
+            raise RuntimeError('No link geometries parsed; cannot query SDF.')
+
+        sdf_stack = torch.stack(sdf_all_links, dim=-1)  # (B,N,L)
+        sdf_min, _ = sdf_stack.min(dim=-1)
+        return sdf_min
 
     # Points
     def _sample_rest_pose_points(self, mesh_dict: Dict[str, trimesh.Trimesh], samples_per_link: int) -> Dict[str, torch.Tensor]:
@@ -273,7 +434,6 @@ class ChainModel:
 
         return axes_world
 
-
 def visualize_chain_pc(
         pc: torch.Tensor,
         link_names: List[str],
@@ -340,6 +500,82 @@ def visualize_chain_pc(
             )
     return server
 
+def visualize_sdf_viser(
+    mesh: trimesh.Trimesh,
+    sdf_samples: np.ndarray,
+    downsample_ratio: float = 0.1,
+    max_points: int = 50000,
+    marker_size: float = 0.003,
+    seed: int = 0,
+    *,
+    host: str = "127.0.0.1",
+    port: int = 9300,
+) -> viser.ViserServer:
+    """Visualize a mesh with SDF points using Viser.
+
+    Matches the signature of ``visualize_samples.visualize_sdf`` but renders via
+    Viser instead of matplotlib. Points are downsampled, colored blue for
+    positive SDF and red for negative, with intensity based on |sdf|.
+    """
+
+    rng = np.random.default_rng(seed)
+    n_total = len(sdf_samples)
+    keep = int(n_total * downsample_ratio)
+    if max_points is not None:
+        keep = min(keep, max_points)
+    keep = max(1, keep) if n_total > 0 else 0
+    if keep == 0:
+        raise ValueError("No points available for visualization")
+    if keep < n_total:
+        idx = rng.choice(n_total, size=keep, replace=False)
+        sdf_samples = sdf_samples[idx]
+
+    xyz = sdf_samples[:, :3]
+    sdf = sdf_samples[:, 3]
+
+    pos_mask = sdf >= 0
+    neg_mask = ~pos_mask
+
+    server = viser.ViserServer(host=host, port=port)
+
+    # Make the mesh translucent so interior points remain visible.
+    mesh_vis = mesh.copy()
+    mesh_vis.visual.face_colors = [200, 200, 210, 80]  # RGBA with alpha ~0.31
+    server.scene.add_mesh_trimesh(name="mesh", mesh=mesh_vis)
+
+    def _add_points(mask: np.ndarray, base_color: Tuple[float, float, float], name: str) -> None:
+        count = int(mask.sum())
+        if count == 0:
+            return
+        vals = np.abs(sdf[mask])
+
+        # Normalize with a percentile to reduce dominance of a few far samples.
+        scale = np.percentile(vals, 99.0)
+        vals = vals / (scale + 1e-9)
+        vals = np.clip(vals, 0.0, 1.0)
+
+        # Lift near-surface values so they are still visible and bias toward bright ends.
+        min_intensity = 0.18
+        gamma = 0.6
+        intensities = min_intensity + (1.0 - min_intensity) * np.power(vals, gamma)
+
+        colors = np.stack([
+            base_color[0] * intensities,
+            base_color[1] * intensities,
+            base_color[2] * intensities,
+        ], axis=-1)
+        server.scene.add_point_cloud(
+            name=name,
+            points=xyz[mask],
+            colors=colors,
+            point_size=marker_size,
+        )
+
+    _add_points(pos_mask, (0.2, 0.6, 1.0), "sdf_pos")
+    _add_points(neg_mask, (1.0, 0.0, 0.0), "sdf_neg")
+
+    return server
+
 def generate_linkage_datasets(
         urdf_path: str | Path,
         data_save_dir: str | Path,
@@ -383,20 +619,48 @@ def generate_linkage_datasets(
         q=q_sample.cpu().numpy(),
     )
 
-    
+
+def _smoke_test_sdf():
+    """Minimal SDF sampling/query test using chain_0 if available."""
+
+    urdf_path = Path("data/out_chains/chain_2.urdf")
+    if not urdf_path.is_file():
+        print("[SDF test] Skipped (urdf not found)")
+        return
+
+    B = 128
+    model = ChainModel(urdf_path, samples_per_link=128)
+    q = model.sample_q(B=B)
+    model.update_status(q)
+
+    pts = model.sample_query_points(n=275000)
+    sdf = model.query_sdf(pts)
+
+    for idx in range(B):
+        visualize_sdf_viser(
+            mesh=model.get_trimesh_q(idx, boolean_merged=True),
+            sdf_samples=torch.cat([pts[idx], sdf[idx].unsqueeze(-1)], dim=-1).cpu().numpy(),
+            host="127.0.0.1",
+            port=9200 + idx,
+            downsample_ratio=0.003
+        )
+
+        print(f"[SDF test] pts shape {pts.shape}, sdf stats mean={sdf.mean():.4f}, min={sdf.min():.4f}, max={sdf.max():.4f}")
 
 if __name__ == '__main__':
-    urdf_dir = "data/out_chains/"
-    data_save_dir = "data/chain_meshes/"
-    Path(data_save_dir).mkdir(parents=True, exist_ok=True)
-    num_links = 1100
-    num_configs = 100
-    for i in range(num_links):
-        urdf_path = Path(urdf_dir) / f"chain_{i}.urdf"
-        generate_linkage_datasets(
-            urdf_path,
-            data_save_dir,
-            B=num_configs,
-            visualize=False,
-        )
-        print(f"Saved chain {i} data to {data_save_dir}")
+    _smoke_test_sdf()
+
+    # urdf_dir = "data/out_chains_v2/"
+    # data_save_dir = "data/chain_meshes/"
+    # Path(data_save_dir).mkdir(parents=True, exist_ok=True)
+    # num_links = 1100
+    # num_configs = 100
+    # for i in range(num_links):
+    #     urdf_path = Path(urdf_dir) / f"chain_{i}.urdf"
+    #     generate_linkage_datasets(
+    #         urdf_path,
+    #         data_save_dir,
+    #         B=num_configs,
+    #         visualize=False,
+    #     )
+    #     print(f"Saved chain {i} data to {data_save_dir}")

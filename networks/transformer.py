@@ -1,6 +1,8 @@
-from typing import Optional
+from typing import Optional, Sequence
 import torch
 import torch.nn as nn
+import matplotlib.pyplot as plt
+import numpy as np
 
 
 def _build_sinusoidal_positional_encoding(
@@ -178,6 +180,136 @@ class TransformerEncoder(nn.Module):
         mask = torch.triu(mask, diagonal=1)
         self._cached_causal_mask = mask
         return mask
+
+
+# ---------------------------------------------------------------------------
+# Attention attribution utilities
+# ---------------------------------------------------------------------------
+
+def compute_token_dependency(
+    model: TransformerEncoder,
+    x: torch.Tensor,
+    *,
+    key_padding_mask: Optional[torch.Tensor] = None,
+    attn_mask: Optional[torch.Tensor] = None,
+    causal: bool = False,
+) -> torch.Tensor:
+    """Compute aggregated token-to-token dependency via attention rollout.
+
+    Returns a ``(batch, seq_len, seq_len)`` tensor where entry ``(b, i, j)``
+    approximates how much input token ``j`` contributes to output token ``i``
+    after compounding attention across all encoder layers. This follows the
+    attention rollout scheme (Abnar & Zuidema, 2020), using the averaged
+    attention weights available from PyTorch's ``MultiheadAttention``.
+    """
+
+    if x.dim() != 3:
+        raise ValueError(f"Expected (batch, length, dim) input, got {tuple(x.shape)}")
+
+    attn_maps: list[torch.Tensor] = []
+
+    def _save_attn(_: nn.Module, __: tuple, output: tuple) -> None:
+        # MultiheadAttention returns (attn_output, attn_weights) when need_weights=True
+        if isinstance(output, tuple) and len(output) == 2 and output[1] is not None:
+            attn_maps.append(output[1].detach())
+
+    # Temporarily force need_weights=True so hooks receive attn maps
+    patched_forwards = []
+    handles = []
+    try:
+        for layer in model.encoder.layers:
+            mha = layer.self_attn
+            orig_forward = mha.forward
+
+            def _patched_forward(*args, orig_forward=orig_forward, **kwargs):
+                kwargs.setdefault("need_weights", True)
+                kwargs.setdefault("average_attn_weights", True)
+                return orig_forward(*args, **kwargs)
+
+            patched_forwards.append((mha, orig_forward))
+            mha.forward = _patched_forward  # type: ignore[assignment]
+            handles.append(mha.register_forward_hook(_save_attn))
+
+        # Force math attention (disable flash/mem-efficient) so PyTorch returns weights.
+        sdp_ctx = (
+            torch.backends.cuda.sdp_kernel(enable_flash=False, enable_mem_efficient=False, enable_math=True)
+            if torch.cuda.is_available()
+            else torch.backends.cuda.sdp_kernel()
+        )
+        with sdp_ctx, torch.no_grad():
+            _ = model(
+                x,
+                key_padding_mask=key_padding_mask,
+                attn_mask=attn_mask,
+                causal=causal,
+            )
+    finally:
+        for h in handles:
+            h.remove()
+        for mha, orig_forward in patched_forwards:
+            mha.forward = orig_forward  # restore
+
+    if not attn_maps:
+        raise RuntimeError("No attention maps were captured; verify model has encoder layers.")
+
+    # attn_maps: list of (batch, seq_len, seq_len) averaged over heads
+    seq_len = attn_maps[0].size(-1)
+    batch = attn_maps[0].size(0)
+    device = attn_maps[0].device
+
+    rollout = torch.eye(seq_len, device=device).unsqueeze(0).expand(batch, -1, -1)
+
+    for attn in attn_maps:
+        # Add residual connection per rollout definition
+        attn = attn + torch.eye(seq_len, device=device)
+        attn = attn / attn.sum(dim=-1, keepdim=True).clamp_min(1e-6)
+        rollout = torch.bmm(attn, rollout)
+
+    # Optional masking: zero-out padded tokens' influence on outputs
+    if key_padding_mask is not None:
+        mask = (~key_padding_mask).float().unsqueeze(1)  # (B,1,L)
+        rollout = rollout * mask
+
+    return rollout
+
+
+def plot_token_dependency(
+    dependency: torch.Tensor | np.ndarray,
+    *,
+    token_labels: Optional[Sequence[str]] = None,
+    title: str = "Token dependency",
+    figsize: tuple[float, float] = (5.0, 4.0),
+    cmap: str = "viridis",
+) -> tuple[plt.Figure, plt.Axes]:
+    """Plot a heatmap for a ``(seq_len, seq_len)`` dependency matrix."""
+
+    if isinstance(dependency, torch.Tensor):
+        dep = dependency.detach().cpu()
+        if dep.dim() == 3:
+            dep = dep[0]  # take first sample if batch provided
+        dependency_np = dep.numpy()
+    else:
+        dependency_np = np.asarray(dependency)
+
+    if dependency_np.ndim != 2 or dependency_np.shape[0] != dependency_np.shape[1]:
+        raise ValueError("dependency must be square (seq_len x seq_len)")
+
+    seq_len = dependency_np.shape[0]
+    if token_labels is None:
+        token_labels = [f"t{i}" for i in range(seq_len)]
+
+    fig, ax = plt.subplots(figsize=figsize)
+    im = ax.imshow(dependency_np, cmap=cmap, origin="lower")
+    ax.set_xticks(range(seq_len))
+    ax.set_yticks(range(seq_len))
+    ax.set_xticklabels(token_labels, rotation=45, ha="right")
+    ax.set_yticklabels(token_labels)
+    ax.set_xlabel("Input tokens")
+    ax.set_ylabel("Output tokens")
+    ax.set_title(title)
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="Contribution")
+    fig.tight_layout()
+    return fig, ax
 
 
 if __name__ == "__main__":

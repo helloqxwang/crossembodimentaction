@@ -12,10 +12,29 @@
             "console": "integratedTerminal"
         },
         {
-            "name": "Generate Samples",
+            "name": "SDF Samples Analytical",
             "type": "debugpy",
             "request": "launch",
-            "program": "${workspaceFolder}/data_process/data_generate_samples.py",
+            "program": "${workspaceFolder}/data_process/SDF_samples_analytical.py",
+            "args": [
+            "${workspaceFolder}/data",
+            "--urdf-dir", "${workspaceFolder}/data/out_chains_v2",
+            "--dest", "${workspaceFolder}/data/chain_samples_v2",
+            "--n-samples", "275000",
+            "--n-configs", "100",
+            "--near-surface-ratio", "0.95",
+            "--var", "0.0025",
+            "--batch-size", "100",
+            "--device", "cuda",
+            "--max-chains", "-1"
+            ],
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "SDF Samples",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/data_process/SDF_samples.py",
             "args": [
             "${workspaceFolder}/data",
             "--nproc",
