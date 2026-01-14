@@ -63,10 +63,10 @@
             ]
         },
         {
-            "name": "Train_sdf",
+            "name": "Train_fk",
             "type": "debugpy",
             "request": "launch",
-            "program": "${workspaceFolder}/train_sdf.py",
+            "program": "${workspaceFolder}/train_fk.py",
             "console": "integratedTerminal",
             "env": {
                 "WANDB_MODE": "disabled"

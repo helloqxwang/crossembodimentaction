@@ -5,27 +5,20 @@ data:
   data_source: ./data/
   indices:
     start: 0
-    end: 3000
+    end: 30
   val_indices:
     start: 3000
     end: 3100
   num_instances: 100
   subsample: 16384
-  batch_size: 48
-  val_batch_size: 32
+  batch_size: 1
+  val_batch_size: 1
   max_num_links: 5
   shuffle: true
   num_workers: 20
   drop_last: true
 
 models:
-  joint_encoder:
-    input_dim: 9
-    output_dim: 128
-    hidden_dims: [128, 128]
-    activation: gelu
-    dropout: 0.0
-    use_layer_norm: false
   link_encoder:
     input_dim: 1024
     output_dim: 128
@@ -33,10 +26,10 @@ models:
     activation: gelu
     dropout: 0.0
     use_layer_norm: false
-  joint_value_encoder:
-    embed_dim: 128
-    use_positional: true
-    mlp_hidden: [128]
+  pose_encoder:
+    input_dim: 9
+    output_dim: 128
+    hidden_dims: [128, 128]
     activation: gelu
     dropout: 0.0
     use_layer_norm: false
@@ -50,7 +43,7 @@ models:
     dropout: 0.1
     attn_dropout: 0.0
     activation: gelu
-    use_positional_encoding: true
+    use_positional_encoding: false
     max_length: 32
     norm_first: true
     final_layer_norm: true
@@ -76,7 +69,7 @@ training:
   wandb:
     enabled: true
     project: action_repr
-    run_name: mask-fk
+    run_name: pose-transformer
     save_interval: 5
     save_dir: ./checkpoints
   lr_schedules:

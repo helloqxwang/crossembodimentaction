@@ -12,7 +12,7 @@ from data_process.dataset import get_dataloader
 from networks.deep_sdf_decoder import Decoder
 from networks.mlp import MLP
 from networks.transformer import TransformerEncoder
-from networks.value_encoder import ScalarValueEncoder
+
 
 def _prepare_device(device_str: str) -> torch.device:
     if device_str.startswith("cuda") and not torch.cuda.is_available():
@@ -21,16 +21,6 @@ def _prepare_device(device_str: str) -> torch.device:
 
 
 def build_models(cfg: DictConfig, device: torch.device) -> Dict[str, torch.nn.Module]:
-    joint_encoder_cfg = cfg.models.joint_encoder
-    joint_encoder = MLP(
-        input_dim=joint_encoder_cfg.input_dim,
-        output_dim=joint_encoder_cfg.output_dim,
-        hidden_dims=joint_encoder_cfg.hidden_dims,
-        activation=joint_encoder_cfg.activation,
-        dropout=joint_encoder_cfg.dropout,
-        use_layer_norm=joint_encoder_cfg.use_layer_norm,
-    ).to(device)
-
     link_encoder_cfg = cfg.models.link_encoder
     link_encoder = MLP(
         input_dim=link_encoder_cfg.input_dim,
@@ -41,14 +31,14 @@ def build_models(cfg: DictConfig, device: torch.device) -> Dict[str, torch.nn.Mo
         use_layer_norm=link_encoder_cfg.use_layer_norm,
     ).to(device)
 
-    joint_value_cfg = cfg.models.joint_value_encoder
-    joint_value_encoder = ScalarValueEncoder(
-        embed_dim=joint_value_cfg.embed_dim,
-        use_positional=joint_value_cfg.use_positional,
-        mlp_hidden=joint_value_cfg.mlp_hidden,
-        activation=joint_value_cfg.activation,
-        dropout=joint_value_cfg.dropout,
-        use_layer_norm=joint_value_cfg.use_layer_norm,
+    pose_encoder_cfg = cfg.models.pose_encoder
+    pose_encoder = MLP(
+        input_dim=pose_encoder_cfg.input_dim,
+        output_dim=pose_encoder_cfg.output_dim,
+        hidden_dims=pose_encoder_cfg.hidden_dims,
+        activation=pose_encoder_cfg.activation,
+        dropout=pose_encoder_cfg.dropout,
+        use_layer_norm=pose_encoder_cfg.use_layer_norm,
     ).to(device)
 
     transformer_cfg = cfg.models.transformer
@@ -82,25 +72,22 @@ def build_models(cfg: DictConfig, device: torch.device) -> Dict[str, torch.nn.Mo
         latent_dropout=decoder_cfg.latent_dropout,
     ).to(device)
 
+    # Shared positional embeddings per token type (geom vs pose).
+    geom_pos = torch.nn.Parameter(torch.zeros(transformer_cfg.model_dim, device=device))
+    pose_pos = torch.nn.Parameter(torch.zeros(transformer_cfg.model_dim, device=device))
+
     return {
-        "joint_encoder": joint_encoder,
         "link_encoder": link_encoder,
-        "joint_value_encoder": joint_value_encoder,
+        "pose_encoder": pose_encoder,
         "transformer": transformer,
         "decoder": decoder,
+        "geom_pos": geom_pos,
+        "pose_pos": pose_pos,
     }
 
 
-def pooled_latent(
-    transformer_out: torch.Tensor,
-    mask: torch.Tensor,
-    mode: str = "mean",
-) -> torch.Tensor:
-    """Pool token embeddings into a single latent.
-
-    mode: "mean" (default) or "max". Mask uses True for valid tokens.
-    """
-
+def pooled_latent(transformer_out: torch.Tensor, mask: torch.Tensor, mode: str = "mean") -> torch.Tensor:
+    """Pool token embeddings into a single latent; mask uses True for valid tokens."""
     if mode == "mean":
         weights = mask.float().unsqueeze(-1)
         summed = (transformer_out * weights).sum(dim=1)
@@ -112,13 +99,8 @@ def pooled_latent(
     raise ValueError(f"Unsupported pooling mode: {mode}")
 
 
-def decoder_forward(
-    decoder: Decoder,
-    latent: torch.Tensor,
-    sdf_samples: torch.Tensor,
-) -> torch.Tensor:
+def decoder_forward(decoder: Decoder, latent: torch.Tensor, sdf_samples: torch.Tensor) -> torch.Tensor:
     """Decode latent + xyz into sdf predictions."""
-
     xyz = sdf_samples[..., :3]  # (B, N, 3)
     B, N, _ = xyz.shape
     latent_expanded = latent.unsqueeze(1).expand(-1, N, -1)
@@ -126,38 +108,43 @@ def decoder_forward(
     decoder_out = decoder(decoder_in.view(B * N, -1))
     return decoder_out.view(B, N, -1)
 
+
 def inference(
     batch: Dict[str, torch.Tensor],
     models: Dict[str, torch.nn.Module],
     device: torch.device = torch.device("cpu"),
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    joint_encoder = models["joint_encoder"]
     link_encoder = models["link_encoder"]
-    joint_value_encoder = models["joint_value_encoder"]
+    pose_encoder = models["pose_encoder"]
     transformer = models["transformer"]
     decoder = models["decoder"]
+    geom_pos = models["geom_pos"]
+    pose_pos = models["pose_pos"]
 
     sdf_samples = batch["sdf_samples"].to(device)
-    chain_q = batch["chain_q"].to(device)  # (B, L-1)
     link_features = batch["link_bps_scdistances"].to(device)  # (B, L, 257)
-    joint_features = batch["joint_features"].to(device)  # (B, L-1, 9)
-    mask = batch["mask"].to(device)  # (B, 3*L-2)
-    links_mask = batch["link_mask"].to(device)  # (B, L)
+    links_poses = batch["links_poses"].to(device)             # (B, L, 9)
+    mask_links = batch["link_mask"].to(device)                # (B, L)
 
-    joint_fts = joint_encoder(joint_features)          # (B, L-1, D)
-    link_fts = link_encoder(link_features)             # (B, L, D)
-    joint_vals = joint_value_encoder(chain_q)          # (B, L-1, D)
+    link_fts = link_encoder(link_features)  # (B, L, D)
+    pose_fts = pose_encoder(links_poses)    # (B, L, D)
+
+    # Apply shared positional embeddings per type.
+    link_fts = link_fts + geom_pos
+    pose_fts = pose_fts + pose_pos
 
     max_num_links = link_features.size(1)
     tokens = []
+    token_mask_parts = []
     for i in range(max_num_links):
         tokens.append(link_fts[:, i])
-        if i < max_num_links - 1:
-            tokens.append(joint_fts[:, i])
-            tokens.append(joint_vals[:, i])
+        token_mask_parts.append(mask_links[:, i])
+        tokens.append(pose_fts[:, i])
+        token_mask_parts.append(mask_links[:, i])
 
-    token_tensor = torch.stack(tokens, dim=1)  # (B, T, D)
-    key_padding_mask = ~mask  # transformer expects True for padding
+    token_tensor = torch.stack(tokens, dim=1)  # (B, 2L, D)
+    token_mask = torch.stack(token_mask_parts, dim=1)  # (B, 2L)
+    key_padding_mask = ~token_mask  # transformer expects True for padding
 
     transformer_out = transformer(
         token_tensor,
@@ -165,7 +152,9 @@ def inference(
         causal=True,
     )
 
-    latent = pooled_latent(transformer_out[:, ::3], links_mask, mode="max")
+    # Keep only geometry outputs (even indices 0,2,4...).
+    geom_out = transformer_out[:, ::2]
+    latent = pooled_latent(geom_out, mask_links, mode="max")
     sdf_pred = decoder_forward(decoder, latent, sdf_samples)
 
     return latent, sdf_pred
@@ -182,7 +171,8 @@ def _compute_lr(schedule_cfg, epoch: int, default_lr: float) -> float:
         return initial * (factor ** (epoch // max(interval, 1)))
     raise ValueError(f"Unsupported LR schedule type: {schedule_cfg.Type}")
 
-@hydra.main(config_path="conf", config_name="config", version_base="1.3")
+
+@hydra.main(config_path="conf", config_name="config_pose", version_base="1.3")
 def main(cfg: DictConfig) -> None:
     device = _prepare_device(cfg.training.device)
     torch.manual_seed(0)
@@ -209,6 +199,7 @@ def main(cfg: DictConfig) -> None:
         shuffle=cfg.data.shuffle,
         num_workers=cfg.data.num_workers,
         drop_last=cfg.data.drop_last,
+        pose_mode=True,
     )
 
     val_loader = get_dataloader(
@@ -221,14 +212,16 @@ def main(cfg: DictConfig) -> None:
         shuffle=False,
         num_workers=0,
         drop_last=False,
+        pose_mode=True,
     )
     val_iter = iter(val_loader)
 
     models = build_models(cfg, device)
-    # init_lr = _compute_lr(active_schedule, 0, lr)
     init_lr = lr
     optimizer = torch.optim.Adam(
-        [p for m in models.values() for p in m.parameters()], lr=init_lr
+        [p for m in models.values() if isinstance(m, torch.nn.Module) for p in m.parameters()] +
+        [models["geom_pos"], models["pose_pos"]],
+        lr=init_lr,
     )
     loss_fn = torch.nn.L1Loss()
 
@@ -263,11 +256,6 @@ def main(cfg: DictConfig) -> None:
         return val_loss_val
 
     for epoch in range(num_epochs):
-        # step LR per epoch
-        # new_lr = _compute_lr(active_schedule, epoch, lr)
-        # for g in optimizer.param_groups:
-        #     g["lr"] = new_lr
-
         for batch in tqdm(sdf_loader, desc=f"Epoch {epoch+1}/{num_epochs}"):
             optimizer.zero_grad()
             latent, sdf_pred = inference(batch, models, device=device)
@@ -291,7 +279,7 @@ def main(cfg: DictConfig) -> None:
             torch.save(
                 {
                     "epoch": epoch + 1,
-                    "models": {k: m.state_dict() for k, m in models.items()},
+                    "models": {k: m.state_dict() if isinstance(m, torch.nn.Module) else m.detach().cpu() for k, m in models.items()},
                     "optimizer": optimizer.state_dict(),
                     "config": dict(cfg),
                 },
@@ -301,6 +289,7 @@ def main(cfg: DictConfig) -> None:
 
     if use_wandb:
         wandb.finish()
+
 
 if __name__ == "__main__":
     main()

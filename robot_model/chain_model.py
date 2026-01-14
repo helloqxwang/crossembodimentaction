@@ -476,6 +476,54 @@ class ChainModel:
 
         return axes_world
 
+    def get_link_poses_world(self) -> torch.Tensor:
+        """Return current link poses as (num_links, 4, 4) in world frame.
+
+        Requires ``update_status`` to have been called. Does not modify state.
+        """
+        if self.frame_status is None:
+            raise RuntimeError('Call update_status() before requesting link poses.')
+
+        poses = []
+        for link_name in self.meshes.keys():
+            poses.append(self.frame_status[link_name].get_matrix())
+        # frame_status matrices are (B,4,4); we keep current batch dimension.
+        return torch.stack(poses, dim=1)  # (B, num_links, 4, 4)
+
+    def get_mesh_from_poses(self, poses_world: torch.Tensor, boolean_merged: bool = True) -> List[trimesh.Trimesh]:
+        """Return meshes positioned by provided poses (B, num_links, 4, 4).
+
+        Does not touch self.q or self.frame_status; applies the given poses
+        directly to the stored rest meshes. Returns list of length B.
+        """
+        if poses_world.ndim != 4:
+            raise ValueError(f"poses_world must be (B, num_links, 4, 4); got shape {poses_world.shape}")
+
+        B, n_links, _, _ = poses_world.shape
+        if n_links != len(self.meshes):
+            raise ValueError(f"poses_world has {n_links} links, but model has {len(self.meshes)}")
+
+        meshes_out: List[trimesh.Trimesh] = []
+        link_names = list(self.meshes.keys())
+
+        for b in range(B):
+            transformed = []
+            for idx, link_name in enumerate(link_names):
+                m = self.meshes[link_name].copy()
+                m.apply_transform(poses_world[b, idx].detach().cpu().numpy())
+                transformed.append(m)
+            if boolean_merged:
+                try:
+                    merged = trimesh.boolean.union(transformed)
+                    if merged is not None:
+                        meshes_out.append(merged)
+                        continue
+                except Exception as exc:
+                    print(f"[get_mesh_from_poses] boolean union failed, falling back to concat: {exc}")
+            meshes_out.append(trimesh.util.concatenate(transformed))
+
+        return meshes_out
+
 def visualize_chain_pc(
         pc: torch.Tensor,
         link_names: List[str],
@@ -665,7 +713,7 @@ def generate_linkage_datasets(
 def _smoke_test_sdf():
     """Minimal SDF sampling/query test using chain_0 if available."""
 
-    urdf_path = Path("data/out_chains/chain_1.urdf")
+    urdf_path = Path("data/out_chains_v2/chain_2.urdf")
     if not urdf_path.is_file():
         print("[SDF test] Skipped (urdf not found)")
         return
@@ -680,22 +728,18 @@ def _smoke_test_sdf():
     pts = model.sample_query_points(n=275000, mask=mask)
     sdf = model.query_sdf(pts, mask=mask)
 
-    for idx in range(1, B):
-        visualize_sdf_viser(
-            mesh=model.get_trimesh_q(idx, boolean_merged=True, mask=mask),
-            sdf_samples=torch.cat([pts[idx], sdf[idx].unsqueeze(-1)], dim=-1).cpu().numpy(),
-            host="127.0.0.1",
-            port=9200 + idx,
-            downsample_ratio=0.003
-        )
-        visualize_sdf_viser(
-            mesh=model.get_trimesh_q(idx, boolean_merged=True),
-            sdf_samples=torch.cat([pts[idx], sdf[idx].unsqueeze(-1)], dim=-1).cpu().numpy(),
-            host="127.0.0.1",
-            port=9200 + idx,
-            downsample_ratio=0.003
-        )
+    link_6d_poses = model.get_link_poses_world()
+    mesh = model.get_mesh_from_poses(link_6d_poses, boolean_merged=True)[0]
 
+    for idx in range(0, B):
+        visualize_sdf_viser(
+            # mesh=model.get_trimesh_q(idx, boolean_merged=True, mask=mask),
+            mesh=mesh,
+            sdf_samples=torch.cat([pts[idx], sdf[idx].unsqueeze(-1)], dim=-1).cpu().numpy(),
+            host="127.0.0.1",
+            port=9200 + idx,
+            downsample_ratio=0.003
+        )
         print(f"[SDF test] pts shape {pts.shape}, sdf stats mean={sdf.mean():.4f}, min={sdf.min():.4f}, max={sdf.max():.4f}")
 
 if __name__ == '__main__':

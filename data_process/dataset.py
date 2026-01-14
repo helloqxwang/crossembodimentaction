@@ -13,6 +13,48 @@ from pathlib import Path
 import sys
 sys.path.append(str(Path(__file__).resolve().parent.parent / ""))
 from robot_model.chain_model import ChainModel, visualize_sdf_viser
+import torch.nn.functional as F
+
+def rotation_6d_to_matrix(d6: torch.Tensor) -> torch.Tensor:
+    """
+    Converts 6D rotation representation by Zhou et al. [1] to rotation matrix
+    using Gram--Schmidt orthogonalisation per Section B of [1].
+    Args:
+        d6: 6D rotation representation, of size (*, 6)
+
+    Returns:
+        batch of rotation matrices of size (*, 3, 3)
+
+    [1] Zhou, Y., Barnes, C., Lu, J., Yang, J., & Li, H.
+    On the Continuity of Rotation Representations in Neural Networks.
+    IEEE Conference on Computer Vision and Pattern Recognition, 2019.
+    Retrieved from http://arxiv.org/abs/1812.07035
+    """
+
+    a1, a2 = d6[..., :3], d6[..., 3:]
+    b1 = F.normalize(a1, dim=-1)
+    b2 = a2 - (b1 * a2).sum(-1, keepdim=True) * b1
+    b2 = F.normalize(b2, dim=-1)
+    b3 = torch.cross(b1, b2, dim=-1)
+    return torch.stack((b1, b2, b3), dim=-2)
+
+
+def matrix_to_rotation_6d(matrix: torch.Tensor) -> torch.Tensor:
+    """
+    Converts rotation matrices to 6D rotation representation by Zhou et al. [1]
+    by dropping the last row. Note that 6D representation is not unique.
+    Args:
+        matrix: batch of rotation matrices of size (*, 3, 3)
+
+    Returns:
+        6D rotation representation, of size (*, 6)
+
+    [1] Zhou, Y., Barnes, C., Lu, J., Yang, J., & Li, H.
+    On the Continuity of Rotation Representations in Neural Networks.
+    IEEE Conference on Computer Vision and Pattern Recognition, 2019.
+    Retrieved from http://arxiv.org/abs/1812.07035
+    """
+    return matrix[..., :2, :].clone().reshape(*matrix.size()[:-2], 6)
 
 class NoMeshFileError(RuntimeError):
     """Raised when a mesh file is not found in a shape directory"""
@@ -108,12 +150,14 @@ class SDFSamples(torch.utils.data.Dataset):
         num_instances,
         subsample,
         ik=False,
+        pose_mode=False,
     ):
         self.subsample = subsample
         self.indices = indices
         self.num_instances = num_instances
         self.data_source = data_source
         self.ik = ik
+        self.pose_mode = pose_mode
 
         self.chain_qs = []
         self.links_properties = []
@@ -156,11 +200,17 @@ class SDFSamples(torch.utils.data.Dataset):
             perm = torch.randperm(model.num_links)[:n_to_mask]
             link_mask[perm] = False
 
+        scale_to = 1
         model.update_status(q)
         pts = model.sample_query_points(n=self.subsample, mask=link_mask)
         sdf_data = model.query_sdf(pts, mask=link_mask)
         sdf = torch.cat([pts[0], sdf_data[0].unsqueeze(-1)], dim=-1)
-        scale_to = 1
+        if self.pose_mode:
+            link_6d_poses = model.get_link_poses_world().squeeze(0)
+            link_pose_repr = torch.cat([
+                link_6d_poses[:, :3, 3], # translation
+                matrix_to_rotation_6d(link_6d_poses[:, :3, :3]).reshape(model.num_links, 6) # 6D rotation
+            ], dim=-1)
 
         link_features = torch.tensor(self.links_properties[class_idx]).float()
         joint_features = torch.tensor(self.joints_properties[class_idx]).float()
@@ -189,6 +239,7 @@ class SDFSamples(torch.utils.data.Dataset):
             'class_idx': class_real_idx, # scalar int
             'instance_idx': instance_idx, # scalar int
             'link_mask': link_mask, # Torch.Tensor of shape (num_links m,)
+            'links_poses': link_pose_repr if self.pose_mode else None, # Torch.Tensor of shape (num_links m, 9) 
         }
 
 def make_collate_fn(max_num_links: int):
@@ -199,6 +250,7 @@ def make_collate_fn(max_num_links: int):
         link_feat_dim = batch[0]["link_features"].shape[-1]          # 4
         joint_feat_dim = batch[0]["joint_features"].shape[-1]        # 9
         bps_dim = batch[0]["link_bps_scdistances"].shape[-1]         # 257
+        links_poses_dim = batch[0]["links_poses"].shape[-1] if batch[0]["links_poses"] is not None else 0
 
         # allocate
         sdf_samples = torch.stack([b["sdf_samples"] for b in batch], dim=0)
@@ -206,7 +258,7 @@ def make_collate_fn(max_num_links: int):
         link_features = torch.zeros(B, max_num_links, link_feat_dim, dtype=torch.float32)
         joint_features = torch.zeros(B, max_num_links - 1, joint_feat_dim, dtype=torch.float32)
         link_bps = torch.zeros(B, max_num_links, bps_dim, dtype=torch.float32)
-
+        links_poses = torch.zeros(B, max_num_links, links_poses_dim, dtype=torch.float32) if links_poses_dim > 0 else None
         masks = torch.zeros(B, 3 * max_num_links - 2, dtype=torch.bool)
         link_masks = torch.zeros(B, max_num_links, dtype=torch.bool)
 
@@ -224,7 +276,8 @@ def make_collate_fn(max_num_links: int):
             joint_features[i, :n_joints] = b["joint_features"]
             link_bps[i, :n_links] = b["link_bps_scdistances"]
             link_masks[i, :n_links] = b["link_mask"]
-
+            if links_poses is not None:
+                links_poses[i, :n_links] = b["links_poses"]
             masks[i, :3 * n_links - 2] = True
 
             class_idx.append(b["class_idx"])
@@ -241,6 +294,7 @@ def make_collate_fn(max_num_links: int):
             "instance_idx": instance_idx,               # list of scalars
             "mask": masks,                              # (B, 3*max_num_links-2)
             "link_mask": link_masks,                    # (B, max_num_links)
+            "links_poses": links_poses,               # (B, max_num_links, 9) or None
         }
     return collate_fn
 
@@ -255,6 +309,7 @@ def get_dataloader(
     num_workers: int = 0,
     drop_last: bool = True,
     ik=False,
+    pose_mode=False,
 ):
     dataset = SDFSamples(
         data_source=data_source,
@@ -262,6 +317,7 @@ def get_dataloader(
         num_instances=num_instances,
         subsample=subsample,
         ik=ik,
+        pose_mode=pose_mode,
     )
     collate_fn = make_collate_fn(max_num_links)
     loader = torch.utils.data.DataLoader(
@@ -277,12 +333,12 @@ def get_dataloader(
 if __name__ == "__main__":
     ### Test the dataset loading.
     data_source = "./data/"
-    indices = list(range(3000))
+    indices = list(range(30))
     num_instances = 100
     subsample = 16384
     batch_size = 64
     max_num_links = 5
-    num_workers = 20
+    num_workers = 0
 
     loader = get_dataloader(
         data_source=data_source,
@@ -294,6 +350,7 @@ if __name__ == "__main__":
         shuffle=True,
         num_workers=num_workers,
         drop_last=True,
+        pose_mode=True,
     )
 
     print(f"Dataset size: {len(loader.dataset)}")
@@ -306,7 +363,7 @@ if __name__ == "__main__":
         # print("joint_features:", batch["joint_features"].shape)
         # print("link_bps_scdistances:", batch["link_bps_scdistances"].shape)
         # print("mask:", batch["mask"].shape)
-
+        # print("links_poses:", batch["links_poses"].shape if batch["links_poses"] is not None else None)
         ### Visulization code
         # vis_cls = batch["class_idx"][0]
         # urdf_path = Path(f"data/out_chains_v2/chain_{vis_cls}.urdf")
