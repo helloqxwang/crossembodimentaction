@@ -2,7 +2,7 @@
 # Copyright 2004-present Facebook. All Rights Reserved.
 
 import glob
-import logging
+import math
 import numpy as np
 import os
 import random
@@ -107,7 +107,6 @@ class SDFSamples(torch.utils.data.Dataset):
         indices,
         num_instances,
         subsample,
-        load_ram=False,
         ik=False,
     ):
         self.subsample = subsample
@@ -116,13 +115,12 @@ class SDFSamples(torch.utils.data.Dataset):
         self.data_source = data_source
         self.ik = ik
 
-        self.npzfiles = []
         self.chain_qs = []
         self.links_properties = []
         self.joints_properties = []
         self.bpses = []
 
-        sdf_tokens_ls = []
+        self.chain_model_ls: list[tuple[ChainModel, int]] = []
         for class_idx, class_real_idx in enumerate(indices):
             chain_properties = np.load(os.path.join(
                 data_source, f'out_chains_v2',
@@ -131,55 +129,39 @@ class SDFSamples(torch.utils.data.Dataset):
             self.joints_properties.append(chain_properties['joints_property'])
             self.bpses.append(chain_properties['bpses'])
 
-            sdf_tokens_instance_ls = []
-            for instance_idx in range(num_instances):
-                filename = os.path.join(
-                    data_source,'chain_samples_v2',
-                    f'chain_{class_real_idx}',
-                    f'config_{instance_idx}',
-                    f"deepsdf.npz",
-                )
-                if not os.path.isfile(filename):
-                    # continue
-                    raise FileNotFoundError(filename)
-                if self.ik:
-                    sdf_tokens_instance_ls.append(torch.load(os.path.join(
-                        data_source,'sdf_tokens',
-                        f'cls{class_real_idx}_inst{instance_idx}.pt',
-                    ), weights_only=False))
-                self.npzfiles.append((filename, class_real_idx, class_idx, instance_idx))
-            if self.ik:
-                sdf_tokens_ls.append(torch.stack(sdf_tokens_instance_ls, dim=0))
-        
-        if self.ik:
-            self.sdf_tokens = torch.stack(sdf_tokens_ls, dim=0).float()  # (num_classes, num_instances, token_dim)
-        self.load_ram = load_ram
-
-        if load_ram:
-            self.loaded_data = []
-            for filename, class_idx, instance_idx in tqdm(self.npzfiles):
-                npz = np.load(filename)
-                pos_tensor = remove_nans(torch.from_numpy(npz["pos"]))
-                neg_tensor = remove_nans(torch.from_numpy(npz["neg"]))
-                self.loaded_data.append(
-                    [
-                        pos_tensor[torch.randperm(pos_tensor.shape[0])],
-                        neg_tensor[torch.randperm(neg_tensor.shape[0])],
-                    ]
-                )
-
+            chain_model = ChainModel(
+                urdf_path=Path(os.path.join(
+                    data_source, f'out_chains_v2',
+                    f"chain_{class_real_idx}.urdf")),
+                    samples_per_link=128,
+                    device="cpu",
+            )
+            self.chain_model_ls.append((chain_model, class_real_idx))
+            self.chain_qs.append(chain_model.sample_q(num_instances).float())
+    
     def __len__(self):
-        return len(self.npzfiles)
+        return len(self.indices) * self.num_instances
 
     def __getitem__(self, idx):
-        filename, class_real_idx, class_idx, instance_idx = self.npzfiles[idx]
-        if self.load_ram:
-            sdf, scale_to = unpack_sdf_samples_from_ram(self.loaded_data[idx], self.subsample)
-        else:
-            sdf, scale_to, q = unpack_sdf_samples(filename, self.subsample)
+        class_idx = idx // self.num_instances
+        instance_idx = idx % self.num_instances
+        model, class_real_idx = self.chain_model_ls[class_idx]
+        q = self.chain_qs[class_idx][instance_idx]
+        # Randomly mask 0–80% of links for SDF/mesh queries; keep at least one link visible.
+        link_mask = torch.ones((model.num_links,), dtype=torch.bool)
+        frac = random.random() * 0.8
+        n_to_mask = int(math.floor(frac * model.num_links))
+        n_to_mask = min(n_to_mask, model.num_links - 1)  # ensure at least one remains
+        if n_to_mask > 0:
+            perm = torch.randperm(model.num_links)[:n_to_mask]
+            link_mask[perm] = False
+
+        model.update_status(q)
+        pts = model.sample_query_points(n=self.subsample, mask=link_mask)
+        sdf_data = model.query_sdf(pts, mask=link_mask)
+        sdf = torch.cat([pts[0], sdf_data[0].unsqueeze(-1)], dim=-1)
         scale_to = 1
 
-        q = torch.from_numpy(q).float()
         link_features = torch.tensor(self.links_properties[class_idx]).float()
         joint_features = torch.tensor(self.joints_properties[class_idx]).float()
         # scale joint origins to match normalized mesh coordinates
@@ -206,6 +188,7 @@ class SDFSamples(torch.utils.data.Dataset):
             'sdf_tokens': self.sdf_tokens[class_idx, instance_idx] if self.ik else None, # Torch.Tensor of shape (token_dim, )
             'class_idx': class_real_idx, # scalar int
             'instance_idx': instance_idx, # scalar int
+            'link_mask': link_mask, # Torch.Tensor of shape (num_links m,)
         }
 
 def make_collate_fn(max_num_links: int):
@@ -225,6 +208,7 @@ def make_collate_fn(max_num_links: int):
         link_bps = torch.zeros(B, max_num_links, bps_dim, dtype=torch.float32)
 
         masks = torch.zeros(B, 3 * max_num_links - 2, dtype=torch.bool)
+        link_masks = torch.zeros(B, max_num_links, dtype=torch.bool)
 
         class_idx = []
         instance_idx = []
@@ -239,6 +223,7 @@ def make_collate_fn(max_num_links: int):
             link_features[i, :n_links] = b["link_features"]
             joint_features[i, :n_joints] = b["joint_features"]
             link_bps[i, :n_links] = b["link_bps_scdistances"]
+            link_masks[i, :n_links] = b["link_mask"]
 
             masks[i, :3 * n_links - 2] = True
 
@@ -254,7 +239,8 @@ def make_collate_fn(max_num_links: int):
             "sdf_tokens": torch.stack([b["sdf_tokens"] for b in batch], dim=0) if batch[0]["sdf_tokens"] is not None else None, # (B, token_dim)
             "class_idx": class_idx,                     # list of scalars
             "instance_idx": instance_idx,               # list of scalars
-            "mask": masks,                               # (B, 3*max_num_links-2)
+            "mask": masks,                              # (B, 3*max_num_links-2)
+            "link_mask": link_masks,                    # (B, max_num_links)
         }
     return collate_fn
 
@@ -265,7 +251,6 @@ def get_dataloader(
     subsample: int,
     batch_size: int,
     max_num_links: int,
-    load_ram: bool = False,
     shuffle: bool = True,
     num_workers: int = 0,
     drop_last: bool = True,
@@ -276,7 +261,6 @@ def get_dataloader(
         indices=indices,
         num_instances=num_instances,
         subsample=subsample,
-        load_ram=load_ram,
         ik=ik,
     )
     collate_fn = make_collate_fn(max_num_links)
@@ -293,12 +277,12 @@ def get_dataloader(
 if __name__ == "__main__":
     ### Test the dataset loading.
     data_source = "./data/"
-    indices = list(range(100))
+    indices = list(range(3000))
     num_instances = 100
     subsample = 16384
     batch_size = 64
     max_num_links = 5
-    num_workers = 0
+    num_workers = 20
 
     loader = get_dataloader(
         data_source=data_source,
@@ -307,7 +291,6 @@ if __name__ == "__main__":
         subsample=subsample,
         batch_size=batch_size,
         max_num_links=max_num_links,
-        load_ram=False,
         shuffle=True,
         num_workers=num_workers,
         drop_last=True,
@@ -315,13 +298,14 @@ if __name__ == "__main__":
 
     print(f"Dataset size: {len(loader.dataset)}")
     for i, batch in enumerate(tqdm(loader)):
-        print("Batch keys:", batch.keys())
-        print("sdf_samples:", batch["sdf_samples"].shape)
-        print("chain_q:", batch["chain_q"].shape)
-        print("link_features:", batch["link_features"].shape)
-        print("joint_features:", batch["joint_features"].shape)
-        print("link_bps_scdistances:", batch["link_bps_scdistances"].shape)
-        print("mask:", batch["mask"].shape)
+        pass
+        # print("Batch keys:", batch.keys())
+        # print("sdf_samples:", batch["sdf_samples"].shape)
+        # print("chain_q:", batch["chain_q"].shape)
+        # print("link_features:", batch["link_features"].shape)
+        # print("joint_features:", batch["joint_features"].shape)
+        # print("link_bps_scdistances:", batch["link_bps_scdistances"].shape)
+        # print("mask:", batch["mask"].shape)
 
         ### Visulization code
         # vis_cls = batch["class_idx"][0]
@@ -331,7 +315,7 @@ if __name__ == "__main__":
         # model.update_status(q)
 
         # visualize_sdf_viser(
-        #     mesh=model.get_trimesh_q(0, boolean_merged=True),
+        #     mesh=model.get_trimesh_q(0, boolean_merged=True, mask=batch['link_mask'][0]),
         #     sdf_samples=batch["sdf_samples"][0].cpu().numpy(),
         #     host="127.0.0.1",
         #     port=9200,

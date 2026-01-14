@@ -203,6 +203,7 @@ class ChainModel:
         self.joint_axes = _parse_joint_axes_from_urdf(self.urdf_path, device)
         self.link_points = self._sample_rest_pose_points(self.meshes, samples_per_link)
         self.frame_status = None
+        self.num_links = len(self.meshes)
 
     # Utilities
     def sample_q(self, B: int = 1) -> torch.Tensor:
@@ -225,7 +226,13 @@ class ChainModel:
         self.frame_status = self.pk_chain.forward_kinematics(self.q)
 
     # SDF sampling and queries
-    def sample_query_points(self, n: int, var: float = 0.0025, near_surface_ratio: float = 0.95) -> torch.Tensor:
+    def sample_query_points(
+        self,
+        n: int,
+        var: float = 0.0025,
+        near_surface_ratio: float = 0.95,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Sample query points for each pose in the current batch.
 
         Args:
@@ -246,8 +253,11 @@ class ChainModel:
         n_near = int(n * near_surface_ratio)
         n_uniform = n - n_near
 
-        pc_full = self.get_transformed_links_pc(num_points=None)  # (B, N, 4)
+        pc_full = self.get_transformed_links_pc(num_points=None, mask=mask)  # (B, N, 4)
         B, M, _ = pc_full.shape
+
+        if M == 0:
+            raise ValueError('Mask removed all links; no points to sample from.')
 
         all_batches = []
         for b in range(B):
@@ -282,7 +292,7 @@ class ChainModel:
 
         return torch.stack(all_batches, dim=0)
 
-    def query_sdf(self, points: torch.Tensor) -> torch.Tensor:
+    def query_sdf(self, points: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """Compute signed distance for ``points`` (B,N,3 or N,3) to the articulated chain.
 
         Uses analytic SDFs per link geometry (box/cylinder/capsule) and returns the
@@ -302,8 +312,18 @@ class ChainModel:
         dtype = points.dtype
         points = points.to(device)
 
+        link_names = list(self.geom_specs.keys())
+        mask_list = None
+        if mask is not None:
+            mask_bool = mask.to(dtype=torch.bool)
+            if mask_bool.numel() != len(link_names):
+                raise ValueError(f"Mask length {mask_bool.numel()} != number of links {len(link_names)}")
+            mask_list = mask_bool.flatten().tolist()
+
         sdf_all_links = []
-        for link_name, spec in self.geom_specs.items():
+        for idx, (link_name, spec) in enumerate(self.geom_specs.items()):
+            if mask_list is not None and not mask_list[idx]:
+                continue
             tf_world = self.frame_status[link_name].get_matrix().to(device=device, dtype=dtype)  # world_T_link (B,4,4)
             tf_world_inv = torch.linalg.inv(tf_world)  # link_T_world
 
@@ -364,6 +384,7 @@ class ChainModel:
         self,
         links_pc: Optional[Dict[str, torch.Tensor]] = None,
         num_points: Optional[int] = None,
+        mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if links_pc is None:
             links_pc = self.link_points
@@ -372,7 +393,17 @@ class ChainModel:
         all_pc = []
         link_names = list(links_pc.keys())
 
+        if mask is not None:
+            mask_bool = mask.to(dtype=torch.bool)
+            if mask_bool.numel() != len(link_names):
+                raise ValueError(f"Mask length {mask_bool.numel()} != number of links {len(link_names)}")
+            mask_flags = mask_bool.flatten().tolist()
+        else:
+            mask_flags = [True] * len(link_names)
+
         for link_idx, link_name in enumerate(link_names):
+            if not mask_flags[link_idx]:
+                continue
             local_pts = links_pc[link_name].to(self.device)
             n_pts = local_pts.shape[0]
             hom = torch.cat([local_pts, torch.ones((n_pts, 1), device=self.device, dtype=torch.float32)], dim=-1)
@@ -388,10 +419,21 @@ class ChainModel:
         return pc
 
     # Mesh export
-    def get_trimesh_q(self, idx: int, boolean_merged: bool=True) -> trimesh.Trimesh:
+    def get_trimesh_q(self, idx: int, boolean_merged: bool=True, mask: Optional[torch.Tensor] = None) -> trimesh.Trimesh:
         """Return mesh for configuration ``idx``; optionally boolean-merge to avoid overlaps."""
+        link_names = list(self.meshes.keys())
+        if mask is not None:
+            mask_bool = mask.to(dtype=torch.bool)
+            if mask_bool.numel() != len(link_names):
+                raise ValueError(f"Mask length {mask_bool.numel()} != number of links {len(link_names)}")
+            mask_flags = mask_bool.flatten().tolist()
+        else:
+            mask_flags = [True] * len(link_names)
+
         transformed_meshes = []
-        for link_name, mesh in self.meshes.items():
+        for link_idx, (link_name, mesh) in enumerate(self.meshes.items()):
+            if not mask_flags[link_idx]:
+                continue
             tf = self.frame_status[link_name].get_matrix()[idx].cpu().numpy()
             m = mesh.copy()
             m.apply_transform(tf)
@@ -623,7 +665,7 @@ def generate_linkage_datasets(
 def _smoke_test_sdf():
     """Minimal SDF sampling/query test using chain_0 if available."""
 
-    urdf_path = Path("data/out_chains/chain_2.urdf")
+    urdf_path = Path("data/out_chains/chain_1.urdf")
     if not urdf_path.is_file():
         print("[SDF test] Skipped (urdf not found)")
         return
@@ -633,10 +675,19 @@ def _smoke_test_sdf():
     q = model.sample_q(B=B)
     model.update_status(q)
 
-    pts = model.sample_query_points(n=275000)
-    sdf = model.query_sdf(pts)
+    mask = torch.ones((model.num_links, ), dtype=torch.bool)
+    mask[1::2] = False  # test link masking
+    pts = model.sample_query_points(n=275000, mask=mask)
+    sdf = model.query_sdf(pts, mask=mask)
 
-    for idx in range(B):
+    for idx in range(1, B):
+        visualize_sdf_viser(
+            mesh=model.get_trimesh_q(idx, boolean_merged=True, mask=mask),
+            sdf_samples=torch.cat([pts[idx], sdf[idx].unsqueeze(-1)], dim=-1).cpu().numpy(),
+            host="127.0.0.1",
+            port=9200 + idx,
+            downsample_ratio=0.003
+        )
         visualize_sdf_viser(
             mesh=model.get_trimesh_q(idx, boolean_merged=True),
             sdf_samples=torch.cat([pts[idx], sdf[idx].unsqueeze(-1)], dim=-1).cpu().numpy(),

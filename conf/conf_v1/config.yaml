@@ -16,7 +16,7 @@ data:
   max_num_links: 5
   load_ram: false
   shuffle: true
-  num_workers: 0
+  num_workers: 8
   drop_last: true
 
 models:
