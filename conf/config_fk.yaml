@@ -4,14 +4,14 @@ defaults:
 data:
   data_source: ./data/
   indices:
-    start: 1
-    end: 2
+    start: 0
+    end: 3000
   val_indices:
-    start: 2
-    end: 5
+    start: 3000
+    end: 3100
   num_instances: 100
   subsample: 16384
-  batch_size: 42
+  batch_size: 48
   val_batch_size: 32
   max_num_links: 5
   shuffle: true
@@ -21,41 +21,41 @@ data:
 models:
   joint_encoder:
     input_dim: 9
-    output_dim: 256  # was 128
-    hidden_dims: [256, 256]  # was [128, 128]
+    output_dim: 128
+    hidden_dims: [128, 128]
     activation: gelu
     dropout: 0.0
     use_layer_norm: false
   link_encoder:
     input_dim: 1024
-    output_dim: 256  # was 128
-    hidden_dims: [384, 384, 384]  # was [256, 256]
+    output_dim: 128
+    hidden_dims: [256, 256]
     activation: gelu
     dropout: 0.0
     use_layer_norm: false
   joint_value_encoder:
-    embed_dim: 256  # was 128
+    embed_dim: 128
     use_positional: true
-    mlp_hidden: [256]  # was [128]
+    mlp_hidden: [128]
     activation: gelu
     dropout: 0.0
     use_layer_norm: false
   transformer:
-    input_dim: 256  # was 128
-    model_dim: 256  # was 128
-    output_dim: 256  # was 128
-    num_heads: 8  # was 4
-    num_layers: 6  # was 4
+    input_dim: 128
+    model_dim: 128
+    output_dim: 128
+    num_heads: 4
+    num_layers: 4
     mlp_ratio: 4.0
     dropout: 0.1
     attn_dropout: 0.0
     activation: gelu
     use_positional_encoding: true
-    max_length: 16  # was 32
+    max_length: 32
     norm_first: true
     final_layer_norm: true
   decoder:
-    latent_size: 256
+    latent_size: 128
     dims: [512, 512, 512, 512, 512, 512, 512, 512]
     dropout: [0, 1, 2, 3, 4, 5, 6, 7]
     dropout_prob: 0.2
@@ -73,11 +73,11 @@ training:
   lr: 1e-4
   num_epochs: 1e8
   test_interval: 500
-  save_interval: 500
+  save_interval: 5
   wandb:
     enabled: true
     project: action_repr
-    run_name: mask-fk_single_1_big_100
+    run_name: mask-fk
     save_dir: ./checkpoints
   lr_schedules:
     - Type: Step

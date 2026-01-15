@@ -4,5 +4,5 @@
 # python 3.10
 # pytorch 2.9.1
 # pytorch3d repo install
-pip install pytorch-kinematics viser trimesh
+pip install pytorch-kinematics viser trimesh matplotlib scipy imageio pillow scikit-image trimesh libigl jupyterlab hydra-core wandb
 ```
