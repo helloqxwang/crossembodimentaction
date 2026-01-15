@@ -16,7 +16,7 @@ import time
 import numpy as np
 import plyfile
 import skimage
-
+from robot_model.chain_model import ChainModel, visualize_sdf_viser
 
 def convert_sdf_samples_to_ply(
     pytorch_3d_sdf_tensor,
@@ -310,16 +310,12 @@ def _validate_once(
 ) -> int:
     loss_fn = torch.nn.L1Loss()
     with torch.no_grad():
+        # batch['link_mask'] = torch.ones_like(batch['link_mask'])
         latent, sdf_pred = inference(batch, models, device=device)
         sdf_gt = batch["sdf_samples"].to(device)[..., 3].unsqueeze(-1)
         loss_val = loss_fn(sdf_pred, sdf_gt).item()
 
     logging.info(f"batch loss: {loss_val:.6f}")
-
-    class_indices = batch["class_idx"]
-    instance_indices = batch["instance_idx"]
-    gt_meshes = [trimesh.load(os.path.join(cfg.data.data_source, f"chain_meshes", f"chain_{class_idx}_{instance_idx}.obj"), force="mesh") for class_idx, instance_idx in zip(class_indices, instance_indices)]
-    radius = [float(np.linalg.norm(mesh.vertices, axis=1).max()) for mesh in gt_meshes]
     
     max_mesh_num = int(getattr(cfg.validation, "max_mesh_per_batch", 0))
     if max_mesh_num > 0:
@@ -328,6 +324,15 @@ def _validate_once(
         for i in range(min(max_mesh_num, latent.shape[0])):
             cls = batch["class_idx"][i]
             inst = batch["instance_idx"][i]
+            chain_model = ChainModel(
+                urdf_path=os.path.join(
+                    cfg.data.data_source, f'out_chains_v2', f"chain_{cls}.urdf"),
+                    samples_per_link=128,
+                    device="cpu",
+            )
+            chain_model.update_status(batch['chain_q'][i, :chain_model.dof].cpu())
+            gt_mesh = chain_model.get_trimesh_q(0)
+            radius = float(np.linalg.norm(gt_mesh.vertices, axis=1).max())
             name = f"cls{cls}_inst{inst}_m{mesh_counter+i}"
             out_path = os.path.join(save_root, name)
             reconstruct_mesh(
@@ -336,7 +341,7 @@ def _validate_once(
                 out_path=out_path,
                 N=mesh_cfg.N,
                 max_batch=mesh_cfg.max_batch,
-                grid_scale=radius[i] * 1.1,
+                grid_scale=radius * 1.5,
                 offset=mesh_cfg.get("offset", None),
                 scale=mesh_cfg.get("scale", None),
             )
@@ -345,10 +350,11 @@ def _validate_once(
             if getattr(vis_cfg, "enable", False):
                 visualize_meshes(
                     pred_mesh_path=out_path + ".ply",
-                    gt_mesh=gt_meshes[i],
+                    gt_mesh=gt_mesh,
                     port=vis_cfg.port,
                     show_pred_only=vis_cfg.get("show_pred_only", False),
                 )
+                print(f"Visualizing mesh on port {vis_cfg.port}...")
 
     return mesh_counter + latent.shape[0]
 
@@ -372,7 +378,6 @@ def main(cfg: DictConfig) -> None:
         subsample=cfg.data.subsample,
         batch_size=cfg.data.val_batch_size,
         max_num_links=cfg.data.max_num_links,
-        load_ram=cfg.data.load_ram,
         shuffle=False,
         num_workers=cfg.data.num_workers,
         drop_last=False,

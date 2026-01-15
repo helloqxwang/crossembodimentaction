@@ -5,20 +5,28 @@ data:
   data_source: ./data/
   indices:
     start: 0
-    end: 30
+    end: 100
   val_indices:
-    start: 3000
-    end: 3100
+    start: 101
+    end: 110
   num_instances: 100
   subsample: 16384
-  batch_size: 1
-  val_batch_size: 1
+  batch_size: 64
+  val_batch_size: 64
   max_num_links: 5
+  load_ram: false
   shuffle: true
-  num_workers: 20
+  num_workers: 8
   drop_last: true
 
 models:
+  joint_encoder:
+    input_dim: 9
+    output_dim: 128
+    hidden_dims: [128, 128]
+    activation: gelu
+    dropout: 0.0
+    use_layer_norm: false
   link_encoder:
     input_dim: 1024
     output_dim: 128
@@ -26,10 +34,10 @@ models:
     activation: gelu
     dropout: 0.0
     use_layer_norm: false
-  pose_encoder:
-    input_dim: 9
-    output_dim: 128
-    hidden_dims: [128, 128]
+  joint_value_encoder:
+    embed_dim: 128
+    use_positional: true
+    mlp_hidden: [128, 128]
     activation: gelu
     dropout: 0.0
     use_layer_norm: false
@@ -43,37 +51,35 @@ models:
     dropout: 0.1
     attn_dropout: 0.0
     activation: gelu
-    use_positional_encoding: false
+    use_positional_encoding: true
     max_length: 32
     norm_first: true
     final_layer_norm: true
-  decoder:
-    latent_size: 128
-    dims: [512, 512, 512, 512, 512, 512, 512, 512]
-    dropout: [0, 1, 2, 3, 4, 5, 6, 7]
-    dropout_prob: 0.2
-    norm_layers: [0, 1, 2, 3, 4, 5, 6, 7]
-    latent_in: [4]
-    xyz_in_all: false
-    use_tanh: false
-    latent_dropout: false
-    weight_norm: true
+  joint_value_decoder:
+    input_dim: 128
+    hidden_dims: [256, 128]
+    activation: gelu
+    dropout: 0.0
+    use_layer_norm: false
+
+flow_matching:
+  noise_std: 1.0
+  time_embed_dim: 128
+  time_mlp_hidden: 256
 
 training:
   device: cuda
   dtype: float32
-  debug_batch: true
   lr: 1e-4
-  num_epochs: 1e8
-  test_interval: 500
-  save_interval: 5
+  num_epochs: 1e6
+  validation_interval: 1000
+  inference_steps: 10
   wandb:
     enabled: true
     project: action_repr
-    run_name: pose-transformer
+    run_name: ik-transformer_fm
+    save_interval: 50
     save_dir: ./checkpoints
-  lr_schedules:
-    - Type: Step
-      Initial: 0.0005
-      Interval: 500
-      Factor: 0.5
+  lr_schedules: []
+  pretrained_ckpt: null
+  freeze_pretrained: false

@@ -1,0 +1,33 @@
+defaults:
+  - config
+  - _self_
+
+data:
+  data_source: ./data/
+  val_indices:
+    start: 1
+    end: 10
+  num_instances: 100
+  subsample: 16384
+  val_batch_size: 2
+  max_num_links: 5
+  load_ram: false
+  num_workers: 0
+  drop_last: true
+
+validation:
+  device: cuda
+  checkpoint: ./checkpoints/sdf-transformer_2/epoch_1300.pth
+  num_batches: null       # set to an integer to limit batches, or null for all
+  save_mesh_dir: ./outputs/val_meshes
+  max_mesh_per_batch: 4
+  mesh:
+    N: 256
+    max_batch: 262144
+    offset: null
+    scale: null
+  visualize:
+    enable: True
+    port: 8080
+    gt_mesh_template: null  # e.g. "${data.data_source}/chain_samples/chain_{class_idx}_{instance_idx}/mesh.ply"
+    show_pred_only: false

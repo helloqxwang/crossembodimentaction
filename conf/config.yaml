@@ -73,11 +73,11 @@ training:
   lr: 1e-4
   num_epochs: 1e8
   test_interval: 500
+  save_interval: 5
   wandb:
     enabled: true
     project: action_repr
     run_name: mask-fk
-    save_interval: 5
     save_dir: ./checkpoints
   lr_schedules:
     - Type: Step

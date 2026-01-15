@@ -83,6 +83,16 @@
             }
         },
         {
+            "name": "Train_ik_nf",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/train_ik_nf.py",
+            "console": "integratedTerminal",
+            "env": {
+                "WANDB_MODE": "disabled"
+            }
+        },
+        {
             "name": "Process SDF",
             "type": "debugpy",
             "request": "launch",
