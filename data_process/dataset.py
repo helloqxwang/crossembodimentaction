@@ -167,8 +167,7 @@ class SDFSamples(torch.utils.data.Dataset):
         self.chain_model_ls: list[tuple[ChainModel, int]] = []
         for class_idx, class_real_idx in enumerate(indices):
             chain_properties = np.load(os.path.join(
-                data_source, f'out_chains_v2',
-                f"chain_{class_real_idx}_properties.npz"), allow_pickle=True)
+                data_source, f'out_chains_v2', f"chain_{class_real_idx}_properties.npz"), allow_pickle=True)
             self.links_properties.append(chain_properties['links_property'])
             self.joints_properties.append(chain_properties['joints_property'])
             self.bpses.append(chain_properties['bpses'])

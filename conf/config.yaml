@@ -11,45 +11,50 @@ data:
     end: 2
   num_instances: 1000
   subsample: 4096
-  batch_size: 42
-  val_batch_size: 32
+  batch_size: 64
+  val_batch_size: 64
   max_num_links: 5
   shuffle: true
   num_workers: 20
   drop_last: true
 
 models:
+  sdf_latent_dim: &sld 128
+  hidden_dims: &hd 256
+
   joint_encoder:
-    use_fourier: false
+    use_fourier: true
     input_dim: 9
-    output_dim: 256
+    output_dim: *sld
     num_frequencies: 64
     sigma: 1.0
-    head_hidden_dims: [256, 256]
-    mlp_hidden_dims: [256, 256]
+    head_hidden_dims: [*hd, *hd]
+    mlp_hidden_dims: [*hd, *hd]
     activation: gelu
     dropout: 0.0
     use_layer_norm: false
   link_encoder:
     input_dim: 1024
-    output_dim: 256
-    hidden_dims: [384, 384, 384]
+    output_dim: *sld
+    hidden_dims: [*hd, *hd]
     activation: gelu
+    compact_repr: false
     dropout: 0.0
     use_layer_norm: false
   joint_value_encoder:
-    embed_dim: 256
+    embed_dim: *sld
     use_positional: true
-    num_frequencies: 64
-    mlp_hidden: [256]
-    positional_head_hidden_dims: [256, 256]
+    positional_type: fourier  # options: fourier, legacy
+    num_frequencies: 8
+    mlp_hidden: [*hd]
+    positional_head_hidden_dims: [*hd, *hd]
     activation: gelu
     dropout: 0.0
     use_layer_norm: false
   transformer:
-    input_dim: 256  # was 128
-    model_dim: 256  # was 128
-    output_dim: 256  # was 128
+    input_dim: *sld  # was 128
+    model_dim: *hd  # was 128
+    output_dim: *sld  # was 128
     num_heads: 8  # was 4
     num_layers: 6  # was 4
     mlp_ratio: 4.0
@@ -61,7 +66,7 @@ models:
     norm_first: true
     final_layer_norm: true
   decoder:
-    latent_size: 256
+    latent_size: *sld
     dims: [512, 512, 512, 512, 512, 512, 512, 512]
     dropout: [0, 1, 2, 3, 4, 5, 6, 7]
     dropout_prob: 0.2
@@ -77,13 +82,13 @@ training:
   dtype: float32
   debug_batch: true
   lr: 1e-4
-  num_epochs: 1e8
+  num_epochs: 1e10
   test_interval: 500
   save_interval: 500
   wandb:
     enabled: true
     project: action_repr
-    run_name: mask-fk_s_freq_MLP_fulljoint_enc
+    run_name: mask-fk_s_freq
     save_dir: ./checkpoints
   lr_schedules:
     - Type: Step

@@ -60,6 +60,7 @@ def build_models(cfg: DictConfig, device: torch.device) -> Dict[str, torch.nn.Mo
     joint_value_encoder = ScalarValueEncoder(
         embed_dim=joint_value_cfg.embed_dim,
         use_positional=joint_value_cfg.use_positional,
+        positional_type=getattr(joint_value_cfg, "positional_type", "fourier"),
         mlp_hidden=joint_value_cfg.mlp_hidden,
         activation=joint_value_cfg.activation,
         dropout=joint_value_cfg.dropout,
@@ -148,6 +149,7 @@ def decoder_forward(
 def inference(
     batch: Dict[str, torch.Tensor],
     models: Dict[str, torch.nn.Module],
+    cfg: DictConfig,
     device: torch.device = torch.device("cpu"),
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     joint_encoder = models["joint_encoder"]
@@ -158,12 +160,15 @@ def inference(
 
     sdf_samples = batch["sdf_samples"].to(device)
     chain_q = batch["chain_q"].to(device)  # (B, L-1)
-    link_features = batch["link_bps_scdistances"].to(device)  # (B, L, 257)
+    if cfg.models.link_encoder.compact_repr:
+        link_features = batch['link_features'].to(device)  # (B, L, 4)
+    else:
+        link_features = batch["link_bps_scdistances"].to(device)  # (B, L, 256 * 4)
     joint_features = batch["joint_features"].to(device)  # (B, L-1, 9)
     mask = batch["mask"].to(device)  # (B, 3*L-2)
     links_mask = batch["link_mask"].to(device)  # (B, L)
 
-    if isinstance(joint_encoder, AxisFourierEncoder):
+    if cfg.models.joint_encoder.use_fourier:
         # Use only the rotation axis (last 3 dims) for Fourier encoding
         joint_fts = joint_encoder(joint_features[..., -3:])
     else:
@@ -278,7 +283,7 @@ def main(cfg: DictConfig) -> None:
     def _run_val_step(step_tag: str) -> float:
         with torch.no_grad():
             val_batch = _next_val_batch()
-            _, val_pred = inference(val_batch, models, device=device)
+            _, val_pred = inference(val_batch, models, cfg=cfg, device=device)
             val_gt = val_batch["sdf_samples"].to(device)[..., 3].unsqueeze(-1)
             val_loss_val = loss_fn(val_pred, val_gt).item()
         if use_wandb:
@@ -293,7 +298,7 @@ def main(cfg: DictConfig) -> None:
 
         for batch in tqdm(sdf_loader, desc=f"Epoch {epoch+1}/{num_epochs}"):
             optimizer.zero_grad()
-            latent, sdf_pred = inference(batch, models, device=device)
+            latent, sdf_pred = inference(batch, models, cfg=cfg, device=device)
             sdf_gt = batch["sdf_samples"].to(device)[..., 3].unsqueeze(-1)
             loss = loss_fn(sdf_pred, sdf_gt)
             loss.backward()

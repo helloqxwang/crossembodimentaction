@@ -9,7 +9,7 @@ data:
     end: 10
   num_instances: 100
   subsample: 16384
-  val_batch_size: 2
+  val_batch_size: 4
   max_num_links: 5
   load_ram: false
   num_workers: 0
@@ -17,7 +17,7 @@ data:
 
 validation:
   device: cuda
-  checkpoint: ./checkpoints/mask-fk_single_1_big_100/epoch_19500.pth
+  checkpoint: ./checkpoints/mask-fk_s_freq/epoch_2500.pth
   num_batches: null       # set to an integer to limit batches, or null for all
   save_mesh_dir: ./outputs/val_meshes
   max_mesh_per_batch: 4
