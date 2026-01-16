@@ -24,6 +24,7 @@ def build_models(cfg: DictConfig, device: torch.device) -> Dict[str, torch.nn.Mo
     joint_encoder_cfg = cfg.models.joint_encoder
     if getattr(joint_encoder_cfg, "use_fourier", True):
         joint_encoder = AxisFourierEncoder(
+            input_dim=joint_encoder_cfg.input_dim,
             embed_dim=joint_encoder_cfg.output_dim,
             num_frequencies=joint_encoder_cfg.num_frequencies,
             sigma=getattr(joint_encoder_cfg, "sigma", 1.0),
@@ -131,7 +132,6 @@ def pooled_latent(
         return masked.max(dim=1).values
     raise ValueError(f"Unsupported pooling mode: {mode}")
 
-
 def decoder_forward(
     decoder: Decoder,
     latent: torch.Tensor,
@@ -168,11 +168,7 @@ def inference(
     mask = batch["mask"].to(device)  # (B, 3*L-2)
     links_mask = batch["link_mask"].to(device)  # (B, L)
 
-    if cfg.models.joint_encoder.use_fourier:
-        # Use only the rotation axis (last 3 dims) for Fourier encoding
-        joint_fts = joint_encoder(joint_features[..., -3:])
-    else:
-        joint_fts = joint_encoder(joint_features)
+    joint_fts = joint_encoder(joint_features)
     link_fts = link_encoder(link_features)             # (B, L, D)
     joint_vals = joint_value_encoder(chain_q)          # (B, L-1, D)
 
@@ -198,7 +194,6 @@ def inference(
 
     return latent, sdf_pred
 
-
 def _compute_lr(schedule_cfg, epoch: int, default_lr: float) -> float:
     if schedule_cfg is None:
         return default_lr
@@ -210,7 +205,7 @@ def _compute_lr(schedule_cfg, epoch: int, default_lr: float) -> float:
         return initial * (factor ** (epoch // max(interval, 1)))
     raise ValueError(f"Unsupported LR schedule type: {schedule_cfg.Type}")
 
-@hydra.main(config_path="conf", config_name="config", version_base="1.3")
+@hydra.main(config_path="conf/conf_fk", config_name="config", version_base="1.3")
 def main(cfg: DictConfig) -> None:
     device = _prepare_device(cfg.training.device)
     torch.manual_seed(0)

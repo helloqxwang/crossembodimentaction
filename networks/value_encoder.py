@@ -116,8 +116,9 @@ class AxisFourierEncoder(nn.Module):
     def __init__(
         self,
         *,
+        input_dim: int = 3,
         embed_dim: int = 256,
-        num_frequencies: int = 64,
+        num_frequencies: int = 16,
         sigma: float = 1.0,
         head_hidden_dims: Sequence[int] | Iterable[int] | None = None,
         activation: str = "gelu",
@@ -141,10 +142,10 @@ class AxisFourierEncoder(nn.Module):
         self.register_buffer("B", B, persistent=True)
 
         if len(head_hidden) == 0:
-            self.proj = nn.Linear(2 * num_frequencies, embed_dim)
+            self.proj = nn.Linear(2 * num_frequencies + input_dim - 3, embed_dim)
         else:
             self.proj = MLP(
-                input_dim=2 * num_frequencies,
+                input_dim=2 * num_frequencies + input_dim - 3,
                 output_dim=embed_dim,
                 hidden_dims=head_hidden,
                 activation=activation,
@@ -152,17 +153,15 @@ class AxisFourierEncoder(nn.Module):
                 use_layer_norm=use_layer_norm,
             )
 
-    def forward(self, axis: torch.Tensor) -> torch.Tensor:
-        if axis.dim() != 3 or axis.size(-1) != 3:
-            raise ValueError(
-                f"Expected axis shape (batch, length, 3), got {tuple(axis.shape)}"
-            )
+    def forward(self, input: torch.Tensor) -> torch.Tensor:
+        axis = input[..., -3:]  # (B, L, 3)
 
         axis = axis / axis.norm(dim=-1, keepdim=True).clamp_min(1e-6)
         # (B, L, K) where K=num_frequencies
         phases = 2 * math.pi * torch.matmul(axis, self.B.t())
         feats = torch.cat([torch.sin(phases), torch.cos(phases)], dim=-1)
 
+        feats = torch.cat([input[..., :-3], feats], dim=-1)  # (B, L, D)
         B, L, D = feats.shape
         out = self.proj(feats.view(B * L, D))
         return out.view(B, L, -1)

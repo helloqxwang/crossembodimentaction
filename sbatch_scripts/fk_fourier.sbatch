@@ -1,17 +1,17 @@
 #!/bin/bash
-#SBATCH -J DT                          # Job name
-#SBATCH --output=/home/qw325/log/pretrain_%j.out # STDOUT -> /home/qw325/log
-#SBATCH --error=/home/qw325/log/pretrain_%j.err  # STDERR -> /home/qw325/log
+#SBATCH -J fourier                          # Job name
+#SBATCH --output=/home/qw325/log/mask_fk_%j.out # STDOUT -> /home/qw325/log
+#SBATCH --error=/home/qw325/log/mask_fk_%j.err  # STDERR -> /home/qw325/log
 #SBATCH --mail-type=END,FAIL                    # 邮件通知类型（可改 ALL）
-#SBATCH --mail-user=NETID@cornell.edu           # 替换为你的邮箱
+#SBATCH --mail-user=qw325@cornell.edu           # 替换为你的邮箱
 #SBATCH --nodes=1                               # 节点数
 #SBATCH --ntasks=1                              # 任务数
-#SBATCH --cpus-per-task=20                      # 每任务 CPU 核数
-#SBATCH --mem=65536                             # 每节点内存（MB），按需调整
+#SBATCH --cpus-per-task=22                      # 每任务 CPU 核数
+#SBATCH --mem=24576                             # 每节点内存（MB），按需调整
 #SBATCH --time=3-00:00:00                          # 运行时长（3天）
 #SBATCH --partition=fang                        # 分区
 #SBATCH --gres=gpu:1                            # GPU 数
-#SBATCH --chdir=/home/qw325/Project/ActionRepresentation  # 进入项目目录
+#SBATCH --chdir=/home/qw325/Project/crossembodimentaction  # 进入项目目录
 
 set -eo pipefail
 
@@ -27,4 +27,4 @@ conda activate repr
 # export CUDA_HOME="$CONDA_PREFIX"
 
 # 4) 启动训练
-python /home/qw325/Project/ActionRepresentation/pretrain.py
+python /home/qw325/Project/crossembodimentaction/train_fk.py --config-name=config_fourier
