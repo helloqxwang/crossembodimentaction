@@ -20,23 +20,21 @@ data:
 
 models:
   joint_encoder:
-    input_dim: 9
-    output_dim: 256  # was 128
-    hidden_dims: [256, 256]  # was [128, 128]
-    activation: gelu
-    dropout: 0.0
-    use_layer_norm: false
+    output_dim: 256
+    num_frequencies: 64
+    sigma: 1.0
   link_encoder:
-    input_dim: 1024
-    output_dim: 256  # was 128
-    hidden_dims: [384, 384, 384]  # was [256, 256]
+    input_dim: 257
+    output_dim: 256
+    hidden_dims: [384, 384, 384]
     activation: gelu
     dropout: 0.0
     use_layer_norm: false
   joint_value_encoder:
-    embed_dim: 256  # was 128
+    embed_dim: 256
     use_positional: true
-    mlp_hidden: [256]  # was [128]
+    num_frequencies: 64
+    mlp_hidden: [256]
     activation: gelu
     dropout: 0.0
     use_layer_norm: false
@@ -77,7 +75,7 @@ training:
   wandb:
     enabled: true
     project: action_repr
-    run_name: mask-fk_single_1_big_0.005
+    run_name: mask-fk_s_freq
     save_dir: ./checkpoints
   lr_schedules:
     - Type: Step
