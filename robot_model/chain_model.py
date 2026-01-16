@@ -229,7 +229,7 @@ class ChainModel:
     def sample_query_points(
         self,
         n: int,
-        var: float = 0.0025,
+        var: float = 0.005,
         near_surface_ratio: float = 0.95,
         mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
