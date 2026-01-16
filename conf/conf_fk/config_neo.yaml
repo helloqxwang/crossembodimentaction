@@ -1,0 +1,97 @@
+defaults:
+  - _self_
+
+data:
+  data_source: ./data/
+  indices:
+    start: 1
+    end: 2
+  val_indices:
+    start: 1
+    end: 2
+  num_instances: 1000
+  subsample: 4096
+  batch_size: 64
+  val_batch_size: 64
+  max_num_links: 5
+  shuffle: true
+  num_workers: 8
+  drop_last: true
+
+models:
+  sdf_latent_dim: &sld 128
+  hidden_dims: &hd 256
+
+  joint_encoder:
+    use_fourier: true
+    input_dim: 9
+    output_dim: *sld
+    num_frequencies: 16
+    sigma: 1.0
+    head_hidden_dims: [*hd, *hd]
+    mlp_hidden_dims: [*hd, *hd]
+    activation: gelu
+    dropout: 0.0
+    use_layer_norm: false
+  link_encoder:
+    input_dim: 4
+    output_dim: *sld
+    hidden_dims: [*hd, *hd]
+    activation: gelu
+    compact_repr: true
+    dropout: 0.0
+    use_layer_norm: false
+  joint_value_encoder:
+    embed_dim: *sld
+    use_positional: true
+    positional_type: fourier  # options: fourier, legacy
+    num_frequencies: 8
+    mlp_hidden: [*hd, *hd]
+    positional_head_hidden_dims: [*hd, *hd]
+    activation: gelu
+    dropout: 0.0
+    use_layer_norm: false
+  transformer:
+    input_dim: *sld  # was 128
+    model_dim: *hd  # was 128
+    output_dim: *sld  # was 128
+    num_heads: 8  # was 4
+    num_layers: 6  # was 4
+    mlp_ratio: 4.0
+    dropout: 0.1
+    attn_dropout: 0.0
+    activation: gelu
+    use_positional_encoding: true
+    max_length: 16
+    norm_first: true
+    final_layer_norm: true
+  decoder:
+    latent_size: *sld
+    dims: [512, 512, 512, 512, 512, 512, 512, 512]
+    dropout: [0, 1, 2, 3, 4, 5, 6, 7]
+    dropout_prob: 0.2
+    norm_layers: [0, 1, 2, 3, 4, 5, 6, 7]
+    latent_in: [4]
+    xyz_in_all: false
+    use_tanh: false
+    latent_dropout: false
+    weight_norm: true
+
+training:
+  device: cuda
+  dtype: float32
+  debug_batch: true
+  lr: 1e-4
+  num_epochs: 1e10
+  test_interval: 500
+  save_interval: 500
+  wandb:
+    enabled: true
+    project: action_repr
+    run_name: mfk_neo
+    save_dir: ./checkpoints
+  lr_schedules:
+    - Type: Step
+      Initial: 0.0005
+      Interval: 500
+      Factor: 0.5

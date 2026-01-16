@@ -205,7 +205,7 @@ def _compute_lr(schedule_cfg, epoch: int, default_lr: float) -> float:
         return initial * (factor ** (epoch // max(interval, 1)))
     raise ValueError(f"Unsupported LR schedule type: {schedule_cfg.Type}")
 
-@hydra.main(config_path="conf/conf_fk", config_name="config", version_base="1.3")
+@hydra.main(config_path="conf/conf_fk", config_name="config_neo_100", version_base="1.3")
 def main(cfg: DictConfig) -> None:
     device = _prepare_device(cfg.training.device)
     torch.manual_seed(0)
