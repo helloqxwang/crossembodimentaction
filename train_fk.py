@@ -22,15 +22,29 @@ def _prepare_device(device_str: str) -> torch.device:
 
 def build_models(cfg: DictConfig, device: torch.device) -> Dict[str, torch.nn.Module]:
     joint_encoder_cfg = cfg.models.joint_encoder
-    joint_encoder = AxisFourierEncoder(
-        embed_dim=joint_encoder_cfg.output_dim,
-        num_frequencies=joint_encoder_cfg.num_frequencies,
-        sigma=getattr(joint_encoder_cfg, "sigma", 1.0),
-        head_hidden_dims=getattr(joint_encoder_cfg, "head_hidden_dims", None),
-        activation=getattr(joint_encoder_cfg, "activation", "gelu"),
-        dropout=getattr(joint_encoder_cfg, "dropout", 0.0),
-        use_layer_norm=getattr(joint_encoder_cfg, "use_layer_norm", False),
-    ).to(device)
+    if getattr(joint_encoder_cfg, "use_fourier", True):
+        joint_encoder = AxisFourierEncoder(
+            embed_dim=joint_encoder_cfg.output_dim,
+            num_frequencies=joint_encoder_cfg.num_frequencies,
+            sigma=getattr(joint_encoder_cfg, "sigma", 1.0),
+            head_hidden_dims=getattr(joint_encoder_cfg, "head_hidden_dims", None),
+            activation=getattr(joint_encoder_cfg, "activation", "gelu"),
+            dropout=getattr(joint_encoder_cfg, "dropout", 0.0),
+            use_layer_norm=getattr(joint_encoder_cfg, "use_layer_norm", False),
+        ).to(device)
+    else:
+        joint_encoder = MLP(
+            input_dim=joint_encoder_cfg.input_dim,
+            output_dim=joint_encoder_cfg.output_dim,
+            hidden_dims=getattr(
+                joint_encoder_cfg,
+                "mlp_hidden_dims",
+                getattr(joint_encoder_cfg, "head_hidden_dims", ()),
+            ),
+            activation=getattr(joint_encoder_cfg, "activation", "gelu"),
+            dropout=getattr(joint_encoder_cfg, "dropout", 0.0),
+            use_layer_norm=getattr(joint_encoder_cfg, "use_layer_norm", False),
+        ).to(device)
 
     link_encoder_cfg = cfg.models.link_encoder
     link_encoder = MLP(
@@ -149,8 +163,11 @@ def inference(
     mask = batch["mask"].to(device)  # (B, 3*L-2)
     links_mask = batch["link_mask"].to(device)  # (B, L)
 
-    # Use only the rotation axis (last 3 dims) for joint encoding
-    joint_fts = joint_encoder(joint_features[..., -3:])  # (B, L-1, D)
+    if isinstance(joint_encoder, AxisFourierEncoder):
+        # Use only the rotation axis (last 3 dims) for Fourier encoding
+        joint_fts = joint_encoder(joint_features[..., -3:])
+    else:
+        joint_fts = joint_encoder(joint_features)
     link_fts = link_encoder(link_features)             # (B, L, D)
     joint_vals = joint_value_encoder(chain_q)          # (B, L-1, D)
 

@@ -20,10 +20,13 @@ data:
 
 models:
   joint_encoder:
+    use_fourier: false
+    input_dim: 9
     output_dim: 256
     num_frequencies: 64
     sigma: 1.0
     head_hidden_dims: [256, 256]
+    mlp_hidden_dims: [256, 256]
     activation: gelu
     dropout: 0.0
     use_layer_norm: false
@@ -80,7 +83,7 @@ training:
   wandb:
     enabled: true
     project: action_repr
-    run_name: mask-fk_s_freq_MLP
+    run_name: mask-fk_s_freq_MLP_fulljoint_enc
     save_dir: ./checkpoints
   lr_schedules:
     - Type: Step
