@@ -10,7 +10,7 @@ data:
     start: 1
     end: 2
   num_instances: 1000
-  subsample: 16384
+  subsample: 4096
   batch_size: 42
   val_batch_size: 32
   max_num_links: 5
@@ -23,8 +23,12 @@ models:
     output_dim: 256
     num_frequencies: 64
     sigma: 1.0
+    head_hidden_dims: [256, 256]
+    activation: gelu
+    dropout: 0.0
+    use_layer_norm: false
   link_encoder:
-    input_dim: 257
+    input_dim: 1024
     output_dim: 256
     hidden_dims: [384, 384, 384]
     activation: gelu
@@ -35,6 +39,7 @@ models:
     use_positional: true
     num_frequencies: 64
     mlp_hidden: [256]
+    positional_head_hidden_dims: [256, 256]
     activation: gelu
     dropout: 0.0
     use_layer_norm: false
@@ -75,7 +80,7 @@ training:
   wandb:
     enabled: true
     project: action_repr
-    run_name: mask-fk_s_freq
+    run_name: mask-fk_s_freq_MLP
     save_dir: ./checkpoints
   lr_schedules:
     - Type: Step

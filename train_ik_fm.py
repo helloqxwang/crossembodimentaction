@@ -89,6 +89,10 @@ def build_models(cfg: DictConfig, device: torch.device) -> Dict[str, torch.nn.Mo
         activation=joint_value_encoder_cfg.activation,
         dropout=joint_value_encoder_cfg.dropout,
         use_layer_norm=joint_value_encoder_cfg.use_layer_norm,
+        num_frequencies=getattr(joint_value_encoder_cfg, "num_frequencies", 64),
+        positional_head_hidden_dims=getattr(
+            joint_value_encoder_cfg, "positional_head_hidden_dims", None
+        ),
     ).to(device)
 
     transformer_cfg = cfg.models.transformer

@@ -26,6 +26,10 @@ def build_models(cfg: DictConfig, device: torch.device) -> Dict[str, torch.nn.Mo
         embed_dim=joint_encoder_cfg.output_dim,
         num_frequencies=joint_encoder_cfg.num_frequencies,
         sigma=getattr(joint_encoder_cfg, "sigma", 1.0),
+        head_hidden_dims=getattr(joint_encoder_cfg, "head_hidden_dims", None),
+        activation=getattr(joint_encoder_cfg, "activation", "gelu"),
+        dropout=getattr(joint_encoder_cfg, "dropout", 0.0),
+        use_layer_norm=getattr(joint_encoder_cfg, "use_layer_norm", False),
     ).to(device)
 
     link_encoder_cfg = cfg.models.link_encoder
@@ -47,6 +51,9 @@ def build_models(cfg: DictConfig, device: torch.device) -> Dict[str, torch.nn.Mo
         dropout=joint_value_cfg.dropout,
         use_layer_norm=joint_value_cfg.use_layer_norm,
         num_frequencies=getattr(joint_value_cfg, "num_frequencies", 64),
+        positional_head_hidden_dims=getattr(
+            joint_value_cfg, "positional_head_hidden_dims", None
+        ),
     ).to(device)
 
     transformer_cfg = cfg.models.transformer

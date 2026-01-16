@@ -28,6 +28,7 @@ class ScalarValueEncoder(nn.Module):
         dropout: float = 0.0,
         use_layer_norm: bool = False,
         num_frequencies: int = 64,
+        positional_head_hidden_dims: Sequence[int] | Iterable[int] | None = None,
     ) -> None:
         super().__init__()
 
@@ -37,15 +38,26 @@ class ScalarValueEncoder(nn.Module):
         self.embed_dim = embed_dim
         self.use_positional = use_positional
         self.num_frequencies = num_frequencies
+        head_hidden = tuple(positional_head_hidden_dims or ())
 
         if use_positional:
-            # 2 * num_frequencies features (sin/cos), then a single learnable projection.
+            # 2 * num_frequencies features (sin/cos), then a configurable head.
             self.register_buffer(
                 "freqs",
                 _geometric_frequencies(num_frequencies),
                 persistent=True,
             )
-            self.proj = nn.Linear(2 * num_frequencies, embed_dim)
+            if len(head_hidden) == 0:
+                self.proj = nn.Linear(2 * num_frequencies, embed_dim)
+            else:
+                self.proj = MLP(
+                    input_dim=2 * num_frequencies,
+                    output_dim=embed_dim,
+                    hidden_dims=head_hidden,
+                    activation=activation,
+                    dropout=dropout,
+                    use_layer_norm=use_layer_norm,
+                )
         else:
             # Fallback to small MLP on raw scalar.
             self.mlp = MLP(
@@ -88,6 +100,10 @@ class AxisFourierEncoder(nn.Module):
         embed_dim: int = 256,
         num_frequencies: int = 64,
         sigma: float = 1.0,
+        head_hidden_dims: Sequence[int] | Iterable[int] | None = None,
+        activation: str = "gelu",
+        dropout: float = 0.0,
+        use_layer_norm: bool = False,
     ) -> None:
         super().__init__()
 
@@ -98,13 +114,24 @@ class AxisFourierEncoder(nn.Module):
 
         self.embed_dim = embed_dim
         self.num_frequencies = num_frequencies
+        head_hidden = tuple(head_hidden_dims or ())
 
         # Fixed random projection matrix B ~ N(0, sigma^2)
         B = torch.randn(num_frequencies, 3) * sigma
         # Keep B in the state dict so saved checkpoints reload identical features.
         self.register_buffer("B", B, persistent=True)
 
-        self.proj = nn.Linear(2 * num_frequencies, embed_dim)
+        if len(head_hidden) == 0:
+            self.proj = nn.Linear(2 * num_frequencies, embed_dim)
+        else:
+            self.proj = MLP(
+                input_dim=2 * num_frequencies,
+                output_dim=embed_dim,
+                hidden_dims=head_hidden,
+                activation=activation,
+                dropout=dropout,
+                use_layer_norm=use_layer_norm,
+            )
 
     def forward(self, axis: torch.Tensor) -> torch.Tensor:
         if axis.dim() != 3 or axis.size(-1) != 3:

@@ -38,6 +38,7 @@ models:
     embed_dim: 128
     use_positional: true
     mlp_hidden: [128, 128]
+    positional_head_hidden_dims: []
     activation: gelu
     dropout: 0.0
     use_layer_norm: false
