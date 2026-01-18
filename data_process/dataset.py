@@ -206,10 +206,10 @@ class SDFSamples(torch.utils.data.Dataset):
         q = self.chain_qs[class_idx][instance_idx]
         # Randomly mask 0–80% of links for SDF/mesh queries; keep at least one link visible.
         link_mask = torch.ones((model.num_links,), dtype=torch.bool)
-        # frac = random.random() * 0.8
-        # n_to_mask = int(math.floor(frac * model.num_links))
-        # n_to_mask = min(n_to_mask, model.num_links - 1)  # ensure at least one remains
-        n_to_mask = model.dof - 2
+        frac = random.random() * 0.8
+        n_to_mask = int(math.floor(frac * model.num_links))
+        n_to_mask = min(n_to_mask, model.num_links - 1)  # ensure at least one remains
+        # n_to_mask = model.dof - 2
         if n_to_mask > 0:
             perm = torch.randperm(model.num_links)[:n_to_mask]
             link_mask[perm] = False

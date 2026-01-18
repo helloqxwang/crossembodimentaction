@@ -1,4 +1,4 @@
-test_instance_name: &name config_fourier_2dfourier_100
+test_instance_name: &name config_CLS_base_100
 
 defaults:
   - conf_fk@_global_: *name
@@ -7,8 +7,8 @@ defaults:
 data:
   data_source: ./data/
   val_indices:
-    start: 100
-    end: 200
+    start: 0
+    end: 100
   num_instances: 64
   val_batch_size: 128
   num_workers: 0
@@ -17,10 +17,10 @@ data:
 
 validation:
   device: cuda
-  checkpoint_dir: ./checkpoints/mfk_fourier_2dfourier_100
+  checkpoint_dir: ./checkpoints/mfk_CLS_100
   checkpoint_epoch: 50
   save_mesh_dir: ./outputs/val_meshes
-  max_mesh_per_batch: 0
+  max_mesh_per_batch: 2
   mesh:
     N: 256
     max_batch: 262144

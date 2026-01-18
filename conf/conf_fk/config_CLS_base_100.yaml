@@ -23,7 +23,7 @@ models:
   hidden_dims: &hd 256
 
   joint_encoder:
-    use_fourier: true
+    use_fourier: false
     input_dim: 9
     output_dim: *sld
     num_frequencies: 16
@@ -44,7 +44,7 @@ models:
   joint_value_encoder:
     embed_dim: *sld
     use_positional: true
-    positional_type: fourier  # options: fourier, legacy
+    positional_type: legacy  # options: fourier, legacy
     num_frequencies: 8
     mlp_hidden: [*hd, *hd]
     positional_head_hidden_dims: [*hd, *hd]
@@ -65,6 +65,16 @@ models:
     max_length: 16
     norm_first: true
     final_layer_norm: true
+  aggregator:
+    num_layers: 4
+    num_heads: 8
+    mlp_ratio: 4.0
+    dropout: 0.1
+    attn_dropout: 0.0
+    activation: gelu
+    norm_first: true
+    final_layer_norm: true
+    max_length: 8
   decoder:
     latent_size: *sld
     dims: [512, 512, 512, 512, 512, 512, 512, 512]
@@ -84,11 +94,11 @@ training:
   lr: 1e-4
   num_epochs: 1e10
   test_interval: 500
-  save_interval: 500
+  save_interval: 50
   wandb:
     enabled: true
     project: action_repr
-    run_name: mfk_fourier_2dfourier_100
+    run_name: mfk_CLS_base_100
     save_dir: ./checkpoints
   lr_schedules:
     - Type: Step

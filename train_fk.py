@@ -11,7 +11,7 @@ from omegaconf import DictConfig
 from data_process.dataset import get_dataloader
 from networks.deep_sdf_decoder import Decoder
 from networks.mlp import MLP
-from networks.transformer import TransformerEncoder
+from networks.transformer import TransformerEncoder, SetAggregator
 from networks.value_encoder import ScalarValueEncoder, AxisFourierEncoder
 
 def _prepare_device(device_str: str) -> torch.device:
@@ -89,6 +89,20 @@ def build_models(cfg: DictConfig, device: torch.device) -> Dict[str, torch.nn.Mo
         final_layer_norm=transformer_cfg.final_layer_norm,
     ).to(device)
 
+    aggregator_cfg = cfg.models.aggregator
+    aggregator = SetAggregator(
+        token_dim=transformer_cfg.output_dim,
+        num_layers=aggregator_cfg.num_layers,
+        num_heads=aggregator_cfg.num_heads,
+        mlp_ratio=aggregator_cfg.mlp_ratio,
+        dropout=aggregator_cfg.dropout,
+        attn_dropout=aggregator_cfg.attn_dropout,
+        activation=aggregator_cfg.activation,
+        norm_first=aggregator_cfg.norm_first,
+        final_layer_norm=aggregator_cfg.final_layer_norm,
+        max_length=aggregator_cfg.max_length,
+    ).to(device)
+
     decoder_cfg = cfg.models.decoder
     decoder = Decoder(
         latent_size=decoder_cfg.latent_size,
@@ -108,6 +122,7 @@ def build_models(cfg: DictConfig, device: torch.device) -> Dict[str, torch.nn.Mo
         "link_encoder": link_encoder,
         "joint_value_encoder": joint_value_encoder,
         "transformer": transformer,
+        "aggregator": aggregator,
         "decoder": decoder,
     }
 
@@ -156,6 +171,7 @@ def inference(
     link_encoder = models["link_encoder"]
     joint_value_encoder = models["joint_value_encoder"]
     transformer = models["transformer"]
+    aggregator = models["aggregator"]
     decoder = models["decoder"]
 
     sdf_samples = batch["sdf_samples"].to(device)
@@ -189,7 +205,9 @@ def inference(
         causal=True,
     )
 
-    latent = pooled_latent(transformer_out[:, ::3], links_mask, mode="max")
+    link_tokens = transformer_out[:, ::3]  # (B, L, D) link positions only
+    latent = aggregator(link_tokens, links_mask)
+    # latent = pooled_latent(link_tokens, links_mask, mode="max")
     sdf_pred = decoder_forward(decoder, latent, sdf_samples)
 
     return latent, sdf_pred
@@ -205,7 +223,7 @@ def _compute_lr(schedule_cfg, epoch: int, default_lr: float) -> float:
         return initial * (factor ** (epoch // max(interval, 1)))
     raise ValueError(f"Unsupported LR schedule type: {schedule_cfg.Type}")
 
-@hydra.main(config_path="conf/conf_fk", config_name="config_fourier_2dfourier_100", version_base="1.3")
+@hydra.main(config_path="conf/conf_fk", config_name="config_CLS_100", version_base="1.3")
 def main(cfg: DictConfig) -> None:
     device = _prepare_device(cfg.training.device)
     torch.manual_seed(0)

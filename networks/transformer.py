@@ -182,6 +182,74 @@ class TransformerEncoder(nn.Module):
         return mask
 
 
+class SetAggregator(nn.Module):
+    """Permutation-invariant CLS pooling over a set of tokens.
+
+    A learnable ``[CLS]`` token is prepended and passed through a small
+    Transformer encoder that omits positional encoding, making the module
+    order-agnostic. The returned embedding is the output at the CLS position.
+    """
+
+    def __init__(
+        self,
+        *,
+        token_dim: int,
+        num_layers: int = 4,
+        num_heads: int = 4,
+        mlp_ratio: float = 4.0,
+        dropout: float = 0.1,
+        attn_dropout: float = 0.0,
+        activation: str = "gelu",
+        norm_first: bool = True,
+        final_layer_norm: bool = True,
+        max_length: int = 64,
+    ) -> None:
+        super().__init__()
+
+        if token_dim <= 0:
+            raise ValueError("token_dim must be positive")
+
+        self.cls = nn.Parameter(torch.zeros(1, 1, token_dim))
+
+        self.encoder = TransformerEncoder(
+            input_dim=token_dim,
+            model_dim=token_dim,
+            output_dim=token_dim,
+            num_heads=num_heads,
+            num_layers=num_layers,
+            mlp_ratio=mlp_ratio,
+            dropout=dropout,
+            attn_dropout=attn_dropout,
+            activation=activation,
+            use_positional_encoding=False,
+            max_length=max_length,
+            norm_first=norm_first,
+            final_layer_norm=final_layer_norm,
+        )
+
+    def forward(self, tokens: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        """Aggregate a batch of token sets.
+
+        tokens: (B, L, D) with arbitrary ordering.
+        mask: (B, L) bool, True for valid tokens.
+        """
+
+        if tokens.dim() != 3:
+            raise ValueError(f"Expected (batch, length, dim) tokens, got {tuple(tokens.shape)}")
+        if mask.shape[:2] != tokens.shape[:2]:
+            raise ValueError("mask shape must match tokens (batch, length)")
+
+        B, _, _ = tokens.shape
+        cls_tokens = self.cls.expand(B, -1, -1)
+        seq = torch.cat([cls_tokens, tokens], dim=1)
+
+        cls_padding = torch.zeros((B, 1), dtype=torch.bool, device=tokens.device)
+        key_padding_mask = torch.cat([cls_padding, ~mask], dim=1)
+
+        out = self.encoder(seq, key_padding_mask=key_padding_mask, causal=False)
+        return out[:, 0]
+
+
 # ---------------------------------------------------------------------------
 # Attention attribution utilities
 # ---------------------------------------------------------------------------

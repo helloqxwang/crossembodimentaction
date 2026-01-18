@@ -278,8 +278,8 @@ def _validate_once(
                     port=vis_cfg.port,
                     show_pred_only=vis_cfg.get("show_pred_only", False),
                 )
-                data = server.get_scene_serializer().serialize()  # Returns bytes
-                pathlibPath("/home/qianxu/Project/crossembodimentaction/test.viser").write_bytes(data)
+                # data = server.get_scene_serializer().serialize()  # Returns bytes
+                # pathlibPath("/home/qianxu/Project/crossembodimentaction/test.viser").write_bytes(data)
                 print(f"Visualizing mesh on port {vis_cfg.port}...")
 
     return mesh_counter + latent.shape[0]
