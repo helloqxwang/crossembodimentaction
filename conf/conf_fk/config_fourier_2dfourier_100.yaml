@@ -84,11 +84,11 @@ training:
   lr: 1e-4
   num_epochs: 1e10
   test_interval: 500
-  save_interval: 500
+  save_interval: 50
   wandb:
     enabled: true
     project: action_repr
-    run_name: mfk_fourier_2dfourier_100
+    run_name: mfk_fourier_2dfourier_100_distantsample
     save_dir: ./checkpoints
   lr_schedules:
     - Type: Step

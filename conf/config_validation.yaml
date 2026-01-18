@@ -1,4 +1,4 @@
-test_instance_name: &name config_CLS_base_100
+test_instance_name: &name config_CLS_100
 
 defaults:
   - conf_fk@_global_: *name
@@ -7,18 +7,18 @@ defaults:
 data:
   data_source: ./data/
   val_indices:
-    start: 0
-    end: 100
+    start: 1
+    end: 2
   num_instances: 64
-  val_batch_size: 128
+  val_batch_size: 16
   num_workers: 0
   drop_last: false
   fix_q_samples: true
 
 validation:
   device: cuda
-  checkpoint_dir: ./checkpoints/mfk_CLS_100
-  checkpoint_epoch: 50
+  checkpoint_dir: ./checkpoints/mfk_CLS_100_ori
+  checkpoint_epoch: 200
   save_mesh_dir: ./outputs/val_meshes
   max_mesh_per_batch: 2
   mesh:

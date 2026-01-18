@@ -89,19 +89,19 @@ def build_models(cfg: DictConfig, device: torch.device) -> Dict[str, torch.nn.Mo
         final_layer_norm=transformer_cfg.final_layer_norm,
     ).to(device)
 
-    aggregator_cfg = cfg.models.aggregator
-    aggregator = SetAggregator(
-        token_dim=transformer_cfg.output_dim,
-        num_layers=aggregator_cfg.num_layers,
-        num_heads=aggregator_cfg.num_heads,
-        mlp_ratio=aggregator_cfg.mlp_ratio,
-        dropout=aggregator_cfg.dropout,
-        attn_dropout=aggregator_cfg.attn_dropout,
-        activation=aggregator_cfg.activation,
-        norm_first=aggregator_cfg.norm_first,
-        final_layer_norm=aggregator_cfg.final_layer_norm,
-        max_length=aggregator_cfg.max_length,
-    ).to(device)
+    # aggregator_cfg = cfg.models.aggregator
+    # aggregator = SetAggregator(
+    #     token_dim=transformer_cfg.output_dim,
+    #     num_layers=aggregator_cfg.num_layers,
+    #     num_heads=aggregator_cfg.num_heads,
+    #     mlp_ratio=aggregator_cfg.mlp_ratio,
+    #     dropout=aggregator_cfg.dropout,
+    #     attn_dropout=aggregator_cfg.attn_dropout,
+    #     activation=aggregator_cfg.activation,
+    #     norm_first=aggregator_cfg.norm_first,
+    #     final_layer_norm=aggregator_cfg.final_layer_norm,
+    #     max_length=aggregator_cfg.max_length,
+    # ).to(device)
 
     decoder_cfg = cfg.models.decoder
     decoder = Decoder(
@@ -122,7 +122,7 @@ def build_models(cfg: DictConfig, device: torch.device) -> Dict[str, torch.nn.Mo
         "link_encoder": link_encoder,
         "joint_value_encoder": joint_value_encoder,
         "transformer": transformer,
-        "aggregator": aggregator,
+        # "aggregator": aggregator,
         "decoder": decoder,
     }
 
@@ -171,7 +171,7 @@ def inference(
     link_encoder = models["link_encoder"]
     joint_value_encoder = models["joint_value_encoder"]
     transformer = models["transformer"]
-    aggregator = models["aggregator"]
+    # aggregator = models["aggregator"]
     decoder = models["decoder"]
 
     sdf_samples = batch["sdf_samples"].to(device)
@@ -202,12 +202,12 @@ def inference(
     transformer_out = transformer(
         token_tensor,
         key_padding_mask=key_padding_mask,
-        causal=True,
+        causal=False,
     )
 
     link_tokens = transformer_out[:, ::3]  # (B, L, D) link positions only
-    latent = aggregator(link_tokens, links_mask)
-    # latent = pooled_latent(link_tokens, links_mask, mode="max")
+    # latent = aggregator(link_tokens, links_mask)
+    latent = pooled_latent(link_tokens, links_mask, mode="max")
     sdf_pred = decoder_forward(decoder, latent, sdf_samples)
 
     return latent, sdf_pred

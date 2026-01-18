@@ -209,14 +209,14 @@ class SDFSamples(torch.utils.data.Dataset):
         frac = random.random() * 0.8
         n_to_mask = int(math.floor(frac * model.num_links))
         n_to_mask = min(n_to_mask, model.num_links - 1)  # ensure at least one remains
-        # n_to_mask = model.dof - 2
+        # n_to_mask = 0
         if n_to_mask > 0:
             perm = torch.randperm(model.num_links)[:n_to_mask]
             link_mask[perm] = False
 
         scale_to = 1
         model.update_status(q)
-        pts = model.sample_query_points(n=self.subsample, mask=link_mask)
+        pts = model.sample_query_points(n=self.subsample, mask=link_mask, var=0.02)
         sdf_data = model.query_sdf(pts, mask=link_mask)
         sdf = torch.cat([pts[0], sdf_data[0].unsqueeze(-1)], dim=-1)
         if self.pose_mode:
@@ -348,11 +348,15 @@ def get_dataloader(
 
 if __name__ == "__main__":
     ### Test the dataset loading.
+    seed = 42
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
     data_source = "./data/"
     indices = list(range(30))
     num_instances = 100
     subsample = 16384
-    batch_size = 64
+    batch_size = 32
     max_num_links = 5
     num_workers = 0
 
@@ -363,7 +367,7 @@ if __name__ == "__main__":
         subsample=subsample,
         batch_size=batch_size,
         max_num_links=max_num_links,
-        shuffle=True,
+        shuffle=False,
         num_workers=num_workers,
         drop_last=True,
         pose_mode=True,
@@ -381,18 +385,18 @@ if __name__ == "__main__":
         # print("mask:", batch["mask"].shape)
         # print("links_poses:", batch["links_poses"].shape if batch["links_poses"] is not None else None)
         ### Visulization code
-        # vis_cls = batch["class_idx"][0]
-        # urdf_path = Path(f"data/out_chains_v2/chain_{vis_cls}.urdf")
-        # model = ChainModel(urdf_path, samples_per_link=128)
-        # q = batch["chain_q"][0] # Here is padded q. So need some inspection to get the real q.
-        # model.update_status(q)
+        vis_cls = batch["class_idx"][0]
+        urdf_path = Path(f"data/out_chains_v2/chain_{vis_cls}.urdf")
+        model = ChainModel(urdf_path, samples_per_link=128)
+        q = batch["chain_q"][0] # Here is padded q. So need some inspection to get the real q.
+        model.update_status(q[:1])
 
-        # visualize_sdf_viser(
-        #     mesh=model.get_trimesh_q(0, boolean_merged=True, mask=batch['link_mask'][0]),
-        #     sdf_samples=batch["sdf_samples"][0].cpu().numpy(),
-        #     host="127.0.0.1",
-        #     port=9200,
-        #     downsample_ratio=0.03
-        # )
+        visualize_sdf_viser(
+            mesh=model.get_trimesh_q(0, boolean_merged=True, mask=batch['link_mask'][0, :1]),
+            sdf_samples=batch["sdf_samples"][0].cpu().numpy(),
+            host="127.0.0.1",
+            port=9200,
+            downsample_ratio=0.03
+        )
 
     print("Done")
