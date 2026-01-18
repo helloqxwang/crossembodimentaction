@@ -4,11 +4,11 @@ defaults:
 data:
   data_source: ./data/
   indices:
-    start: 1
-    end: 2
+    start: 0
+    end: 100
   val_indices:
-    start: 1
-    end: 2
+    start: 100
+    end: 110
   num_instances: 1000
   subsample: 4096
   batch_size: 64
@@ -19,11 +19,11 @@ data:
   drop_last: true
 
 models:
-  sdf_latent_dim: &sld 512
+  sdf_latent_dim: &sld 128
   hidden_dims: &hd 256
 
   joint_encoder:
-    use_fourier: false
+    use_fourier: true
     input_dim: 9
     output_dim: *sld
     num_frequencies: 16
@@ -44,7 +44,7 @@ models:
   joint_value_encoder:
     embed_dim: *sld
     use_positional: true
-    positional_type: legacy  # options: fourier, legacy
+    positional_type: fourier  # options: fourier, legacy
     num_frequencies: 8
     mlp_hidden: [*hd, *hd]
     positional_head_hidden_dims: [*hd, *hd]
@@ -67,7 +67,7 @@ models:
     final_layer_norm: true
   decoder:
     latent_size: *sld
-    dims: [1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024]
+    dims: [512, 512, 512, 512, 512, 512, 512, 512]
     dropout: [0, 1, 2, 3, 4, 5, 6, 7]
     dropout_prob: 0.2
     norm_layers: [0, 1, 2, 3, 4, 5, 6, 7]
@@ -84,11 +84,11 @@ training:
   lr: 1e-4
   num_epochs: 1e10
   test_interval: 500
-  save_interval: 500
+  save_interval: 50
   wandb:
     enabled: true
     project: action_repr
-    run_name: mfk_biglatent
+    run_name: mfk_test2latent
     save_dir: ./checkpoints
   lr_schedules:
     - Type: Step

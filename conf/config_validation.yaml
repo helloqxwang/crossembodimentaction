@@ -1,26 +1,26 @@
+test_instance_name: &name config_fourier_2dfourier_100
+
 defaults:
-  - config
+  - conf_fk@_global_: *name
   - _self_
 
 data:
   data_source: ./data/
   val_indices:
-    start: 1
-    end: 10
-  num_instances: 100
-  subsample: 16384
-  val_batch_size: 4
-  max_num_links: 5
-  load_ram: false
+    start: 100
+    end: 200
+  num_instances: 64
+  val_batch_size: 128
   num_workers: 0
-  drop_last: true
+  drop_last: false
+  fix_q_samples: true
 
 validation:
   device: cuda
-  checkpoint: ./checkpoints/mask-fk_s_freq/epoch_2500.pth
-  num_batches: null       # set to an integer to limit batches, or null for all
+  checkpoint_dir: ./checkpoints/mfk_fourier_2dfourier_100
+  checkpoint_epoch: 50
   save_mesh_dir: ./outputs/val_meshes
-  max_mesh_per_batch: 4
+  max_mesh_per_batch: 0
   mesh:
     N: 256
     max_batch: 262144

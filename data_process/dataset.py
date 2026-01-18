@@ -151,6 +151,7 @@ class SDFSamples(torch.utils.data.Dataset):
         subsample,
         ik=False,
         pose_mode=False,
+        fix_q_samples=False,
     ):
         self.subsample = subsample
         self.indices = indices
@@ -158,6 +159,7 @@ class SDFSamples(torch.utils.data.Dataset):
         self.data_source = data_source
         self.ik = ik
         self.pose_mode = pose_mode
+        self.fix_q_samples = fix_q_samples
 
         self.chain_qs = []
         self.links_properties = []
@@ -180,7 +182,19 @@ class SDFSamples(torch.utils.data.Dataset):
                     device="cpu",
             )
             self.chain_model_ls.append((chain_model, class_real_idx))
-            self.chain_qs.append(chain_model.sample_q(num_instances).float())
+            if self.fix_q_samples:
+                os.makedirs(os.path.join(data_source, f'chain_qs'), exist_ok=True)
+                q_samples_path = os.path.join(
+                    data_source, f'chain_qs',
+                    f"chain_{class_real_idx}_{num_instances}_samples.pt")
+                if os.path.exists(q_samples_path):
+                    q_samples = torch.load(q_samples_path, weights_only=False).float()
+                else:
+                    q_samples = chain_model.sample_q(num_instances).float()
+                    torch.save(q_samples, q_samples_path)
+                self.chain_qs.append(q_samples)
+            else:
+                self.chain_qs.append(chain_model.sample_q(num_instances).float())
     
     def __len__(self):
         return len(self.indices) * self.num_instances
@@ -192,9 +206,10 @@ class SDFSamples(torch.utils.data.Dataset):
         q = self.chain_qs[class_idx][instance_idx]
         # Randomly mask 0–80% of links for SDF/mesh queries; keep at least one link visible.
         link_mask = torch.ones((model.num_links,), dtype=torch.bool)
-        frac = random.random() * 0.8
-        n_to_mask = int(math.floor(frac * model.num_links))
-        n_to_mask = min(n_to_mask, model.num_links - 1)  # ensure at least one remains
+        # frac = random.random() * 0.8
+        # n_to_mask = int(math.floor(frac * model.num_links))
+        # n_to_mask = min(n_to_mask, model.num_links - 1)  # ensure at least one remains
+        n_to_mask = model.dof - 2
         if n_to_mask > 0:
             perm = torch.randperm(model.num_links)[:n_to_mask]
             link_mask[perm] = False
@@ -309,6 +324,7 @@ def get_dataloader(
     drop_last: bool = True,
     ik=False,
     pose_mode=False,
+    fix_q_samples=False,
 ):
     dataset = SDFSamples(
         data_source=data_source,
@@ -317,6 +333,7 @@ def get_dataloader(
         subsample=subsample,
         ik=ik,
         pose_mode=pose_mode,
+        fix_q_samples=fix_q_samples,
     )
     collate_fn = make_collate_fn(max_num_links)
     loader = torch.utils.data.DataLoader(

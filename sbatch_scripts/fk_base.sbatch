@@ -2,8 +2,8 @@
 #SBATCH -J base                          # Job name
 #SBATCH --output=/home/qw325/log/mfk_%j.out # STDOUT -> /home/qw325/log
 #SBATCH --error=/home/qw325/log/mfk_%j.err  # STDERR -> /home/qw325/log
-#SBATCH --mail-type=END,FAIL                    # 邮件通知类型（可改 ALL）
-#SBATCH --mail-user=qw325@cornell.edu           # 替换为你的邮箱
+#SBATCH --mail-type=END,FAIL                    # 
+#SBATCH --mail-user=qw325@cornell.edu           # 
 #SBATCH --nodes=1                               # 节点数
 #SBATCH --ntasks=1                              # 任务数
 #SBATCH --cpus-per-task=8                    # 每任务 CPU 核数

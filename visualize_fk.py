@@ -2,12 +2,17 @@ from typing import Dict, Tuple, Optional
 import os
 import logging
 
+from anyio import Path
+from pathlib import Path as pathlibPath
 import hydra
 from hydra.utils import to_absolute_path
 from omegaconf import DictConfig
 import torch
 import trimesh
 import viser
+import plotly.express as px
+import plotly.graph_objects as go
+from tqdm import tqdm
 
 from data_process.dataset import get_dataloader
 from data_process.visualize_samples import visualize_sdf, plot_mesh
@@ -17,6 +22,7 @@ import numpy as np
 import plyfile
 import skimage
 from robot_model.chain_model import ChainModel, visualize_sdf_viser
+from visualize_ik import visualize_meshes
 
 def convert_sdf_samples_to_ply(
     pytorch_3d_sdf_tensor,
@@ -164,7 +170,10 @@ def _prepare_device(device_str: str) -> torch.device:
 
 def _load_models(cfg: DictConfig, device: torch.device) -> Tuple[Dict[str, torch.nn.Module], Optional[int]]:
     models = build_models(cfg, device)
-    ckpt_path = to_absolute_path(cfg.validation.checkpoint)
+    if cfg.validation.checkpoint_epoch is None:
+        logging.info("no checkpoint specified, skipping model loading")
+        return models, None
+    ckpt_path = to_absolute_path(os.path.join(cfg.validation.checkpoint_dir, f"epoch_{cfg.validation.checkpoint_epoch}.pth"))
     if not os.path.isfile(ckpt_path):
         raise FileNotFoundError(f"checkpoint not found: {ckpt_path}")
 
@@ -212,110 +221,25 @@ def reconstruct_mesh(
         )
 
 
-def _resolve_gt_mesh_path(template: Optional[str], class_idx: int, instance_idx: int) -> Optional[str]:
-    if template is None:
-        return None
-    path = template.format(class_idx=class_idx, instance_idx=instance_idx)
-    return path if os.path.isfile(path) else None
-
-
-def visualize_meshes(
-    pred_mesh_path: str,
-    gt_mesh: Optional[trimesh.Trimesh] = None,
-    port: int = 8080,
-    show_pred_only: bool = False,
-):
-    if not os.path.isfile(pred_mesh_path):
-        raise FileNotFoundError(f"pred mesh not found: {pred_mesh_path}")
-
-    server = viser.ViserServer(port=port)
-    pred_mesh = trimesh.load(pred_mesh_path, force="mesh")
-    server.scene.add_mesh_trimesh(
-        name="pred_mesh",
-        mesh=pred_mesh,
-        # material=viser.materials.MeshStandardMaterial(color=(0.2, 0.7, 1.0), opacity=0.9),
-    )
-    # Calculate mesh bounds and shift distance
-    pred_bounds = pred_mesh.bounds
-    pred_size = pred_bounds[1] - pred_bounds[0]
-    shift_distance = pred_size[0] * 1.2  # 20% padding
-
-    # Shift gt_mesh along x-axis
-    if gt_mesh is not None and not show_pred_only:
-        gt_mesh_shifted = gt_mesh.copy()
-        gt_mesh_shifted.apply_translation([shift_distance, 0, 0])
-        server.scene.add_mesh_trimesh(
-            name="gt_mesh",
-            mesh=gt_mesh_shifted,
-        )
-        
-        # Visualize world frames
-        server.scene.add_frame(
-            name="pred_frame",
-            wxyz=np.array([1, 0, 0, 0]),
-            position=np.array([0, 0, 0]),
-            axes_length=shift_distance * 0.3,
-            axes_radius=0.005,
-        )
-        server.scene.add_frame(
-            name="gt_frame",
-            wxyz=np.array([1, 0, 0, 0]),
-            position=np.array([shift_distance, 0, 0]),
-            axes_length=shift_distance * 0.3,
-            axes_radius=0.005,
-        )
-    logging.info(f"Viser running on http://localhost:{port}")
-
-
-def visualize_sdf_with_mesh(
-    pred_mesh: trimesh.Trimesh,
-    sdf_pred: np.ndarray,
-    sdf_gt: Optional[np.ndarray] = None,
-    title: str = "SDF + Mesh",
-    downsample_ratio: float = 0.1,
-    max_points: int = 50000,
-    marker_size: int = 3,
-    seed: int = 0,
-):
-    """Visualize predicted SDF + mesh in same figure.
-    
-    Args:
-        pred_mesh: trimesh object.
-        sdf_pred: Predicted SDF points, shape (N, 4) with [x, y, z, sdf].
-        sdf_gt: Optional GT SDF points, shape (M, 4) with [x, y, z, sdf].
-        title: Plot title.
-        downsample_ratio: Fraction of points to visualize [0, 1].
-        max_points: Cap on visualized points after downsampling.
-        marker_size: Scatter marker size.
-        seed: Random seed for subsampling.
-    """
-    visualize_sdf(
-        mesh=pred_mesh,
-        sdf_pred=sdf_pred,
-        sdf_gt=sdf_gt,
-        title=title,
-        downsample_ratio=downsample_ratio,
-        max_points=max_points,
-        marker_size=marker_size,
-        seed=seed,
-    )
-
-
 def _validate_once(
     cfg: DictConfig,
     models: Dict[str, torch.nn.Module],
     device: torch.device,
     batch: Dict[str, torch.Tensor],
     mesh_counter: int,
+    chain_error_dict: Dict,
 ) -> int:
-    loss_fn = torch.nn.L1Loss()
+    loss_fn = torch.nn.L1Loss(reduction='none')
     with torch.no_grad():
-        # batch['link_mask'] = torch.ones_like(batch['link_mask'])
-        latent, sdf_pred = inference(batch, models, device=device)
+        latent, sdf_pred = inference(batch, models, cfg=cfg, device=device)
         sdf_gt = batch["sdf_samples"].to(device)[..., 3].unsqueeze(-1)
-        loss_val = loss_fn(sdf_pred, sdf_gt).item()
-
-    logging.info(f"batch loss: {loss_val:.6f}")
+        loss_points_vals = loss_fn(sdf_pred, sdf_gt) # (B, num_samples, 1)
+        loss_vals = loss_points_vals.flatten(1).mean(dim=1)  # (B, )
+        for i in range(loss_vals.shape[0]):
+            cls = batch["class_idx"][i]
+            if cls not in chain_error_dict:
+                chain_error_dict[cls] = []
+            chain_error_dict[cls].append(loss_vals[i].item())
     
     max_mesh_num = int(getattr(cfg.validation, "max_mesh_per_batch", 0))
     if max_mesh_num > 0:
@@ -348,15 +272,131 @@ def _validate_once(
 
             vis_cfg = cfg.validation.visualize
             if getattr(vis_cfg, "enable", False):
-                visualize_meshes(
-                    pred_mesh_path=out_path + ".ply",
+                server = visualize_meshes(
+                    pred_mesh=trimesh.load(out_path + ".ply", force="mesh"),
                     gt_mesh=gt_mesh,
                     port=vis_cfg.port,
                     show_pred_only=vis_cfg.get("show_pred_only", False),
                 )
+                data = server.get_scene_serializer().serialize()  # Returns bytes
+                pathlibPath("/home/qianxu/Project/crossembodimentaction/test.viser").write_bytes(data)
                 print(f"Visualizing mesh on port {vis_cfg.port}...")
 
     return mesh_counter + latent.shape[0]
+
+
+def plot_chain_error_boxplot(chain_error_dict: Dict[int, list], out_path: str | None = None, show: bool = False):
+    """Create a Plotly box plot of per-class error lists."""
+
+    if not chain_error_dict:
+        return None
+
+    records = [
+        {"class": cls, "error": err}
+        for cls, errs in chain_error_dict.items()
+        for err in errs
+    ]
+
+    fig = px.box(records, x="class", y="error", points="outliers")
+    if out_path:
+        fig.write_html(out_path)
+    if show:
+        fig.show()
+    return fig
+
+
+def plot_zero_pose_chains(val_indices: list[int], data_source: str, out_path: str | None = None, show: bool = False, gap: float = 0.2):
+    """Visualize zero-pose meshes for given chain indices using Plotly.
+
+    Meshes are laid out along the y-axis without overlap (with a configurable gap).
+    """
+
+    if not val_indices:
+        return None
+
+    fig = go.Figure()
+    current_y = 0.0
+    for idx in val_indices:
+        urdf_path = os.path.join(data_source, "out_chains_v2", f"chain_{idx}.urdf")
+        if not os.path.isfile(urdf_path):
+            logging.warning("URDF not found for chain %s at %s", idx, urdf_path)
+            continue
+
+        chain_model = ChainModel(urdf_path=urdf_path, samples_per_link=128, device="cpu")
+        q_zero = torch.zeros(chain_model.dof)
+        chain_model.update_status(q_zero)
+        mesh = chain_model.get_trimesh_q(0)
+
+        verts = mesh.vertices.copy()
+        faces = mesh.faces
+
+        min_y, max_y = verts[:, 1].min(), verts[:, 1].max()
+        height = float(max_y - min_y)
+        shift = current_y - float(min_y)
+        verts[:, 1] = verts[:, 1] + shift
+
+        fig.add_trace(
+            go.Mesh3d(
+                x=verts[:, 0],
+                y=verts[:, 1],
+                z=verts[:, 2],
+                i=faces[:, 0],
+                j=faces[:, 1],
+                k=faces[:, 2],
+                name=f"chain_{idx}",
+                opacity=0.6,
+            )
+        )
+
+        current_y += height + gap
+
+    fig.update_layout(scene=dict(aspectmode="data"), title="Zero-pose chains (stacked along y)")
+    if out_path:
+        fig.write_html(out_path)
+    if show:
+        fig.show()
+    return fig
+
+
+def summarize_errors_by_length_and_boxes(
+    chain_error_dict: Dict[int, list],
+    data_source: str,
+    lengths: Tuple[int, ...] = (2, 3, 4, 5),
+) -> Tuple[Dict[int, list], list[Dict[int, list]]]:
+    """Group errors by chain length and by number of box links per chain.
+
+    Returns
+    -------
+    length_errors: dict
+        key: chain length (e.g., 2–5); value: list of errors for all chains of that length.
+    boxes_per_length: list of dict
+        For each length in ``lengths`` (in order), a dict mapping ``num_boxes`` -> list of errors.
+    """
+
+    length_errors: Dict[int, list] = {L: [] for L in lengths}
+    boxes_per_length: list[Dict[int, list]] = [{ } for _ in lengths]
+
+    for cls, errs in chain_error_dict.items():
+        urdf_path = os.path.join(data_source, "out_chains_v2", f"chain_{cls}.urdf")
+        if not os.path.isfile(urdf_path):
+            logging.warning("URDF not found for chain %s at %s", cls, urdf_path)
+            continue
+
+        chain_model = ChainModel(urdf_path=urdf_path, samples_per_link=128, device="cpu")
+        length = chain_model.num_links
+        num_boxes = sum(1 for spec in chain_model.geom_specs.values() if spec.get("type") == "box")
+
+        if length in length_errors:
+            length_errors[length].extend(errs)
+            length_idx = lengths.index(length)
+            buckets = boxes_per_length[length_idx]
+            if num_boxes not in buckets:
+                buckets[num_boxes] = []
+            buckets[num_boxes].extend(errs)
+        else:
+            length_errors.setdefault(length, []).extend(errs)
+
+    return length_errors, boxes_per_length
 
 
 @hydra.main(config_path="conf", config_name="config_validation", version_base="1.3")
@@ -380,18 +420,33 @@ def main(cfg: DictConfig) -> None:
         max_num_links=cfg.data.max_num_links,
         shuffle=False,
         num_workers=cfg.data.num_workers,
-        drop_last=False,
+        drop_last=cfg.data.drop_last,
+        fix_q_samples=cfg.data.get("fix_q_samples", False),
     )
 
     mesh_counter = 0
-    num_batches = cfg.validation.get("num_batches", None)
-    for b_idx, batch in enumerate(val_loader):
-        mesh_counter = _validate_once(cfg, models, device, batch, mesh_counter)
-        if num_batches is not None and (b_idx + 1) >= num_batches:
-            break
+    chain_error_dict = {}
+    for b_idx, batch in enumerate(tqdm(val_loader, desc="Validating", leave=False)):
+        mesh_counter = _validate_once(cfg, models, device, batch, mesh_counter, chain_error_dict)
 
+    length_errors, boxes_per_length = summarize_errors_by_length_and_boxes(
+        chain_error_dict,
+        data_source,
+    )
+
+    plot_chain_error_boxplot(chain_error_dict, show=True)
+    plot_chain_error_boxplot(length_errors, show=True)
+    for length_idx, buckets in enumerate(boxes_per_length):
+        plot_chain_error_boxplot(buckets, show=True)
+
+    plot_zero_pose_chains(
+        val_indices=val_indices,
+        data_source=data_source,
+        show=True,
+        gap=0.08,
+    )
+    
     logging.info("validation finished")
-
 
 if __name__ == "__main__":
     main()

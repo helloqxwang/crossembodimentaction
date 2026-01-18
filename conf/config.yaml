@@ -67,7 +67,8 @@ models:
     final_layer_norm: true
   decoder:
     latent_size: *sld
-    dims: [512, 512, 512, 512, 512, 512, 512, 512]
+    # dims: [512 , 512, 512, 512, 512, 512, 512, 512]
+    dims: [1024, 1024, 1024, 1024, 1024, 1024, 1024, 1024]
     dropout: [0, 1, 2, 3, 4, 5, 6, 7]
     dropout_prob: 0.2
     norm_layers: [0, 1, 2, 3, 4, 5, 6, 7]
