@@ -243,7 +243,7 @@ def siren_sdf_loss(
         create_graph=True,
     )[0]
 
-    sdf_constraint = torch.where(gt_sdf != -1, pred_sdf, torch.zeros_like(pred_sdf))
+    sdf_constraint = torch.where(gt_sdf != -1, pred_sdf - gt_sdf, torch.zeros_like(pred_sdf))
     inter_constraint = torch.where(gt_sdf != -1, torch.zeros_like(pred_sdf), torch.exp(-1e2 * torch.abs(pred_sdf)))
     if normal_mask is None:
         normal_mask = gt_sdf != -1
@@ -254,7 +254,7 @@ def siren_sdf_loss(
     )
     grad_constraint = torch.abs(gradients.norm(dim=-1, keepdim=True) - 1)
 
-    loss_sdf = torch.abs(sdf_constraint).mean() * sdf_weight
+    loss_sdf = torch.abs(sdf_constraint).mean() * sdf_weight # L1 loss
     loss_inter = inter_constraint.mean() * inter_weight
     loss_normal = normal_constraint.mean() * normal_weight
     loss_grad = grad_constraint.mean() * grad_weight
@@ -284,7 +284,7 @@ def _cfg_get(cfg, key: str, default):
         return cfg.get(key, default)
     return getattr(cfg, key, default)
 
-@hydra.main(config_path="conf/conf_fk", config_name="config_fourier_2dfourier_100", version_base="1.3")
+@hydra.main(config_path="conf/conf_fk", config_name="config_siren_100", version_base="1.3")
 def main(cfg: DictConfig) -> None:
     device = _prepare_device(cfg.training.device)
     torch.manual_seed(0)

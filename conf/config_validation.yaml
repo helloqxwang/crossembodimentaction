@@ -1,4 +1,4 @@
-test_instance_name: &name config_fourier_2dfourier_100
+test_instance_name: &name config_siren_100
 
 defaults:
   - conf_fk@_global_: *name
@@ -19,14 +19,14 @@ data:
 
 validation:
   device: cuda
-  checkpoint_dir: ./checkpoints/mfk_fourier_2dfourier_100_distantsample
+  checkpoint_dir: ./checkpoints/mfk_siren
   checkpoint_epoch: 50
   save_mesh_dir: ./outputs/val_meshes
   output_dir: ./outputs/validation
   max_mesh_per_batch: 2
   mesh:
-    N: 64
-    max_batch: 2
+    N: 256
+    max_batch: 262144
     offset: null
     scale: null
   visualize:

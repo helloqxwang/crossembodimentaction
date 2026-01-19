@@ -225,7 +225,6 @@ class SDFSamples(torch.utils.data.Dataset):
         scale_to = 1
         model.update_status(q)
         sdf_normals = None
-        sdf_normals = None
         normal_mask = None
         if self.sdf_mode == "siren":
             n_surface = self.subsample // 2
