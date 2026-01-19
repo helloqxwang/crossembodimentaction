@@ -17,6 +17,10 @@ data:
   shuffle: true
   num_workers: 20
   drop_last: true
+  sdf_mode: siren
+  off_surface_center: mesh
+  sdf_target_mode: "true"
+  tsdf_band: 0.05
 
 models:
   sdf_latent_dim: &sld 128
@@ -67,7 +71,11 @@ models:
     final_layer_norm: true
   decoder:
     latent_size: *sld
-    dims: [512, 512, 512, 512, 512, 512, 512, 512]
+    type: siren
+    omega_0: 30.0
+    outermost_linear: true
+    # dims: [256, 256, 256, 256]
+    dims: [512, 512, 512, 512]
     dropout: [0, 1, 2, 3, 4, 5, 6, 7]
     dropout_prob: 0.2
     norm_layers: [0, 1, 2, 3, 4, 5, 6, 7]
@@ -85,10 +93,16 @@ training:
   num_epochs: 1e10
   test_interval: 500
   save_interval: 50
+  loss_type: siren
+  siren_loss:
+    sdf_weight: 3000.0
+    inter_weight: 100.0
+    normal_weight: 100.0
+    grad_weight: 50.0
   wandb:
     enabled: true
     project: action_repr
-    run_name: mfk_fourier_2dfourier_100_distantsample
+    run_name: mfk_siren
     save_dir: ./checkpoints
   lr_schedules:
     - Type: Step

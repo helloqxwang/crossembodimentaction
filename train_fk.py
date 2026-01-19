@@ -4,12 +4,14 @@ import os
 import wandb
 import hydra
 import torch
+import torch.nn.functional as F
 from tqdm import tqdm
 from hydra.utils import to_absolute_path
 from omegaconf import DictConfig
 
 from data_process.dataset import get_dataloader
 from networks.deep_sdf_decoder import Decoder
+from networks.siren_decoder import SirenDecoder
 from networks.mlp import MLP
 from networks.transformer import TransformerEncoder, SetAggregator
 from networks.value_encoder import ScalarValueEncoder, AxisFourierEncoder
@@ -104,18 +106,27 @@ def build_models(cfg: DictConfig, device: torch.device) -> Dict[str, torch.nn.Mo
     # ).to(device)
 
     decoder_cfg = cfg.models.decoder
-    decoder = Decoder(
-        latent_size=decoder_cfg.latent_size,
-        dims=list(decoder_cfg.dims),
-        dropout=list(decoder_cfg.dropout),
-        dropout_prob=decoder_cfg.dropout_prob,
-        norm_layers=list(decoder_cfg.norm_layers),
-        latent_in=list(decoder_cfg.latent_in),
-        weight_norm=decoder_cfg.weight_norm,
-        xyz_in_all=decoder_cfg.xyz_in_all,
-        use_tanh=decoder_cfg.use_tanh,
-        latent_dropout=decoder_cfg.latent_dropout,
-    ).to(device)
+    decoder_type = str(getattr(decoder_cfg, "type", "siren")).lower()
+    if decoder_type == "siren":
+        decoder = SirenDecoder(
+            latent_size=decoder_cfg.latent_size,
+            hidden_dims=list(decoder_cfg.dims),
+            omega_0=getattr(decoder_cfg, "omega_0", 30.0),
+            outermost_linear=getattr(decoder_cfg, "outermost_linear", True),
+        ).to(device)
+    else:
+        decoder = Decoder(
+            latent_size=decoder_cfg.latent_size,
+            dims=list(decoder_cfg.dims),
+            dropout=list(decoder_cfg.dropout),
+            dropout_prob=decoder_cfg.dropout_prob,
+            norm_layers=list(decoder_cfg.norm_layers),
+            latent_in=list(decoder_cfg.latent_in),
+            weight_norm=decoder_cfg.weight_norm,
+            xyz_in_all=decoder_cfg.xyz_in_all,
+            use_tanh=decoder_cfg.use_tanh,
+            latent_dropout=decoder_cfg.latent_dropout,
+        ).to(device)
 
     return {
         "joint_encoder": joint_encoder,
@@ -148,13 +159,11 @@ def pooled_latent(
     raise ValueError(f"Unsupported pooling mode: {mode}")
 
 def decoder_forward(
-    decoder: Decoder,
+    decoder: torch.nn.Module,
     latent: torch.Tensor,
-    sdf_samples: torch.Tensor,
+    xyz: torch.Tensor,
 ) -> torch.Tensor:
     """Decode latent + xyz into sdf predictions."""
-
-    xyz = sdf_samples[..., :3]  # (B, N, 3)
     B, N, _ = xyz.shape
     latent_expanded = latent.unsqueeze(1).expand(-1, N, -1)
     decoder_in = torch.cat([latent_expanded, xyz], dim=-1)
@@ -166,6 +175,7 @@ def inference(
     models: Dict[str, torch.nn.Module],
     cfg: DictConfig,
     device: torch.device = torch.device("cpu"),
+    coords_override: torch.Tensor | None = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     joint_encoder = models["joint_encoder"]
     link_encoder = models["link_encoder"]
@@ -208,9 +218,54 @@ def inference(
     link_tokens = transformer_out[:, ::3]  # (B, L, D) link positions only
     # latent = aggregator(link_tokens, links_mask)
     latent = pooled_latent(link_tokens, links_mask, mode="max")
-    sdf_pred = decoder_forward(decoder, latent, sdf_samples)
+    xyz = coords_override if coords_override is not None else sdf_samples[..., :3]
+    sdf_pred = decoder_forward(decoder, latent, xyz)
 
     return latent, sdf_pred
+
+
+def siren_sdf_loss(
+    pred_sdf: torch.Tensor,
+    coords: torch.Tensor,
+    gt_sdf: torch.Tensor,
+    gt_normals: torch.Tensor,
+    normal_mask: torch.Tensor | None = None,
+    *,
+    sdf_weight: float = 3e3,
+    inter_weight: float = 1e2,
+    normal_weight: float = 1e2,
+    grad_weight: float = 5e1,
+) -> Tuple[torch.Tensor, Dict[str, float]]:
+    gradients = torch.autograd.grad(
+        pred_sdf,
+        coords,
+        grad_outputs=torch.ones_like(pred_sdf),
+        create_graph=True,
+    )[0]
+
+    sdf_constraint = torch.where(gt_sdf != -1, pred_sdf, torch.zeros_like(pred_sdf))
+    inter_constraint = torch.where(gt_sdf != -1, torch.zeros_like(pred_sdf), torch.exp(-1e2 * torch.abs(pred_sdf)))
+    if normal_mask is None:
+        normal_mask = gt_sdf != -1
+    normal_constraint = torch.where(
+        normal_mask,
+        1 - F.cosine_similarity(gradients, gt_normals, dim=-1)[..., None],
+        torch.zeros_like(pred_sdf),
+    )
+    grad_constraint = torch.abs(gradients.norm(dim=-1, keepdim=True) - 1)
+
+    loss_sdf = torch.abs(sdf_constraint).mean() * sdf_weight
+    loss_inter = inter_constraint.mean() * inter_weight
+    loss_normal = normal_constraint.mean() * normal_weight
+    loss_grad = grad_constraint.mean() * grad_weight
+    loss = loss_sdf + loss_inter + loss_normal + loss_grad
+
+    return loss, {
+        "loss/sdf": loss_sdf.item() / sdf_weight,
+        "loss/inter": loss_inter.item() / inter_weight,
+        "loss/normal": loss_normal.item() / normal_weight,
+        "loss/grad": loss_grad.item() / grad_weight,
+    }
 
 def _compute_lr(schedule_cfg, epoch: int, default_lr: float) -> float:
     if schedule_cfg is None:
@@ -223,7 +278,13 @@ def _compute_lr(schedule_cfg, epoch: int, default_lr: float) -> float:
         return initial * (factor ** (epoch // max(interval, 1)))
     raise ValueError(f"Unsupported LR schedule type: {schedule_cfg.Type}")
 
-@hydra.main(config_path="conf/conf_fk", config_name="config_CLS_100", version_base="1.3")
+
+def _cfg_get(cfg, key: str, default):
+    if isinstance(cfg, dict):
+        return cfg.get(key, default)
+    return getattr(cfg, key, default)
+
+@hydra.main(config_path="conf/conf_fk", config_name="config_fourier_2dfourier_100", version_base="1.3")
 def main(cfg: DictConfig) -> None:
     device = _prepare_device(cfg.training.device)
     torch.manual_seed(0)
@@ -239,6 +300,13 @@ def main(cfg: DictConfig) -> None:
     indices = list(range(cfg.data.indices.start, cfg.data.indices.end))
     val_indices = list(range(cfg.data.val_indices.start, cfg.data.val_indices.end))
     data_source = to_absolute_path(cfg.data.data_source)
+    loss_type = str(getattr(cfg.training, "loss_type", "siren")).lower()
+    sdf_mode = str(getattr(cfg.data, "sdf_mode", "siren")).lower()
+    off_surface_center = str(getattr(cfg.data, "off_surface_center", "zero")).lower()
+    sdf_target_mode = str(getattr(cfg.data, "sdf_target_mode", "fake")).lower()
+    tsdf_band = float(getattr(cfg.data, "tsdf_band", 0.1))
+    if loss_type == "siren" and sdf_mode != "siren":
+        raise ValueError("siren loss requires data.sdf_mode = 'siren' to provide normals and surface flags")
 
     sdf_loader = get_dataloader(
         data_source=data_source,
@@ -250,6 +318,10 @@ def main(cfg: DictConfig) -> None:
         shuffle=cfg.data.shuffle,
         num_workers=cfg.data.num_workers,
         drop_last=cfg.data.drop_last,
+        sdf_mode=sdf_mode,
+        off_surface_center=off_surface_center,
+        sdf_target_mode=sdf_target_mode,
+        tsdf_band=tsdf_band,
     )
 
     val_loader = get_dataloader(
@@ -262,6 +334,10 @@ def main(cfg: DictConfig) -> None:
         shuffle=False,
         num_workers=0,
         drop_last=False,
+        sdf_mode=sdf_mode,
+        off_surface_center=off_surface_center,
+        sdf_target_mode=sdf_target_mode,
+        tsdf_band=tsdf_band,
     )
     val_iter = iter(val_loader)
 
@@ -272,6 +348,13 @@ def main(cfg: DictConfig) -> None:
         [p for m in models.values() for p in m.parameters()], lr=init_lr
     )
     loss_fn = torch.nn.L1Loss()
+    siren_cfg = getattr(cfg.training, "siren_loss", {})
+    siren_weights = {
+        "sdf_weight": float(_cfg_get(siren_cfg, "sdf_weight", 3e3)),
+        "inter_weight": float(_cfg_get(siren_cfg, "inter_weight", 1e2)),
+        "normal_weight": float(_cfg_get(siren_cfg, "normal_weight", 1e2)),
+        "grad_weight": float(_cfg_get(siren_cfg, "grad_weight", 5e1)),
+    }
 
     save_dir = os.path.join(cfg.training.wandb.save_dir, cfg.training.wandb.run_name)
     os.makedirs(save_dir, exist_ok=True)
@@ -294,13 +377,36 @@ def main(cfg: DictConfig) -> None:
             return next(val_iter)
 
     def _run_val_step(step_tag: str) -> float:
-        with torch.no_grad():
-            val_batch = _next_val_batch()
-            _, val_pred = inference(val_batch, models, cfg=cfg, device=device)
-            val_gt = val_batch["sdf_samples"].to(device)[..., 3].unsqueeze(-1)
-            val_loss_val = loss_fn(val_pred, val_gt).item()
+        val_batch = _next_val_batch()
+        if loss_type == "siren":
+            with torch.enable_grad():
+                sdf_samples = val_batch["sdf_samples"].to(device)
+                coords = sdf_samples[..., :3].clone().detach().requires_grad_(True)
+                _, val_pred = inference(val_batch, models, cfg=cfg, device=device, coords_override=coords)
+                val_gt = sdf_samples[..., 3:].to(device)
+                val_normals = val_batch["sdf_normals"].to(device)
+                val_normal_mask = val_batch.get("sdf_normal_mask", None)
+                if val_normal_mask is not None:
+                    val_normal_mask = val_normal_mask.to(device)
+                val_loss, val_terms = siren_sdf_loss(
+                    val_pred,
+                    coords,
+                    val_gt,
+                    val_normals,
+                    normal_mask=val_normal_mask,
+                    **siren_weights,
+                )
+                val_loss_val = val_loss.item()
+        else:
+            with torch.no_grad():
+                _, val_pred = inference(val_batch, models, cfg=cfg, device=device)
+                val_gt = val_batch["sdf_samples"].to(device)[..., 3].unsqueeze(-1)
+                val_loss_val = loss_fn(val_pred, val_gt).item()
         if use_wandb:
-            wandb.log({"val/loss": val_loss_val, "step": step_tag})
+            wandb.log({"val/loss": val_loss_val, "step": step_tag, "epoch": epoch})
+            if loss_type == "siren":
+                for k, v in val_terms.items():
+                    wandb.log({f"val/{k}": v, "step": step_tag, "epoch": epoch})
         return val_loss_val
 
     for epoch in range(num_epochs):
@@ -311,14 +417,35 @@ def main(cfg: DictConfig) -> None:
 
         for batch in tqdm(sdf_loader, desc=f"Epoch {epoch+1}/{num_epochs}"):
             optimizer.zero_grad()
-            latent, sdf_pred = inference(batch, models, cfg=cfg, device=device)
-            sdf_gt = batch["sdf_samples"].to(device)[..., 3].unsqueeze(-1)
-            loss = loss_fn(sdf_pred, sdf_gt)
+            if loss_type == "siren":
+                sdf_samples = batch["sdf_samples"].to(device)
+                coords = sdf_samples[..., :3].clone().detach().requires_grad_(True)
+                latent, sdf_pred = inference(batch, models, cfg=cfg, device=device, coords_override=coords)
+                sdf_gt = sdf_samples[..., 3:].to(device)
+                sdf_normals = batch["sdf_normals"].to(device)
+                sdf_normal_mask = batch.get("sdf_normal_mask", None)
+                if sdf_normal_mask is not None:
+                    sdf_normal_mask = sdf_normal_mask.to(device)
+                loss, loss_terms = siren_sdf_loss(
+                    sdf_pred,
+                    coords,
+                    sdf_gt,
+                    sdf_normals,
+                    normal_mask=sdf_normal_mask,
+                    **siren_weights,
+                )
+            else:
+                latent, sdf_pred = inference(batch, models, cfg=cfg, device=device)
+                sdf_gt = batch["sdf_samples"].to(device)[..., 3].unsqueeze(-1)
+                loss = loss_fn(sdf_pred, sdf_gt)
             loss.backward()
             optimizer.step()
 
             if use_wandb:
                 wandb.log({"train/loss": loss.item(), "step": global_step, "epoch": epoch})
+                if loss_type == "siren":
+                    for k, v in loss_terms.items():
+                        wandb.log({f"train/{k}": v, "step": global_step, "epoch": epoch})
             global_step += 1
 
             if test_interval is not None and test_interval > 0 and global_step % test_interval == 0:

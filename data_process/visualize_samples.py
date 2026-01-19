@@ -8,6 +8,7 @@ import os
 
 import matplotlib.pyplot as plt
 import numpy as np
+import plotly.graph_objects as go
 import trimesh
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
@@ -55,6 +56,240 @@ def plot_mesh(ax, mesh: trimesh.Trimesh, color: str = "lightgray", alpha: float 
     tri_vertices = verts[faces]
     collection = Poly3DCollection(tri_vertices, facecolor=color, edgecolor="none", alpha=alpha)
     ax.add_collection3d(collection)
+
+
+def visualize_sdf_points_plotly(
+    *,
+    mesh: trimesh.Trimesh | None = None,
+    points: np.ndarray | None = None,
+    sdf: np.ndarray | None = None,
+    normals: np.ndarray | None = None,
+    gt_sdf: np.ndarray | None = None,
+    title: str = "SDF Visualization",
+    downsample_ratio: float = 0.1,
+    max_points: int = 50000,
+    marker_size: int = 3,
+    show_sign: str = "all",
+    normal_stride: int = 10,
+    normal_length: float = 0.02,
+    seed: int = 0,
+    save_path: str | None = None,
+    save_html_path: str | None = None,
+    show: bool = False,
+) -> go.Figure:
+    """Plot mesh + points with SDF colors and optional normals using Plotly.
+
+    If gt_sdf is provided, point colors represent abs(pred - gt) with a color bar.
+    Otherwise, points are colored by signed distance (blue negative, red positive).
+    show_sign controls whether to plot all points or only negative/zero/positive.
+    """
+
+    rng = np.random.default_rng(seed)
+    fig = go.Figure()
+
+    if mesh is not None:
+        verts = mesh.vertices
+        faces = mesh.faces
+        fig.add_trace(
+            go.Mesh3d(
+                x=verts[:, 0],
+                y=verts[:, 1],
+                z=verts[:, 2],
+                i=faces[:, 0],
+                j=faces[:, 1],
+                k=faces[:, 2],
+                color="lightgray",
+                opacity=0.35,
+                name="mesh",
+            )
+        )
+
+    if points is not None:
+        points = np.asarray(points)
+        if points.ndim != 2 or points.shape[1] != 3:
+            raise ValueError(f"points must be (N, 3); got shape {points.shape}")
+
+        keep_count = int(len(points) * downsample_ratio)
+        if max_points is not None:
+            keep_count = min(keep_count, max_points)
+        keep_count = max(1, keep_count) if len(points) > 0 else 0
+        if keep_count == 0:
+            pts = None
+            idx = None
+        elif keep_count >= len(points):
+            idx = np.arange(len(points))
+            pts = points
+        else:
+            idx = rng.choice(len(points), size=keep_count, replace=False)
+            pts = points[idx]
+
+        if pts is not None and len(pts) > 0:
+            
+            if sdf is not None:
+                sdf_vals = np.asarray(sdf).reshape(-1)[idx]
+            else:
+                sdf_vals = None
+
+            gt_vals_full = None
+            if gt_sdf is not None:
+                gt_vals_full = np.asarray(gt_sdf).reshape(-1)[idx]
+            normals_full = None
+            if normals is not None:
+                normals_full = np.asarray(normals)[idx]
+
+            sign_mask = None
+            if sdf_vals is not None:
+                show_sign = str(show_sign).lower()
+                if show_sign == "negative":
+                    sign_mask = sdf_vals < 0
+                elif show_sign == "zero":
+                    sign_mask = sdf_vals == 0
+                elif show_sign == "positive":
+                    sign_mask = sdf_vals > 0
+                elif show_sign == "all":
+                    sign_mask = None
+                else:
+                    raise ValueError(f"Unsupported show_sign: {show_sign}")
+                if sign_mask is not None:
+                    pts = pts[sign_mask]
+                    sdf_vals = sdf_vals[sign_mask]
+                    if gt_vals_full is not None:
+                        gt_vals_full = gt_vals_full[sign_mask]
+                    if normals_full is not None:
+                        normals_full = normals_full[sign_mask]
+
+            cmid = None
+            valid_mask = None
+            color = "rgb(80,80,80)"
+            cmin = cmax = None
+            colorbar = None
+            colorscale = None
+            if gt_sdf is not None and sdf_vals is not None:
+                gt_vals = gt_vals_full
+                valid_mask = gt_vals != -1
+                err = np.abs(sdf_vals - gt_vals)
+                err_valid = err[valid_mask] if np.any(valid_mask) else err
+                color = err_valid
+                cmax = float(np.percentile(err_valid, 95)) if np.any(err_valid > 0) else 1.0
+                cmin = 0.0
+                colorbar = dict(title="|pred - gt|")
+                colorscale = "Viridis"
+            elif sdf_vals is not None:
+                valid_mask = sdf_vals != -1
+                sdf_valid = sdf_vals[valid_mask] if np.any(valid_mask) else sdf_vals
+                abs_sdf = np.abs(sdf_valid)
+                max_abs = float(np.percentile(abs_sdf, 95)) if np.any(abs_sdf > 0) else 1.0
+                color = sdf_valid
+                cmin, cmax = -max_abs, max_abs
+                cmid = 0.0
+                colorbar = dict(title="sdf")
+                colorscale = [
+                    [0.0, "rgb(0,0,180)"],
+                    [0.5, "rgb(230,230,230)"],
+                    [1.0, "rgb(180,0,0)"],
+                ]
+
+            if valid_mask is None:
+                valid_mask = np.ones(len(pts), dtype=bool)
+            pts_valid = pts[valid_mask]
+            pts_unknown = pts[~valid_mask]
+
+            if len(pts_valid) > 0:
+                fig.add_trace(
+                    go.Scatter3d(
+                        x=pts_valid[:, 0],
+                        y=pts_valid[:, 1],
+                        z=pts_valid[:, 2],
+                        mode="markers",
+                        marker=dict(
+                            size=marker_size,
+                            color=color,
+                            colorscale=colorscale,
+                            cmin=cmin,
+                            cmax=cmax,
+                            cmid=cmid,
+                            colorbar=colorbar,
+                            opacity=0.9,
+                        ),
+                        name="samples",
+                    )
+                )
+            if len(pts_unknown) > 0:
+                fig.add_trace(
+                    go.Scatter3d(
+                        x=pts_unknown[:, 0],
+                        y=pts_unknown[:, 1],
+                        z=pts_unknown[:, 2],
+                        mode="markers",
+                        marker=dict(
+                            size=max(1, int(marker_size * 0.8)),
+                            color="rgb(120,120,120)",
+                            opacity=0.5,
+                        ),
+                        name="sdf=-1 (unknown)",
+                    )
+                )
+
+            if normals_full is not None:
+                normals = normals_full
+                norm_pts = pts
+                if gt_sdf is not None:
+                    gt_vals = gt_vals_full
+                    surface_mask = gt_vals != -1
+                elif sdf_vals is not None:
+                    surface_mask = sdf_vals != -1
+                else:
+                    surface_mask = np.ones(len(norm_pts), dtype=bool)
+                normals = normals[surface_mask]
+                norm_pts = norm_pts[surface_mask]
+                if len(norm_pts) > 0:
+                    step = max(1, int(normal_stride))
+                    line_pts = []
+                    for i in range(0, len(norm_pts), step):
+                        p = norm_pts[i]
+                        n = normals[i]
+                        line_pts.append(p)
+                        line_pts.append(p + normal_length * n)
+                        line_pts.append([np.nan, np.nan, np.nan])
+                    line_pts = np.array(line_pts)
+                    fig.add_trace(
+                        go.Scatter3d(
+                            x=line_pts[:, 0],
+                            y=line_pts[:, 1],
+                            z=line_pts[:, 2],
+                            mode="lines",
+                            line=dict(color="black", width=2),
+                            name="normals",
+                        )
+                    )
+
+    fig.update_layout(
+        title=title,
+        scene=dict(
+            xaxis_title="X",
+            yaxis_title="Y",
+            zaxis_title="Z",
+            aspectmode="data",
+        ),
+        legend=dict(itemsizing="constant"),
+    )
+
+    if save_path:
+        try:
+            fig.write_image(save_path)
+        except Exception as exc:
+            if save_html_path is None:
+                save_html_path = save_path + ".html"
+            fig.write_html(save_html_path)
+            print(f"[visualize_sdf_points_plotly] write_image failed ({exc}); wrote HTML to {save_html_path}")
+
+    if save_html_path and (save_path is None or save_html_path != save_path):
+        fig.write_html(save_html_path)
+
+    if show:
+        fig.show()
+
+    return fig
 
 
 def visualize_sdf(

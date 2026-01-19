@@ -1,4 +1,4 @@
-test_instance_name: &name config_CLS_100
+test_instance_name: &name config_fourier_2dfourier_100
 
 defaults:
   - conf_fk@_global_: *name
@@ -14,16 +14,19 @@ data:
   num_workers: 0
   drop_last: false
   fix_q_samples: true
+  sdf_target_mode: tsdf
+  tsdf_band: 0.05
 
 validation:
   device: cuda
-  checkpoint_dir: ./checkpoints/mfk_CLS_100_ori
-  checkpoint_epoch: 200
+  checkpoint_dir: ./checkpoints/mfk_fourier_2dfourier_100_distantsample
+  checkpoint_epoch: 50
   save_mesh_dir: ./outputs/val_meshes
+  output_dir: ./outputs/validation
   max_mesh_per_batch: 2
   mesh:
-    N: 256
-    max_batch: 262144
+    N: 64
+    max_batch: 2
     offset: null
     scale: null
   visualize:
@@ -31,3 +34,13 @@ validation:
     port: 8080
     gt_mesh_template: null  # e.g. "${data.data_source}/chain_samples/chain_{class_idx}_{instance_idx}/mesh.ply"
     show_pred_only: false
+  sample_visualize:
+    enable: false
+    output_dir: ./outputs/validation/samples
+    num_samples: 6
+    seed: 0
+    downsample_ratio: 0.1
+    max_points: 30000
+    normal_stride: 25
+    normal_length: 0.02
+    save_html: true

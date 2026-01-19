@@ -372,6 +372,154 @@ class ChainModel:
         sdf_min, _ = sdf_stack.min(dim=-1)
         return sdf_min
 
+    def query_sdf_and_normals(
+        self,
+        points: torch.Tensor,
+        mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Compute signed distances and outward normals for ``points``.
+
+        Returns:
+            sdf_min: (B, N) signed distances.
+            normals_world: (B, N, 3) unit normals from the closest link surface.
+        """
+
+        if self.frame_status is None:
+            raise RuntimeError('Call update_status() before querying SDF.')
+
+        if points.dim() == 2:
+            points = points.unsqueeze(0)
+        if points.size(0) != self.q.size(0):
+            raise ValueError(f'Batch mismatch: points batch {points.size(0)} vs q batch {self.q.size(0)}')
+
+        B, N, _ = points.shape
+        device = self.device
+        dtype = points.dtype
+        points = points.to(device)
+
+        link_names = list(self.geom_specs.keys())
+        mask_list = None
+        if mask is not None:
+            mask_bool = mask.to(dtype=torch.bool)
+            if mask_bool.numel() != len(link_names):
+                raise ValueError(f"Mask length {mask_bool.numel()} != number of links {len(link_names)}")
+            mask_list = mask_bool.flatten().tolist()
+
+        sdf_all_links = []
+        normal_all_links = []
+
+        for idx, (link_name, spec) in enumerate(self.geom_specs.items()):
+            if mask_list is not None and not mask_list[idx]:
+                continue
+            tf_world = self.frame_status[link_name].get_matrix().to(device=device, dtype=dtype)  # (B,4,4)
+            tf_world_inv = torch.linalg.inv(tf_world)
+
+            tf_geom = spec['tf'].to(device=device, dtype=dtype)
+            tf_geom_inv = torch.linalg.inv(tf_geom)
+
+            homog = torch.cat([points, torch.ones(B, N, 1, device=device, dtype=dtype)], dim=-1)
+            p_link = torch.matmul(homog, tf_world_inv.transpose(1, 2))
+            p_geom = torch.matmul(p_link, tf_geom_inv.transpose(0, 1))[:, :, :3]
+
+            gtype = spec['type']
+            params = spec['params'].to(device=device, dtype=dtype)
+
+            if gtype == 'box':
+                half_extents = params
+                abs_p = p_geom.abs()
+                qv = abs_p - half_extents
+                outside = torch.clamp(qv, min=0.0)
+                outside_norm = torch.linalg.norm(outside, dim=-1, keepdim=True)
+                inside = torch.clamp(qv.max(dim=-1).values, max=0.0)
+                sdf = outside_norm.squeeze(-1) + inside
+
+                sign = torch.where(p_geom >= 0, torch.ones_like(p_geom), -torch.ones_like(p_geom))
+                outside_normal = outside / outside_norm.clamp_min(1e-9)
+                outside_normal = outside_normal * sign
+
+                max_idx = qv.argmax(dim=-1, keepdim=True)
+                inside_normal = torch.zeros_like(p_geom)
+                inside_normal.scatter_(-1, max_idx, 1.0)
+                inside_normal = inside_normal * sign
+
+                use_outside = outside_norm.squeeze(-1) > 0
+                normal_geom = torch.where(use_outside.unsqueeze(-1), outside_normal, inside_normal)
+            elif gtype == 'capsule':
+                height, radius = params[0], params[1]
+                px = p_geom[..., 0].clamp(-height * 0.5, height * 0.5)
+                closest = torch.stack([px, torch.zeros_like(px), torch.zeros_like(px)], dim=-1)
+                vec = p_geom - closest
+                dist = torch.linalg.norm(vec, dim=-1, keepdim=True)
+                sdf = dist.squeeze(-1) - radius
+                fallback = torch.tensor([1.0, 0.0, 0.0], device=device, dtype=dtype).view(1, 1, 3)
+                normal_geom = torch.where(dist > 1e-9, vec / dist.clamp_min(1e-9), fallback)
+            elif gtype == 'cylinder':
+                raise ValueError(f'Unsupported geometry type: {gtype}')
+            else:
+                raise ValueError(f'Unsupported geometry type: {gtype}')
+
+            tf_world_geom = tf_world @ tf_geom
+            rot = tf_world_geom[:, :3, :3]
+            normal_world = torch.matmul(rot, normal_geom.unsqueeze(-1)).squeeze(-1)
+            normal_world = normal_world / torch.linalg.norm(normal_world, dim=-1, keepdim=True).clamp_min(1e-9)
+
+            sdf_all_links.append(sdf)
+            normal_all_links.append(normal_world)
+
+        if not sdf_all_links:
+            raise RuntimeError('No link geometries parsed; cannot query SDF.')
+
+        sdf_stack = torch.stack(sdf_all_links, dim=-1)  # (B,N,L)
+        normals_stack = torch.stack(normal_all_links, dim=-2)  # (B,N,L,3)
+        sdf_min, min_idx = sdf_stack.min(dim=-1)
+        idx_expand = min_idx.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 1, 3)
+        normals_min = normals_stack.gather(dim=-2, index=idx_expand).squeeze(-2)
+
+        return sdf_min, normals_min
+
+    def sample_surface_points(
+        self,
+        n: int,
+        mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Sample points on the chain surface for the current configuration."""
+        pc_full = self.get_transformed_links_pc(num_points=None, mask=mask)
+        if pc_full.numel() == 0:
+            raise ValueError('Mask removed all links; no points to sample from.')
+        B, M, _ = pc_full.shape
+        pts = pc_full[..., :3]
+        idx = torch.randint(0, M, (B, n), device=self.device)
+        idx_expand = idx.unsqueeze(-1).expand(-1, -1, 3)
+        return pts.gather(1, idx_expand)
+
+    def sample_off_surface_points(
+        self,
+        n: int,
+        mask: Optional[torch.Tensor] = None,
+        center_mode: str = "zero",
+    ) -> torch.Tensor:
+        """Sample points uniformly inside a bounding sphere of the current chain."""
+        pc_full = self.get_transformed_links_pc(num_points=None, mask=mask)
+        if pc_full.numel() == 0:
+            raise ValueError('Mask removed all links; no points to sample from.')
+        pts = pc_full[..., :3]
+        if center_mode == "mesh":
+            pts_min = pts.min(dim=1).values
+            pts_max = pts.max(dim=1).values
+            center = 0.5 * (pts_min + pts_max)
+        elif center_mode == "zero":
+            center = torch.zeros(pts.shape[0], 3, device=self.device, dtype=pts.dtype)
+        else:
+            raise ValueError(f"Unsupported center_mode: {center_mode}")
+
+        radius = torch.linalg.norm(pts - center[:, None, :], dim=-1).max(dim=-1).values.clamp_min(1e-6)
+
+        B = pts.shape[0]
+        dir_vec = torch.randn(B, n, 3, device=self.device)
+        dir_vec = dir_vec / dir_vec.norm(dim=-1, keepdim=True).clamp_min(1e-9)
+        radii = torch.rand(B, n, 1, device=self.device) ** (1.0 / 3.0)
+        return center[:, None, :] + dir_vec * radii * radius.view(B, 1, 1)
+
     # Points
     def _sample_rest_pose_points(self, mesh_dict: Dict[str, trimesh.Trimesh], samples_per_link: int) -> Dict[str, torch.Tensor]:
         points: Dict[str, torch.Tensor] = {}

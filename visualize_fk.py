@@ -2,26 +2,23 @@ from typing import Dict, Tuple, Optional
 import os
 import logging
 
-from anyio import Path
-from pathlib import Path as pathlibPath
 import hydra
 from hydra.utils import to_absolute_path
 from omegaconf import DictConfig
 import torch
 import trimesh
-import viser
 import plotly.express as px
 import plotly.graph_objects as go
 from tqdm import tqdm
 
 from data_process.dataset import get_dataloader
-from data_process.visualize_samples import visualize_sdf, plot_mesh
+from data_process.visualize_samples import visualize_sdf_points_plotly
 from train_fk import build_models, inference
 import time
 import numpy as np
 import plyfile
-import skimage
-from robot_model.chain_model import ChainModel, visualize_sdf_viser
+import skimage.measure
+from robot_model.chain_model import ChainModel
 from visualize_ik import visualize_meshes
 
 def convert_sdf_samples_to_ply(
@@ -31,6 +28,7 @@ def convert_sdf_samples_to_ply(
     ply_filename_out,
     offset=None,
     scale=None,
+    marching_step: int = 2,
 ):
     """
     Convert sdf samples to .ply
@@ -47,7 +45,10 @@ def convert_sdf_samples_to_ply(
     numpy_3d_sdf_tensor = pytorch_3d_sdf_tensor.numpy()
 
     verts, faces, normals, values = skimage.measure.marching_cubes(
-        numpy_3d_sdf_tensor, level=0.0, spacing=[voxel_size] * 3
+        numpy_3d_sdf_tensor,
+        level=0.0,
+        spacing=[voxel_size] * 3,
+        step_size=max(int(marching_step), 1),
     )
 
     # transform from voxel coordinates to camera coordinates
@@ -64,6 +65,9 @@ def convert_sdf_samples_to_ply(
         mesh_points = mesh_points - offset
 
     # try writing to the ply file
+    if verts.shape[0] == 0 or faces.shape[0] == 0:
+        logging.warning("no surface extracted; skipping ply write to %s", ply_filename_out)
+        return
 
     num_verts = verts.shape[0]
     num_faces = faces.shape[0]
@@ -105,7 +109,15 @@ def decode_sdf(decoder, latent_vector, queries):
     return sdf
 
 def decode_to_mesh(
-    decoder, latent_vec, filename, N=256, max_batch=32 ** 3, grid_scale=2, offset=None, scale=None
+    decoder,
+    latent_vec,
+    filename,
+    N=256,
+    max_batch=32 ** 3,
+    grid_scale=2,
+    offset=None,
+    scale=None,
+    marching_step: int = 2,
 ):
     start = time.time()
     ply_filename = filename
@@ -158,6 +170,7 @@ def decode_to_mesh(
         ply_filename + ".ply",
         offset,
         scale,
+        marching_step=marching_step,
     )
 
 
@@ -200,6 +213,7 @@ def reconstruct_mesh(
     grid_scale: int = 1,
     offset=None,
     scale=None,
+    marching_step: int = 2,
 ):
     """Decode a single latent to a mesh using deep_sdf.mesh.create_mesh."""
 
@@ -218,6 +232,7 @@ def reconstruct_mesh(
             grid_scale=grid_scale,
             offset=offset,
             scale=scale,
+            marching_step=marching_step,
         )
 
 
@@ -228,6 +243,7 @@ def _validate_once(
     batch: Dict[str, torch.Tensor],
     mesh_counter: int,
     chain_error_dict: Dict,
+    sample_vis_state: Dict,
 ) -> int:
     loss_fn = torch.nn.L1Loss(reduction='none')
     with torch.no_grad():
@@ -240,6 +256,54 @@ def _validate_once(
             if cls not in chain_error_dict:
                 chain_error_dict[cls] = []
             chain_error_dict[cls].append(loss_vals[i].item())
+
+    vis_cfg = getattr(cfg.validation, "sample_visualize", None)
+    if vis_cfg and getattr(vis_cfg, "enable", False):
+        out_dir = to_absolute_path(vis_cfg.output_dir)
+        os.makedirs(out_dir, exist_ok=True)
+        rng = sample_vis_state["rng"]
+        remaining = vis_cfg.num_samples - sample_vis_state["count"]
+        if remaining > 0:
+            B = sdf_pred.shape[0]
+            idxs = rng.choice(B, size=min(remaining, B), replace=False).tolist()
+            for i in idxs:
+                cls = batch["class_idx"][i]
+                inst = batch["instance_idx"][i]
+                chain_model = ChainModel(
+                    urdf_path=os.path.join(
+                        cfg.data.data_source, f'out_chains_v2', f"chain_{cls}.urdf"),
+                    samples_per_link=128,
+                    device="cpu",
+                )
+                chain_model.update_status(batch['chain_q'][i, :chain_model.dof].cpu())
+                gt_mesh = chain_model.get_trimesh_q(0)
+
+                pts = batch["sdf_samples"][i, :, :3].cpu().numpy()
+                sdf_pred_i = sdf_pred[i, :, 0].cpu().numpy()
+                sdf_gt_i = sdf_gt[i, :, 0].cpu().numpy()
+                normals = batch.get("sdf_normals", None)
+                normals_np = normals[i].cpu().numpy() if normals is not None else None
+
+                out_path = os.path.join(out_dir, f"samples_cls{cls}_inst{inst}.png")
+                html_path = os.path.join(out_dir, f"samples_cls{cls}_inst{inst}.html")
+                visualize_sdf_points_plotly(
+                    mesh=gt_mesh,
+                    points=pts,
+                    sdf=sdf_pred_i,
+                    gt_sdf=sdf_gt_i,
+                    normals=normals_np,
+                    title=f"cls {cls} inst {inst} | abs error",
+                    downsample_ratio=vis_cfg.downsample_ratio,
+                    max_points=vis_cfg.max_points,
+                    normal_stride=vis_cfg.normal_stride,
+                    normal_length=vis_cfg.normal_length,
+                    save_path=out_path,
+                    save_html_path=html_path if vis_cfg.save_html else None,
+                    show=False,
+                )
+                sample_vis_state["count"] += 1
+                if sample_vis_state["count"] >= vis_cfg.num_samples:
+                    break
     
     max_mesh_num = int(getattr(cfg.validation, "max_mesh_per_batch", 0))
     if max_mesh_num > 0:
@@ -278,14 +342,31 @@ def _validate_once(
                     port=vis_cfg.port,
                     show_pred_only=vis_cfg.get("show_pred_only", False),
                 )
-                # data = server.get_scene_serializer().serialize()  # Returns bytes
-                # pathlibPath("/home/qianxu/Project/crossembodimentaction/test.viser").write_bytes(data)
                 print(f"Visualizing mesh on port {vis_cfg.port}...")
 
     return mesh_counter + latent.shape[0]
 
 
-def plot_chain_error_boxplot(chain_error_dict: Dict[int, list], out_path: str | None = None, show: bool = False):
+def _save_plotly_figure(fig: go.Figure, out_path: str | None, save_html: bool = False) -> None:
+    if out_path is None:
+        return
+    try:
+        fig.write_image(out_path)
+    except Exception as exc:
+        html_path = out_path + ".html"
+        fig.write_html(html_path)
+        logging.warning("write_image failed (%s); wrote HTML to %s", exc, html_path)
+    if save_html:
+        fig.write_html(out_path + ".html")
+
+
+def plot_chain_error_boxplot(
+    chain_error_dict: Dict[int, list],
+    out_path: str | None = None,
+    show: bool = False,
+    title: str | None = None,
+    save_html: bool = False,
+):
     """Create a Plotly box plot of per-class error lists."""
 
     if not chain_error_dict:
@@ -298,14 +379,25 @@ def plot_chain_error_boxplot(chain_error_dict: Dict[int, list], out_path: str | 
     ]
 
     fig = px.box(records, x="class", y="error", points="outliers")
-    if out_path:
-        fig.write_html(out_path)
+    fig.update_layout(
+        title=title or "Per-chain error distribution",
+        xaxis_title="chain id",
+        yaxis_title="mean abs error",
+    )
+    _save_plotly_figure(fig, out_path, save_html=save_html)
     if show:
         fig.show()
     return fig
 
 
-def plot_zero_pose_chains(val_indices: list[int], data_source: str, out_path: str | None = None, show: bool = False, gap: float = 0.2):
+def plot_zero_pose_chains(
+    val_indices: list[int],
+    data_source: str,
+    out_path: str | None = None,
+    show: bool = False,
+    gap: float = 0.2,
+    save_html: bool = False,
+):
     """Visualize zero-pose meshes for given chain indices using Plotly.
 
     Meshes are laid out along the y-axis without overlap (with a configurable gap).
@@ -351,8 +443,62 @@ def plot_zero_pose_chains(val_indices: list[int], data_source: str, out_path: st
         current_y += height + gap
 
     fig.update_layout(scene=dict(aspectmode="data"), title="Zero-pose chains (stacked along y)")
-    if out_path:
-        fig.write_html(out_path)
+    _save_plotly_figure(fig, out_path, save_html=save_html)
+    if show:
+        fig.show()
+    return fig
+
+
+def plot_error_histogram(
+    chain_error_dict: Dict[int, list],
+    out_path: str | None = None,
+    show: bool = False,
+    save_html: bool = False,
+):
+    errors = [err for errs in chain_error_dict.values() for err in errs]
+    if not errors:
+        return None
+    fig = px.histogram(x=errors, nbins=40)
+    fig.update_layout(
+        title="Error histogram (all instances)",
+        xaxis_title="mean abs error",
+        yaxis_title="count",
+    )
+    _save_plotly_figure(fig, out_path, save_html=save_html)
+    if show:
+        fig.show()
+    return fig
+
+
+def plot_error_vs_links(
+    chain_error_dict: Dict[int, list],
+    data_source: str,
+    out_path: str | None = None,
+    show: bool = False,
+    save_html: bool = False,
+):
+    records = []
+    for cls, errs in chain_error_dict.items():
+        urdf_path = os.path.join(data_source, "out_chains_v2", f"chain_{cls}.urdf")
+        if not os.path.isfile(urdf_path):
+            continue
+        chain_model = ChainModel(urdf_path=urdf_path, samples_per_link=128, device="cpu")
+        records.append(
+            {
+                "chain_id": cls,
+                "num_links": chain_model.num_links,
+                "error": float(np.mean(errs)),
+            }
+        )
+    if not records:
+        return None
+    fig = px.scatter(records, x="num_links", y="error", hover_data=["chain_id"])
+    fig.update_layout(
+        title="Mean error vs chain length",
+        xaxis_title="num links",
+        yaxis_title="mean abs error",
+    )
+    _save_plotly_figure(fig, out_path, save_html=save_html)
     if show:
         fig.show()
     return fig
@@ -426,24 +572,66 @@ def main(cfg: DictConfig) -> None:
 
     mesh_counter = 0
     chain_error_dict = {}
+    vis_cfg = getattr(cfg.validation, "sample_visualize", None)
+    sample_vis_state = {
+        "count": 0,
+        "rng": np.random.default_rng(getattr(vis_cfg, "seed", 0) if vis_cfg else 0),
+    }
     for b_idx, batch in enumerate(tqdm(val_loader, desc="Validating", leave=False)):
-        mesh_counter = _validate_once(cfg, models, device, batch, mesh_counter, chain_error_dict)
+        mesh_counter = _validate_once(cfg, models, device, batch, mesh_counter, chain_error_dict, sample_vis_state)
 
     length_errors, boxes_per_length = summarize_errors_by_length_and_boxes(
         chain_error_dict,
         data_source,
     )
 
-    plot_chain_error_boxplot(chain_error_dict, show=True)
-    plot_chain_error_boxplot(length_errors, show=True)
+    output_dir = to_absolute_path(getattr(cfg.validation, "output_dir", "./outputs/validation"))
+    os.makedirs(output_dir, exist_ok=True)
+
+    plot_chain_error_boxplot(
+        chain_error_dict,
+        out_path=os.path.join(output_dir, "boxplot_by_chain.png"),
+        show=False,
+        title="Error distribution by chain",
+        save_html=True,
+    )
+    plot_chain_error_boxplot(
+        length_errors,
+        out_path=os.path.join(output_dir, "boxplot_by_length.png"),
+        show=False,
+        title="Error distribution by chain length",
+        save_html=True,
+    )
     for length_idx, buckets in enumerate(boxes_per_length):
-        plot_chain_error_boxplot(buckets, show=True)
+        plot_chain_error_boxplot(
+            buckets,
+            out_path=os.path.join(output_dir, f"boxplot_boxes_len{length_idx + 2}.png"),
+            show=False,
+            title=f"Error by #boxes (length {length_idx + 2})",
+            save_html=True,
+        )
+
+    plot_error_histogram(
+        chain_error_dict,
+        out_path=os.path.join(output_dir, "error_histogram.png"),
+        show=False,
+        save_html=True,
+    )
+    plot_error_vs_links(
+        chain_error_dict,
+        data_source,
+        out_path=os.path.join(output_dir, "error_vs_links.png"),
+        show=False,
+        save_html=True,
+    )
 
     plot_zero_pose_chains(
         val_indices=val_indices,
         data_source=data_source,
-        show=True,
+        out_path=os.path.join(output_dir, "zero_pose_chains.png"),
+        show=False,
         gap=0.08,
+        save_html=True,
     )
     
     logging.info("validation finished")

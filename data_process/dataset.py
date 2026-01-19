@@ -152,6 +152,10 @@ class SDFSamples(torch.utils.data.Dataset):
         ik=False,
         pose_mode=False,
         fix_q_samples=False,
+        sdf_mode: str = "l1",
+        off_surface_center: str = "zero",
+        sdf_target_mode: str = "fake",
+        tsdf_band: float = 0.1,
     ):
         self.subsample = subsample
         self.indices = indices
@@ -160,6 +164,10 @@ class SDFSamples(torch.utils.data.Dataset):
         self.ik = ik
         self.pose_mode = pose_mode
         self.fix_q_samples = fix_q_samples
+        self.sdf_mode = sdf_mode
+        self.off_surface_center = off_surface_center
+        self.sdf_target_mode = sdf_target_mode
+        self.tsdf_band = float(tsdf_band)
 
         self.chain_qs = []
         self.links_properties = []
@@ -209,16 +217,55 @@ class SDFSamples(torch.utils.data.Dataset):
         frac = random.random() * 0.8
         n_to_mask = int(math.floor(frac * model.num_links))
         n_to_mask = min(n_to_mask, model.num_links - 1)  # ensure at least one remains
-        # n_to_mask = 0
+        n_to_mask = 0
         if n_to_mask > 0:
             perm = torch.randperm(model.num_links)[:n_to_mask]
             link_mask[perm] = False
 
         scale_to = 1
         model.update_status(q)
-        pts = model.sample_query_points(n=self.subsample, mask=link_mask, var=0.02)
-        sdf_data = model.query_sdf(pts, mask=link_mask)
-        sdf = torch.cat([pts[0], sdf_data[0].unsqueeze(-1)], dim=-1)
+        sdf_normals = None
+        sdf_normals = None
+        normal_mask = None
+        if self.sdf_mode == "siren":
+            n_surface = self.subsample // 2
+            n_off = self.subsample - n_surface
+            surface_pts = model.sample_surface_points(n=n_surface, mask=link_mask)
+            off_pts = model.sample_off_surface_points(
+                n=n_off,
+                mask=link_mask,
+                center_mode=self.off_surface_center,
+            )
+            _, surface_normals = model.query_sdf_and_normals(surface_pts, mask=link_mask)
+
+            coords = torch.cat([surface_pts[0], off_pts[0]], dim=0)
+            sdf_true = model.query_sdf(torch.cat([surface_pts, off_pts], dim=1), mask=link_mask)[0].unsqueeze(-1)
+
+            if self.sdf_target_mode == "true":
+                sdf_labels = sdf_true
+            elif self.sdf_target_mode == "tsdf":
+                band = max(self.tsdf_band, 1e-6)
+                sdf_labels = torch.where(
+                    sdf_true.abs() <= band,
+                    torch.clamp(sdf_true, -band, band),
+                    torch.full_like(sdf_true, -1.0),
+                )
+            elif self.sdf_target_mode == "fake":
+                sdf_surface = torch.zeros(n_surface, 1, device=surface_pts.device)
+                sdf_off = -torch.ones(n_off, 1, device=off_pts.device)
+                sdf_labels = torch.cat([sdf_surface, sdf_off], dim=0)
+            else:
+                raise ValueError(f"Unsupported sdf_target_mode: {self.sdf_target_mode}")
+
+            sdf_normals = torch.zeros(self.subsample, 3, device=surface_pts.device)
+            sdf_normals[:n_surface] = surface_normals[0]
+            normal_mask = torch.zeros(self.subsample, 1, device=surface_pts.device, dtype=torch.bool)
+            normal_mask[:n_surface] = True
+            sdf = torch.cat([coords, sdf_labels], dim=-1)
+        else:
+            pts = model.sample_query_points(n=self.subsample, mask=link_mask, var=0.02)
+            sdf_data = model.query_sdf(pts, mask=link_mask)
+            sdf = torch.cat([pts[0], sdf_data[0].unsqueeze(-1)], dim=-1)
         if self.pose_mode:
             link_6d_poses = model.get_link_poses_world().squeeze(0)
             link_pose_repr = torch.cat([
@@ -245,6 +292,8 @@ class SDFSamples(torch.utils.data.Dataset):
         link_bps_scdistances = torch.tensor(np.stack(link_bps_scdistances, axis=0)).float().flatten(1)
         return {
             'sdf_samples': sdf, # Torch.Tensor of shape (subsample, 4)
+            'sdf_normals': sdf_normals, # Torch.Tensor of shape (subsample, 3) or None
+            'sdf_normal_mask': normal_mask, # Torch.Tensor of shape (subsample, 1) or None
             'chain_q': q, # Torch.Tensor of shape (num_links m - 1, )
             'link_features': link_features, # Torch.Tensor of shape (num_links m, 4)
             'joint_features': joint_features, # Torch.Tensor of shape (num_links m - 1, 9)
@@ -261,6 +310,8 @@ def make_collate_fn(max_num_links: int):
         B = len(batch)
         # infer shapes
         sdf_shape = batch[0]["sdf_samples"].shape  # (subsample, 4)
+        has_normals = batch[0]["sdf_normals"] is not None
+        has_normal_mask = batch[0]["sdf_normal_mask"] is not None
         link_feat_dim = batch[0]["link_features"].shape[-1]          # 4
         joint_feat_dim = batch[0]["joint_features"].shape[-1]        # 9
         bps_dim = batch[0]["link_bps_scdistances"].shape[-1]         # 257
@@ -273,6 +324,8 @@ def make_collate_fn(max_num_links: int):
         joint_features = torch.zeros(B, max_num_links - 1, joint_feat_dim, dtype=torch.float32)
         link_bps = torch.zeros(B, max_num_links, bps_dim, dtype=torch.float32)
         links_poses = torch.zeros(B, max_num_links, links_poses_dim, dtype=torch.float32) if links_poses_dim > 0 else None
+        sdf_normals = torch.stack([b["sdf_normals"] for b in batch], dim=0) if has_normals else None
+        sdf_normal_mask = torch.stack([b["sdf_normal_mask"] for b in batch], dim=0) if has_normal_mask else None
         masks = torch.zeros(B, 3 * max_num_links - 2, dtype=torch.bool)
         link_masks = torch.zeros(B, max_num_links, dtype=torch.bool)
 
@@ -299,6 +352,8 @@ def make_collate_fn(max_num_links: int):
 
         return {
             "sdf_samples": sdf_samples,                 # (B, subsample, 4)
+            "sdf_normals": sdf_normals,                 # (B, subsample, 3) or None
+            "sdf_normal_mask": sdf_normal_mask,         # (B, subsample, 1) or None
             "chain_q": chain_q,                         # (B, max_num_links-1)
             "link_features": link_features,             # (B, max_num_links, 4)
             "joint_features": joint_features,           # (B, max_num_links-1, 9)
@@ -325,6 +380,10 @@ def get_dataloader(
     ik=False,
     pose_mode=False,
     fix_q_samples=False,
+    sdf_mode: str = "l1",
+    off_surface_center: str = "zero",
+    sdf_target_mode: str = "fake",
+    tsdf_band: float = 0.1,
 ):
     dataset = SDFSamples(
         data_source=data_source,
@@ -334,6 +393,10 @@ def get_dataloader(
         ik=ik,
         pose_mode=pose_mode,
         fix_q_samples=fix_q_samples,
+        sdf_mode=sdf_mode,
+        off_surface_center=off_surface_center,
+        sdf_target_mode=sdf_target_mode,
+        tsdf_band=tsdf_band,
     )
     collate_fn = make_collate_fn(max_num_links)
     loader = torch.utils.data.DataLoader(
@@ -353,50 +416,95 @@ if __name__ == "__main__":
     np.random.seed(seed)
     torch.manual_seed(seed)
     data_source = "./data/"
-    indices = list(range(30))
+    indices = list(range(1, 30))
     num_instances = 100
     subsample = 16384
     batch_size = 32
     max_num_links = 5
     num_workers = 0
 
-    loader = get_dataloader(
+    # loader = get_dataloader(
+    #     data_source=data_source,
+    #     indices=indices,
+    #     num_instances=num_instances,
+    #     subsample=subsample,
+    #     batch_size=batch_size,
+    #     max_num_links=max_num_links,
+    #     shuffle=False,
+    #     num_workers=num_workers,
+    #     drop_last=True,
+    #     pose_mode=True,
+    # )
+
+    # print(f"Dataset size: {len(loader.dataset)}")
+    # for i, batch in enumerate(tqdm(loader)):
+    #     pass
+    #     # print("Batch keys:", batch.keys())
+    #     # print("sdf_samples:", batch["sdf_samples"].shape)
+    #     # print("chain_q:", batch["chain_q"].shape)
+    #     # print("link_features:", batch["link_features"].shape)
+    #     # print("joint_features:", batch["joint_features"].shape)
+    #     # print("link_bps_scdistances:", batch["link_bps_scdistances"].shape)
+    #     # print("mask:", batch["mask"].shape)
+    #     # print("links_poses:", batch["links_poses"].shape if batch["links_poses"] is not None else None)
+    #     ### Visulization code
+    #     vis_cls = batch["class_idx"][0]
+    #     urdf_path = Path(f"data/out_chains_v2/chain_{vis_cls}.urdf")
+    #     model = ChainModel(urdf_path, samples_per_link=128)
+    #     q = batch["chain_q"][0] # Here is padded q. So need some inspection to get the real q.
+    #     model.update_status(q[:1])
+
+    #     visualize_sdf_viser(
+    #         mesh=model.get_trimesh_q(0, boolean_merged=True, mask=batch['link_mask'][0, :1]),
+    #         sdf_samples=batch["sdf_samples"][0].cpu().numpy(),
+    #         host="127.0.0.1",
+    #         port=9200,
+    #         downsample_ratio=0.03
+    #     )
+
+    #     break
+
+    from data_process.visualize_samples import visualize_sdf_points_plotly
+
+    siren_loader = get_dataloader(
         data_source=data_source,
         indices=indices,
         num_instances=num_instances,
         subsample=subsample,
-        batch_size=batch_size,
+        batch_size=1,
         max_num_links=max_num_links,
         shuffle=False,
-        num_workers=num_workers,
+        num_workers=0,
         drop_last=True,
-        pose_mode=True,
+        pose_mode=False,
+        sdf_mode="siren",
+        off_surface_center="mesh",
+        sdf_target_mode="tsdf",
+        tsdf_band=0.05,
     )
+    siren_batch = next(iter(siren_loader))
+    vis_cls = siren_batch["class_idx"][0]
+    urdf_path = Path(f"data/out_chains_v2/chain_{vis_cls}.urdf")
+    model = ChainModel(urdf_path, samples_per_link=128, device="cpu")
+    q = siren_batch["chain_q"][0]
+    model.update_status(q[: model.dof])
+    mesh = model.get_trimesh_q(0, boolean_merged=True, mask=siren_batch["link_mask"][0, :model.num_links])
 
-    print(f"Dataset size: {len(loader.dataset)}")
-    for i, batch in enumerate(tqdm(loader)):
-        pass
-        # print("Batch keys:", batch.keys())
-        # print("sdf_samples:", batch["sdf_samples"].shape)
-        # print("chain_q:", batch["chain_q"].shape)
-        # print("link_features:", batch["link_features"].shape)
-        # print("joint_features:", batch["joint_features"].shape)
-        # print("link_bps_scdistances:", batch["link_bps_scdistances"].shape)
-        # print("mask:", batch["mask"].shape)
-        # print("links_poses:", batch["links_poses"].shape if batch["links_poses"] is not None else None)
-        ### Visulization code
-        vis_cls = batch["class_idx"][0]
-        urdf_path = Path(f"data/out_chains_v2/chain_{vis_cls}.urdf")
-        model = ChainModel(urdf_path, samples_per_link=128)
-        q = batch["chain_q"][0] # Here is padded q. So need some inspection to get the real q.
-        model.update_status(q[:1])
-
-        visualize_sdf_viser(
-            mesh=model.get_trimesh_q(0, boolean_merged=True, mask=batch['link_mask'][0, :1]),
-            sdf_samples=batch["sdf_samples"][0].cpu().numpy(),
-            host="127.0.0.1",
-            port=9200,
-            downsample_ratio=0.03
-        )
+    out_dir = Path("./outputs")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    visualize_sdf_points_plotly(
+        mesh=mesh,
+        points=siren_batch["sdf_samples"][0, :, :3].cpu().numpy(),
+        sdf=siren_batch["sdf_samples"][0, :, 3].cpu().numpy(),
+        normals=siren_batch["sdf_normals"][0].cpu().numpy(),
+        title="SIREN mode samples",
+        downsample_ratio=0.05,
+        max_points=20000,
+        normal_stride=1,
+        save_path=str(out_dir / "siren_samples.png"),
+        save_html_path=str(out_dir / "siren_samples.html"),
+        show=False,
+        show_sign="all",  # "all" | "negative" | "zero" | "positive"
+    )
 
     print("Done")
