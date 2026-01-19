@@ -118,6 +118,8 @@ def decode_to_mesh(
     offset=None,
     scale=None,
     marching_step: int = 2,
+    normalize_center=None,
+    normalize_scale=None,
 ):
     start = time.time()
     ply_filename = filename
@@ -151,6 +153,8 @@ def decode_to_mesh(
 
     while head < num_samples:
         sample_subset = samples[head : min(head + max_batch, num_samples), 0:3].cuda()
+        if normalize_center is not None and normalize_scale is not None:
+            sample_subset = (sample_subset - normalize_center) / normalize_scale
 
         samples[head : min(head + max_batch, num_samples), 3] = (
             decode_sdf(decoder, latent_vec, sample_subset).squeeze(1).detach().cpu()
@@ -204,6 +208,18 @@ def _load_models(cfg: DictConfig, device: torch.device) -> Tuple[Dict[str, torch
     return models, epoch
 
 
+def _compute_coord_center_scale(chain_model: ChainModel, link_mask: torch.Tensor, center_mode: str):
+    pc_full = chain_model.get_transformed_links_pc(num_points=None, mask=link_mask)[0, :, :3]
+    if center_mode == "mesh":
+        pts_min = pc_full.min(dim=0).values
+        pts_max = pc_full.max(dim=0).values
+        center = 0.5 * (pts_min + pts_max)
+    else:
+        center = torch.zeros_like(pc_full[0])
+    scale = (pc_full - center).norm(dim=-1).max().clamp_min(1e-6)
+    return center, scale
+
+
 def reconstruct_mesh(
     decoder: torch.nn.Module,
     latent: torch.Tensor,
@@ -214,6 +230,8 @@ def reconstruct_mesh(
     offset=None,
     scale=None,
     marching_step: int = 2,
+    normalize_center=None,
+    normalize_scale=None,
 ):
     """Decode a single latent to a mesh using deep_sdf.mesh.create_mesh."""
 
@@ -233,6 +251,8 @@ def reconstruct_mesh(
             offset=offset,
             scale=scale,
             marching_step=marching_step,
+            normalize_center=normalize_center,
+            normalize_scale=normalize_scale,
         )
 
 
@@ -323,6 +343,17 @@ def _validate_once(
             radius = float(np.linalg.norm(gt_mesh.vertices, axis=1).max())
             name = f"cls{cls}_inst{inst}_m{mesh_counter+i}"
             out_path = os.path.join(save_root, name)
+            normalize_center = None
+            normalize_scale = None
+            if getattr(cfg.data, "normalize_coords", False):
+                center, scale = _compute_coord_center_scale(
+                    chain_model,
+                    batch["link_mask"][i, :chain_model.num_links],
+                    center_mode=str(getattr(cfg.data, "off_surface_center", "zero")).lower(),
+                )
+                normalize_center = center.to(device=models["decoder"].parameters().__next__().device)
+                normalize_scale = scale.to(device=models["decoder"].parameters().__next__().device)
+
             reconstruct_mesh(
                 decoder=models["decoder"],
                 latent=latent[i : i + 1],
@@ -332,6 +363,8 @@ def _validate_once(
                 grid_scale=radius * 1.5,
                 offset=mesh_cfg.get("offset", None),
                 scale=mesh_cfg.get("scale", None),
+                normalize_center=normalize_center,
+                normalize_scale=normalize_scale,
             )
 
             vis_cfg = cfg.validation.visualize

@@ -11,7 +11,7 @@ from omegaconf import DictConfig
 
 from data_process.dataset import get_dataloader
 from networks.deep_sdf_decoder import Decoder
-from networks.siren_decoder import SirenDecoder
+from networks.siren_decoder import SirenDecoder, SirenSplitDecoder
 from networks.mlp import MLP
 from networks.transformer import TransformerEncoder, SetAggregator
 from networks.value_encoder import ScalarValueEncoder, AxisFourierEncoder
@@ -114,6 +114,14 @@ def build_models(cfg: DictConfig, device: torch.device) -> Dict[str, torch.nn.Mo
             omega_0=getattr(decoder_cfg, "omega_0", 30.0),
             outermost_linear=getattr(decoder_cfg, "outermost_linear", True),
         ).to(device)
+    elif decoder_type == "siren_split":
+        decoder = SirenSplitDecoder(
+            latent_size=decoder_cfg.latent_size,
+            hidden_features=getattr(decoder_cfg, "hidden_features", 256),
+            omega_0=getattr(decoder_cfg, "omega_0", 30.0),
+            num_state_layers=getattr(decoder_cfg, "num_state_layers", 4),
+            num_fusion_layers=getattr(decoder_cfg, "num_fusion_layers", 3),
+        ).to(device)
     else:
         decoder = Decoder(
             latent_size=decoder_cfg.latent_size,
@@ -162,8 +170,12 @@ def decoder_forward(
     decoder: torch.nn.Module,
     latent: torch.Tensor,
     xyz: torch.Tensor,
+    coord_center: torch.Tensor | None = None,
+    coord_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Decode latent + xyz into sdf predictions."""
+    if coord_center is not None and coord_scale is not None:
+        xyz = (xyz - coord_center.unsqueeze(1)) / coord_scale.view(-1, 1, 1)
     B, N, _ = xyz.shape
     latent_expanded = latent.unsqueeze(1).expand(-1, N, -1)
     decoder_in = torch.cat([latent_expanded, xyz], dim=-1)
@@ -219,7 +231,13 @@ def inference(
     # latent = aggregator(link_tokens, links_mask)
     latent = pooled_latent(link_tokens, links_mask, mode="max")
     xyz = coords_override if coords_override is not None else sdf_samples[..., :3]
-    sdf_pred = decoder_forward(decoder, latent, xyz)
+    coord_center = batch.get("coord_center", None)
+    coord_scale = batch.get("coord_scale", None)
+    if coord_center is not None:
+        coord_center = coord_center.to(device)
+    if coord_scale is not None:
+        coord_scale = coord_scale.to(device)
+    sdf_pred = decoder_forward(decoder, latent, xyz, coord_center=coord_center, coord_scale=coord_scale)
 
     return latent, sdf_pred
 
@@ -305,6 +323,7 @@ def main(cfg: DictConfig) -> None:
     off_surface_center = str(getattr(cfg.data, "off_surface_center", "zero")).lower()
     sdf_target_mode = str(getattr(cfg.data, "sdf_target_mode", "fake")).lower()
     tsdf_band = float(getattr(cfg.data, "tsdf_band", 0.1))
+    normalize_coords = bool(getattr(cfg.data, "normalize_coords", False))
     if loss_type == "siren" and sdf_mode != "siren":
         raise ValueError("siren loss requires data.sdf_mode = 'siren' to provide normals and surface flags")
 
@@ -322,6 +341,7 @@ def main(cfg: DictConfig) -> None:
         off_surface_center=off_surface_center,
         sdf_target_mode=sdf_target_mode,
         tsdf_band=tsdf_band,
+        normalize_coords=normalize_coords,
     )
 
     val_loader = get_dataloader(
@@ -338,6 +358,7 @@ def main(cfg: DictConfig) -> None:
         off_surface_center=off_surface_center,
         sdf_target_mode=sdf_target_mode,
         tsdf_band=tsdf_band,
+        normalize_coords=normalize_coords,
     )
     val_iter = iter(val_loader)
 

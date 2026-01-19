@@ -156,6 +156,7 @@ class SDFSamples(torch.utils.data.Dataset):
         off_surface_center: str = "zero",
         sdf_target_mode: str = "fake",
         tsdf_band: float = 0.1,
+        normalize_coords: bool = False,
     ):
         self.subsample = subsample
         self.indices = indices
@@ -168,6 +169,7 @@ class SDFSamples(torch.utils.data.Dataset):
         self.off_surface_center = off_surface_center
         self.sdf_target_mode = sdf_target_mode
         self.tsdf_band = float(tsdf_band)
+        self.normalize_coords = bool(normalize_coords)
 
         self.chain_qs = []
         self.links_properties = []
@@ -226,6 +228,8 @@ class SDFSamples(torch.utils.data.Dataset):
         model.update_status(q)
         sdf_normals = None
         normal_mask = None
+        coord_center = torch.zeros(3, dtype=torch.float32)
+        coord_scale = torch.tensor(1.0, dtype=torch.float32)
         if self.sdf_mode == "siren":
             n_surface = self.subsample // 2
             n_off = self.subsample - n_surface
@@ -265,6 +269,20 @@ class SDFSamples(torch.utils.data.Dataset):
             pts = model.sample_query_points(n=self.subsample, mask=link_mask, var=0.02)
             sdf_data = model.query_sdf(pts, mask=link_mask)
             sdf = torch.cat([pts[0], sdf_data[0].unsqueeze(-1)], dim=-1)
+
+        if self.normalize_coords:
+            pc_full = model.get_transformed_links_pc(num_points=None, mask=link_mask)[0, :, :3]
+            if self.off_surface_center == "mesh":
+                pts_min = pc_full.min(dim=0).values
+                pts_max = pc_full.max(dim=0).values
+                coord_center = 0.5 * (pts_min + pts_max)
+            else:
+                coord_center = torch.zeros_like(pc_full[0])
+            coord_scale = (pc_full - coord_center).norm(dim=-1).max().clamp_min(1e-6)
+
+            sdf[:, :3] = (sdf[:, :3] - coord_center) / coord_scale
+            if self.sdf_mode != "siren" or self.sdf_target_mode != "fake":
+                sdf[:, 3] = sdf[:, 3] / coord_scale
         if self.pose_mode:
             link_6d_poses = model.get_link_poses_world().squeeze(0)
             link_pose_repr = torch.cat([
@@ -293,6 +311,8 @@ class SDFSamples(torch.utils.data.Dataset):
             'sdf_samples': sdf, # Torch.Tensor of shape (subsample, 4)
             'sdf_normals': sdf_normals, # Torch.Tensor of shape (subsample, 3) or None
             'sdf_normal_mask': normal_mask, # Torch.Tensor of shape (subsample, 1) or None
+            'coord_center': coord_center, # Torch.Tensor of shape (3,)
+            'coord_scale': coord_scale, # scalar tensor
             'chain_q': q, # Torch.Tensor of shape (num_links m - 1, )
             'link_features': link_features, # Torch.Tensor of shape (num_links m, 4)
             'joint_features': joint_features, # Torch.Tensor of shape (num_links m - 1, 9)
@@ -325,6 +345,8 @@ def make_collate_fn(max_num_links: int):
         links_poses = torch.zeros(B, max_num_links, links_poses_dim, dtype=torch.float32) if links_poses_dim > 0 else None
         sdf_normals = torch.stack([b["sdf_normals"] for b in batch], dim=0) if has_normals else None
         sdf_normal_mask = torch.stack([b["sdf_normal_mask"] for b in batch], dim=0) if has_normal_mask else None
+        coord_center = torch.stack([b["coord_center"] for b in batch], dim=0)
+        coord_scale = torch.stack([b["coord_scale"] for b in batch], dim=0)
         masks = torch.zeros(B, 3 * max_num_links - 2, dtype=torch.bool)
         link_masks = torch.zeros(B, max_num_links, dtype=torch.bool)
 
@@ -353,6 +375,8 @@ def make_collate_fn(max_num_links: int):
             "sdf_samples": sdf_samples,                 # (B, subsample, 4)
             "sdf_normals": sdf_normals,                 # (B, subsample, 3) or None
             "sdf_normal_mask": sdf_normal_mask,         # (B, subsample, 1) or None
+            "coord_center": coord_center,               # (B, 3)
+            "coord_scale": coord_scale,                 # (B,)
             "chain_q": chain_q,                         # (B, max_num_links-1)
             "link_features": link_features,             # (B, max_num_links, 4)
             "joint_features": joint_features,           # (B, max_num_links-1, 9)
@@ -383,6 +407,7 @@ def get_dataloader(
     off_surface_center: str = "zero",
     sdf_target_mode: str = "fake",
     tsdf_band: float = 0.1,
+    normalize_coords: bool = False,
 ):
     dataset = SDFSamples(
         data_source=data_source,
@@ -396,6 +421,7 @@ def get_dataloader(
         off_surface_center=off_surface_center,
         sdf_target_mode=sdf_target_mode,
         tsdf_band=tsdf_band,
+        normalize_coords=normalize_coords,
     )
     collate_fn = make_collate_fn(max_num_links)
     loader = torch.utils.data.DataLoader(

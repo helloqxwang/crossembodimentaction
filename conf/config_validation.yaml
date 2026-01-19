@@ -19,8 +19,8 @@ data:
 
 validation:
   device: cuda
-  checkpoint_dir: ./checkpoints/mfk_siren_l1_sample_mlp
-  checkpoint_epoch: 30
+  checkpoint_dir: ./checkpoints/mfk_siren_mlp
+  checkpoint_epoch: 10
   save_mesh_dir: ./outputs/val_meshes
   output_dir: ./outputs/validation
   max_mesh_per_batch: 2
