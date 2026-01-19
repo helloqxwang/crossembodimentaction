@@ -46,7 +46,7 @@ def convert_sdf_samples_to_ply(
 
     verts, faces, normals, values = skimage.measure.marching_cubes(
         numpy_3d_sdf_tensor,
-        level=0.0,
+        level=None,
         spacing=[voxel_size] * 3,
         step_size=max(int(marching_step), 1),
     )

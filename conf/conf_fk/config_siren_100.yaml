@@ -18,7 +18,7 @@ data:
   num_workers: 20
   drop_last: true
   sdf_mode: siren
-  off_surface_center: mesh
+  off_surface_center: 'zero'
   sdf_target_mode: "true"
   tsdf_band: 0.05
 
@@ -71,7 +71,7 @@ models:
     final_layer_norm: true
   decoder:
     latent_size: *sld
-    type: siren
+    type: mlp
     omega_0: 30.0
     outermost_linear: true
     # dims: [256, 256, 256, 256]
@@ -92,7 +92,7 @@ training:
   lr: 1e-4
   num_epochs: 1e10
   test_interval: 500
-  save_interval: 50
+  save_interval: 10
   loss_type: siren
   siren_loss:
     sdf_weight: 3000.0
@@ -102,7 +102,7 @@ training:
   wandb:
     enabled: true
     project: action_repr
-    run_name: mfk_siren
+    run_name: mfk_siren_mlp
     save_dir: ./checkpoints
   lr_schedules:
     - Type: Step

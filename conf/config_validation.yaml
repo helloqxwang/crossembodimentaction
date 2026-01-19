@@ -7,8 +7,8 @@ defaults:
 data:
   data_source: ./data/
   val_indices:
-    start: 1
-    end: 2
+    start: 0
+    end: 1
   num_instances: 64
   val_batch_size: 16
   num_workers: 0
@@ -19,8 +19,8 @@ data:
 
 validation:
   device: cuda
-  checkpoint_dir: ./checkpoints/mfk_siren
-  checkpoint_epoch: 50
+  checkpoint_dir: ./checkpoints/mfk_siren_l1_sample_mlp
+  checkpoint_epoch: 30
   save_mesh_dir: ./outputs/val_meshes
   output_dir: ./outputs/validation
   max_mesh_per_batch: 2
