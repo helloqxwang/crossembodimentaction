@@ -3,3 +3,5 @@ data/
 wandb/
 outputs/
 checkpoints/
+__pycache__/
+*/__pycache__/

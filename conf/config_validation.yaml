@@ -1,4 +1,4 @@
-test_instance_name: &name config_siren_100
+test_instance_name: &name config_siren_100_new
 
 defaults:
   - conf_fk@_global_: *name
@@ -7,20 +7,22 @@ defaults:
 data:
   data_source: ./data/
   val_indices:
-    start: 0
-    end: 1
+    start: 1
+    end: 2
   num_instances: 64
   val_batch_size: 16
   num_workers: 0
   drop_last: false
   fix_q_samples: true
-  sdf_target_mode: tsdf
+  siren_sdf_mode: tsdf
   tsdf_band: 0.05
+  normalize_mode: dataset
+  normalize_center_mode: mesh
 
 validation:
   device: cuda
-  checkpoint_dir: ./checkpoints/mfk_siren_mlp
-  checkpoint_epoch: 10
+  checkpoint_dir: ./checkpoints/mfk_siren
+  checkpoint_epoch: 20
   save_mesh_dir: ./outputs/val_meshes
   output_dir: ./outputs/validation
   max_mesh_per_batch: 2

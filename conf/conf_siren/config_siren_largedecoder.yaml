@@ -17,7 +17,7 @@ data:
   shuffle: true
   num_workers: 20
   drop_last: true
-  sdf_mode: deepsdf # dataset mode deepsdf/siren
+  sdf_mode: siren # dataset mode deepsdf/siren
   off_surface_center: zero
   siren_sdf_mode: "true"
   tsdf_band: 0.05
@@ -73,7 +73,7 @@ models:
     final_layer_norm: true
   decoder:
     latent_size: *sld
-    type: mlp
+    type: siren
     omega_0: 30.0
     outermost_linear: true
     hidden_features: 256
@@ -97,7 +97,7 @@ training:
   num_epochs: 1e10
   test_interval: 500
   save_interval: 10
-  loss_type: l1 # options: l1/siren
+  loss_type: siren # options: l1/siren
   siren_loss:
     sdf_weight: 3000.0
     inter_weight: 100.0
@@ -106,7 +106,7 @@ training:
   wandb:
     enabled: true
     project: action_repr
-    run_name: mfk_mlp
+    run_name: mfk_siren_largedecoder
     save_dir: ./checkpoints
   lr_schedules:
     - Type: Step

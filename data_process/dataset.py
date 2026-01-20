@@ -152,11 +152,12 @@ class SDFSamples(torch.utils.data.Dataset):
         ik=False,
         pose_mode=False,
         fix_q_samples=False,
-        sdf_mode: str = "l1",
+        sdf_mode: str = "deepsdf",
         off_surface_center: str = "zero",
-        sdf_target_mode: str = "fake",
+        siren_sdf_mode: str = "fake",
         tsdf_band: float = 0.1,
-        normalize_coords: bool = False,
+        normalize_mode: str = "none",
+        normalize_center_mode: str = "zero",
     ):
         self.subsample = subsample
         self.indices = indices
@@ -167,14 +168,20 @@ class SDFSamples(torch.utils.data.Dataset):
         self.fix_q_samples = fix_q_samples
         self.sdf_mode = sdf_mode
         self.off_surface_center = off_surface_center
-        self.sdf_target_mode = sdf_target_mode
+        self.siren_sdf_mode = siren_sdf_mode
         self.tsdf_band = float(tsdf_band)
-        self.normalize_coords = bool(normalize_coords)
+        self.normalize_mode = str(normalize_mode).lower()
+        self.normalize_center_mode = str(normalize_center_mode).lower()
+        if self.normalize_mode not in ("none", "instance", "chain", "dataset"):
+            raise ValueError(f"Unsupported normalize_mode: {self.normalize_mode}")
 
         self.chain_qs = []
         self.links_properties = []
         self.joints_properties = []
         self.bpses = []
+        self.chain_centers = []
+        self.chain_scales = []
+        cached_chain_pcs = []
 
         self.chain_model_ls: list[tuple[ChainModel, int]] = []
         for class_idx, class_real_idx in enumerate(indices):
@@ -192,6 +199,31 @@ class SDFSamples(torch.utils.data.Dataset):
                     device="cpu",
             )
             self.chain_model_ls.append((chain_model, class_real_idx))
+            
+            if self.normalize_mode in ("chain", "dataset"):
+                chain_model.update_status(torch.zeros(chain_model.dof))
+                pc_full = chain_model.get_transformed_links_pc(
+                    num_points=None,
+                    mask=torch.ones(chain_model.num_links, dtype=torch.bool),
+                )[0, :, :3]
+                cached_chain_pcs.append(pc_full)
+                if self.normalize_mode == "chain":
+                    if self.normalize_center_mode == "mesh":
+                        # compute center of each chain at zero configuration
+                        pts_min = pc_full.min(dim=0).values
+                        pts_max = pc_full.max(dim=0).values
+                        center = 0.5 * (pts_min + pts_max)
+                    elif self.normalize_center_mode == "zero":
+                        center = torch.zeros_like(pc_full[0])
+                    else:
+                        raise ValueError(f"Unsupported normalize_center_mode: {self.normalize_center_mode}")
+                    scale = (pc_full - center).norm(dim=-1).max().clamp_min(1e-6)
+                    self.chain_centers.append(center)
+                    self.chain_scales.append(scale)
+            else:
+                self.chain_centers.append(torch.zeros(3))
+                self.chain_scales.append(torch.tensor(1.0))
+
             if self.fix_q_samples:
                 os.makedirs(os.path.join(data_source, f'chain_qs'), exist_ok=True)
                 q_samples_path = os.path.join(
@@ -205,6 +237,22 @@ class SDFSamples(torch.utils.data.Dataset):
                 self.chain_qs.append(q_samples)
             else:
                 self.chain_qs.append(chain_model.sample_q(num_instances).float())
+
+        if self.normalize_mode == "dataset":
+            if not cached_chain_pcs:
+                raise ValueError("normalize_mode=dataset requires chain point clouds")
+            all_pts = torch.cat(cached_chain_pcs, dim=0)
+            if self.normalize_center_mode == "mesh":
+                pts_min = all_pts.min(dim=0).values
+                pts_max = all_pts.max(dim=0).values
+                center = 0.5 * (pts_min + pts_max)
+            elif self.normalize_center_mode == "zero":
+                center = torch.zeros_like(all_pts[0])
+            else:
+                raise ValueError(f"Unsupported normalize_center_mode: {self.normalize_center_mode}")
+            scale = (all_pts - center).norm(dim=-1).max().clamp_min(1e-6)
+            self.chain_centers = [center.clone() for _ in self.indices]
+            self.chain_scales = [scale.clone() for _ in self.indices]
     
     def __len__(self):
         return len(self.indices) * self.num_instances
@@ -214,12 +262,13 @@ class SDFSamples(torch.utils.data.Dataset):
         instance_idx = idx % self.num_instances
         model, class_real_idx = self.chain_model_ls[class_idx]
         q = self.chain_qs[class_idx][instance_idx]
+        
         # Randomly mask 0–80% of links for SDF/mesh queries; keep at least one link visible.
         link_mask = torch.ones((model.num_links,), dtype=torch.bool)
         frac = random.random() * 0.8
         n_to_mask = int(math.floor(frac * model.num_links))
         n_to_mask = min(n_to_mask, model.num_links - 1)  # ensure at least one remains
-        n_to_mask = 0
+        # n_to_mask = 0
         if n_to_mask > 0:
             perm = torch.randperm(model.num_links)[:n_to_mask]
             link_mask[perm] = False
@@ -228,8 +277,7 @@ class SDFSamples(torch.utils.data.Dataset):
         model.update_status(q)
         sdf_normals = None
         normal_mask = None
-        coord_center = torch.zeros(3, dtype=torch.float32)
-        coord_scale = torch.tensor(1.0, dtype=torch.float32)
+
         if self.sdf_mode == "siren":
             n_surface = self.subsample // 2
             n_off = self.subsample - n_surface
@@ -244,21 +292,21 @@ class SDFSamples(torch.utils.data.Dataset):
             coords = torch.cat([surface_pts[0], off_pts[0]], dim=0)
             sdf_true = model.query_sdf(torch.cat([surface_pts, off_pts], dim=1), mask=link_mask)[0].unsqueeze(-1)
 
-            if self.sdf_target_mode == "true":
+            if self.siren_sdf_mode == "true":
                 sdf_labels = sdf_true
-            elif self.sdf_target_mode == "tsdf":
+            elif self.siren_sdf_mode == "tsdf":
                 band = max(self.tsdf_band, 1e-6)
                 sdf_labels = torch.where(
                     sdf_true.abs() <= band,
                     torch.clamp(sdf_true, -band, band),
                     torch.full_like(sdf_true, -1.0),
                 )
-            elif self.sdf_target_mode == "fake":
+            elif self.siren_sdf_mode == "fake":
                 sdf_surface = torch.zeros(n_surface, 1, device=surface_pts.device)
                 sdf_off = -torch.ones(n_off, 1, device=off_pts.device)
                 sdf_labels = torch.cat([sdf_surface, sdf_off], dim=0)
             else:
-                raise ValueError(f"Unsupported sdf_target_mode: {self.sdf_target_mode}")
+                raise ValueError(f"Unsupported siren_sdf_mode: {self.siren_sdf_mode}")
 
             sdf_normals = torch.zeros(self.subsample, 3, device=surface_pts.device)
             sdf_normals[:n_surface] = surface_normals[0]
@@ -266,22 +314,27 @@ class SDFSamples(torch.utils.data.Dataset):
             normal_mask[:n_surface] = True
             sdf = torch.cat([coords, sdf_labels], dim=-1)
         else:
-            pts = model.sample_query_points(n=self.subsample, mask=link_mask, var=0.02)
+            pts = model.sample_query_points(n=self.subsample, mask=link_mask, var=0.005)
             sdf_data = model.query_sdf(pts, mask=link_mask)
             sdf = torch.cat([pts[0], sdf_data[0].unsqueeze(-1)], dim=-1)
 
-        if self.normalize_coords:
+        if self.normalize_mode == "instance":
             pc_full = model.get_transformed_links_pc(num_points=None, mask=link_mask)[0, :, :3]
-            if self.off_surface_center == "mesh":
+            if self.normalize_center_mode == "mesh":
                 pts_min = pc_full.min(dim=0).values
                 pts_max = pc_full.max(dim=0).values
                 coord_center = 0.5 * (pts_min + pts_max)
-            else:
+            elif self.normalize_center_mode == "zero":
                 coord_center = torch.zeros_like(pc_full[0])
+            else:
+                raise ValueError(f"Unsupported normalize_center_mode: {self.normalize_center_mode}")
             coord_scale = (pc_full - coord_center).norm(dim=-1).max().clamp_min(1e-6)
 
+        coord_center = self.chain_centers[class_idx].clone()
+        coord_scale = self.chain_scales[class_idx].clone()
+        if self.normalize_mode != "none":
             sdf[:, :3] = (sdf[:, :3] - coord_center) / coord_scale
-            if self.sdf_mode != "siren" or self.sdf_target_mode != "fake":
+            if self.sdf_mode != "siren" or self.siren_sdf_mode != "fake":
                 sdf[:, 3] = sdf[:, 3] / coord_scale
         if self.pose_mode:
             link_6d_poses = model.get_link_poses_world().squeeze(0)
@@ -403,11 +456,12 @@ def get_dataloader(
     ik=False,
     pose_mode=False,
     fix_q_samples=False,
-    sdf_mode: str = "l1",
+    sdf_mode: str = "deepsdf",
     off_surface_center: str = "zero",
-    sdf_target_mode: str = "fake",
+    siren_sdf_mode: str = "fake",
     tsdf_band: float = 0.1,
-    normalize_coords: bool = False,
+    normalize_mode: str = "none",
+    normalize_center_mode: str = "zero",
 ):
     dataset = SDFSamples(
         data_source=data_source,
@@ -419,9 +473,10 @@ def get_dataloader(
         fix_q_samples=fix_q_samples,
         sdf_mode=sdf_mode,
         off_surface_center=off_surface_center,
-        sdf_target_mode=sdf_target_mode,
+        siren_sdf_mode=siren_sdf_mode,
         tsdf_band=tsdf_band,
-        normalize_coords=normalize_coords,
+        normalize_mode=normalize_mode,
+        normalize_center_mode=normalize_center_mode,
     )
     collate_fn = make_collate_fn(max_num_links)
     loader = torch.utils.data.DataLoader(
@@ -448,47 +503,6 @@ if __name__ == "__main__":
     max_num_links = 5
     num_workers = 0
 
-    # loader = get_dataloader(
-    #     data_source=data_source,
-    #     indices=indices,
-    #     num_instances=num_instances,
-    #     subsample=subsample,
-    #     batch_size=batch_size,
-    #     max_num_links=max_num_links,
-    #     shuffle=False,
-    #     num_workers=num_workers,
-    #     drop_last=True,
-    #     pose_mode=True,
-    # )
-
-    # print(f"Dataset size: {len(loader.dataset)}")
-    # for i, batch in enumerate(tqdm(loader)):
-    #     pass
-    #     # print("Batch keys:", batch.keys())
-    #     # print("sdf_samples:", batch["sdf_samples"].shape)
-    #     # print("chain_q:", batch["chain_q"].shape)
-    #     # print("link_features:", batch["link_features"].shape)
-    #     # print("joint_features:", batch["joint_features"].shape)
-    #     # print("link_bps_scdistances:", batch["link_bps_scdistances"].shape)
-    #     # print("mask:", batch["mask"].shape)
-    #     # print("links_poses:", batch["links_poses"].shape if batch["links_poses"] is not None else None)
-    #     ### Visulization code
-    #     vis_cls = batch["class_idx"][0]
-    #     urdf_path = Path(f"data/out_chains_v2/chain_{vis_cls}.urdf")
-    #     model = ChainModel(urdf_path, samples_per_link=128)
-    #     q = batch["chain_q"][0] # Here is padded q. So need some inspection to get the real q.
-    #     model.update_status(q[:1])
-
-    #     visualize_sdf_viser(
-    #         mesh=model.get_trimesh_q(0, boolean_merged=True, mask=batch['link_mask'][0, :1]),
-    #         sdf_samples=batch["sdf_samples"][0].cpu().numpy(),
-    #         host="127.0.0.1",
-    #         port=9200,
-    #         downsample_ratio=0.03
-    #     )
-
-    #     break
-
     from data_process.visualize_samples import visualize_sdf_points_plotly
 
     siren_loader = get_dataloader(
@@ -502,34 +516,43 @@ if __name__ == "__main__":
         num_workers=0,
         drop_last=True,
         pose_mode=False,
-        sdf_mode="siren",
-        off_surface_center="mesh",
-        sdf_target_mode="tsdf",
+        # parameters
+        sdf_mode="deepsdf",
+        off_surface_center="zero",
+        siren_sdf_mode="true",
         tsdf_band=0.05,
+        normalize_mode="dataset",
+        normalize_center_mode="zero",
     )
-    siren_batch = next(iter(siren_loader))
-    vis_cls = siren_batch["class_idx"][0]
-    urdf_path = Path(f"data/out_chains_v2/chain_{vis_cls}.urdf")
-    model = ChainModel(urdf_path, samples_per_link=128, device="cpu")
-    q = siren_batch["chain_q"][0]
-    model.update_status(q[: model.dof])
-    mesh = model.get_trimesh_q(0, boolean_merged=True, mask=siren_batch["link_mask"][0, :model.num_links])
+    for data_batch in siren_loader:
+        vis_cls = data_batch["class_idx"][0]
+        urdf_path = Path(f"data/out_chains_v2/chain_{vis_cls}.urdf")
+        model = ChainModel(urdf_path, samples_per_link=128, device="cpu")
+        q = data_batch["chain_q"][0]
+        model.update_status(q[: model.dof])
+        mesh = model.get_trimesh_q(0, boolean_merged=True, mask=data_batch["link_mask"][0, :model.num_links]).copy()
 
-    out_dir = Path("./outputs")
-    out_dir.mkdir(parents=True, exist_ok=True)
-    visualize_sdf_points_plotly(
-        mesh=mesh,
-        points=siren_batch["sdf_samples"][0, :, :3].cpu().numpy(),
-        sdf=siren_batch["sdf_samples"][0, :, 3].cpu().numpy(),
-        normals=siren_batch["sdf_normals"][0].cpu().numpy(),
-        title="SIREN mode samples",
-        downsample_ratio=0.05,
-        max_points=20000,
-        normal_stride=1,
-        save_path=str(out_dir / "siren_samples.png"),
-        save_html_path=str(out_dir / "siren_samples.html"),
-        show=False,
-        show_sign="all",  # "all" | "negative" | "zero" | "positive"
-    )
+        # Apply the same normalization used for SDF samples so visualization stays consistent.
+        center = data_batch["coord_center"][0].cpu().numpy()
+        scale = float(data_batch["coord_scale"][0])
+        mesh.apply_translation(-center)
+        mesh.apply_scale(1.0 / max(scale, 1e-8))
 
-    print("Done")
+        out_dir = Path("./outputs")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        visualize_sdf_points_plotly(
+            mesh=mesh,
+            points=data_batch["sdf_samples"][0, :, :3].cpu().numpy(),
+            sdf=data_batch["sdf_samples"][0, :, 3].cpu().numpy(),
+            normals=data_batch["sdf_normals"][0].cpu().numpy() if data_batch["sdf_normals"] is not None else None,
+            title="SIREN mode samples",
+            downsample_ratio=0.05,
+            max_points=20000,
+            normal_stride=1,
+            save_path=str(out_dir / "siren_samples.png"),
+            save_html_path=str(out_dir / "siren_samples.html"),
+            show=True,
+            show_sign="all",  # "all" | "negative" | "zero" | "positive"
+        )
+
+        print("Done")

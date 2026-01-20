@@ -11,13 +11,13 @@ data:
     end: 110
   num_instances: 1000
   subsample: 4096
-  batch_size: 64
-  val_batch_size: 64
+  batch_size: 48
+  val_batch_size: 48
   max_num_links: 5
   shuffle: true
   num_workers: 20
   drop_last: true
-  sdf_mode: deepsdf # dataset mode deepsdf/siren
+  sdf_mode: siren # dataset mode deepsdf/siren
   off_surface_center: zero
   siren_sdf_mode: "true"
   tsdf_band: 0.05
@@ -97,7 +97,7 @@ training:
   num_epochs: 1e10
   test_interval: 500
   save_interval: 10
-  loss_type: l1 # options: l1/siren
+  loss_type: siren # options: l1/siren
   siren_loss:
     sdf_weight: 3000.0
     inter_weight: 100.0

@@ -170,12 +170,8 @@ def decoder_forward(
     decoder: torch.nn.Module,
     latent: torch.Tensor,
     xyz: torch.Tensor,
-    coord_center: torch.Tensor | None = None,
-    coord_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Decode latent + xyz into sdf predictions."""
-    if coord_center is not None and coord_scale is not None:
-        xyz = (xyz - coord_center.unsqueeze(1)) / coord_scale.view(-1, 1, 1)
     B, N, _ = xyz.shape
     latent_expanded = latent.unsqueeze(1).expand(-1, N, -1)
     decoder_in = torch.cat([latent_expanded, xyz], dim=-1)
@@ -231,13 +227,7 @@ def inference(
     # latent = aggregator(link_tokens, links_mask)
     latent = pooled_latent(link_tokens, links_mask, mode="max")
     xyz = coords_override if coords_override is not None else sdf_samples[..., :3]
-    coord_center = batch.get("coord_center", None)
-    coord_scale = batch.get("coord_scale", None)
-    if coord_center is not None:
-        coord_center = coord_center.to(device)
-    if coord_scale is not None:
-        coord_scale = coord_scale.to(device)
-    sdf_pred = decoder_forward(decoder, latent, xyz, coord_center=coord_center, coord_scale=coord_scale)
+    sdf_pred = decoder_forward(decoder, latent, xyz)
 
     return latent, sdf_pred
 
@@ -302,7 +292,7 @@ def _cfg_get(cfg, key: str, default):
         return cfg.get(key, default)
     return getattr(cfg, key, default)
 
-@hydra.main(config_path="conf/conf_fk", config_name="config_siren_100", version_base="1.3")
+@hydra.main(config_path="conf/conf_siren", config_name="config_mlp", version_base="1.3")
 def main(cfg: DictConfig) -> None:
     device = _prepare_device(cfg.training.device)
     torch.manual_seed(0)
@@ -321,9 +311,10 @@ def main(cfg: DictConfig) -> None:
     loss_type = str(getattr(cfg.training, "loss_type", "siren")).lower()
     sdf_mode = str(getattr(cfg.data, "sdf_mode", "siren")).lower()
     off_surface_center = str(getattr(cfg.data, "off_surface_center", "zero")).lower()
-    sdf_target_mode = str(getattr(cfg.data, "sdf_target_mode", "fake")).lower()
+    siren_sdf_mode = str(getattr(cfg.data, "siren_sdf_mode", "fake")).lower()
     tsdf_band = float(getattr(cfg.data, "tsdf_band", 0.1))
-    normalize_coords = bool(getattr(cfg.data, "normalize_coords", False))
+    normalize_mode = str(getattr(cfg.data, "normalize_mode", "none")).lower()
+    normalize_center_mode = str(getattr(cfg.data, "normalize_center_mode", "mesh")).lower()
     if loss_type == "siren" and sdf_mode != "siren":
         raise ValueError("siren loss requires data.sdf_mode = 'siren' to provide normals and surface flags")
 
@@ -339,9 +330,10 @@ def main(cfg: DictConfig) -> None:
         drop_last=cfg.data.drop_last,
         sdf_mode=sdf_mode,
         off_surface_center=off_surface_center,
-        sdf_target_mode=sdf_target_mode,
+        siren_sdf_mode=siren_sdf_mode,
         tsdf_band=tsdf_band,
-        normalize_coords=normalize_coords,
+        normalize_mode=normalize_mode,
+        normalize_center_mode=normalize_center_mode,
     )
 
     val_loader = get_dataloader(
@@ -356,9 +348,10 @@ def main(cfg: DictConfig) -> None:
         drop_last=False,
         sdf_mode=sdf_mode,
         off_surface_center=off_surface_center,
-        sdf_target_mode=sdf_target_mode,
+        siren_sdf_mode=siren_sdf_mode,
         tsdf_band=tsdf_band,
-        normalize_coords=normalize_coords,
+        normalize_mode=normalize_mode,
+        normalize_center_mode=normalize_center_mode,
     )
     val_iter = iter(val_loader)
 
