@@ -1,4 +1,5 @@
 defaults:
+  - conf_siren@_global_: config_siren
   - _self_
 
 data:
@@ -10,7 +11,7 @@ data:
     start: 101
     end: 110
   num_instances: 100
-  subsample: 16384
+  subsample: 4096
   batch_size: 64
   val_batch_size: 64
   max_num_links: 5
@@ -20,45 +21,25 @@ data:
   drop_last: true
 
 models:
-  joint_encoder:
-    input_dim: 9
-    output_dim: 128
-    hidden_dims: [128, 128]
-    activation: gelu
-    dropout: 0.0
-    use_layer_norm: false
-  link_encoder:
-    input_dim: 1024
-    output_dim: 128
-    hidden_dims: [256, 256]
-    activation: gelu
-    dropout: 0.0
-    use_layer_norm: false
-  joint_value_encoder:
-    embed_dim: 128
-    use_positional: true
-    mlp_hidden: [128, 128]
-    positional_head_hidden_dims: []
-    activation: gelu
-    dropout: 0.0
-    use_layer_norm: false
+  sdf_latent_dim: &sld 128
+  hidden_dims: &hd 256
   transformer:
-    input_dim: 128
-    model_dim: 128
-    output_dim: 128
-    num_heads: 4
-    num_layers: 4
+    input_dim: *sld  # was 128
+    model_dim: *hd  # was 128
+    output_dim: *sld  # was 128
+    num_heads: 8  # was 4
+    num_layers: 6  # was 4
     mlp_ratio: 4.0
     dropout: 0.1
     attn_dropout: 0.0
     activation: gelu
     use_positional_encoding: true
-    max_length: 32
+    max_length: 16
     norm_first: true
     final_layer_norm: true
   joint_value_decoder:
-    input_dim: 128
-    hidden_dims: [256, 128]
+    input_dim: *sld
+    hidden_dims: [*hd, *sld]
     activation: gelu
     dropout: 0.0
     use_layer_norm: false

@@ -1,7 +1,7 @@
-test_instance_name: &name config_siren_100_new
+test_instance_name: &name config_siren
 
 defaults:
-  - conf_fk@_global_: *name
+  - conf_siren@_global_: *name
   - _self_
 
 data:
@@ -22,7 +22,7 @@ data:
 validation:
   device: cuda
   checkpoint_dir: ./checkpoints/mfk_siren
-  checkpoint_epoch: 20
+  checkpoint_epoch: 830
   save_mesh_dir: ./outputs/val_meshes
   output_dir: ./outputs/validation
   max_mesh_per_batch: 2

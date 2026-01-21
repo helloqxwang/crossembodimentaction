@@ -7,7 +7,7 @@ import hydra
 import torch
 import wandb
 from hydra.utils import to_absolute_path
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
 
 from data_process.dataset import get_dataloader
@@ -15,6 +15,7 @@ from networks.mlp import MLP
 from networks.transformer import TransformerEncoder
 from networks.value_encoder import ScalarValueEncoder
 from networks.flow_matching import sample_interpolants, SinusoidalTimeEmbedding, rk4_integrate
+from train_fk import build_models as build_fk_models
 
 
 def _prepare_device(device_str: str) -> torch.device:
@@ -60,26 +61,19 @@ def masked_mse(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> 
     return masked.sum() / denom
 
 
-def build_models(cfg: DictConfig, device: torch.device) -> Dict[str, torch.nn.Module]:
-    joint_encoder_cfg = cfg.models.joint_encoder
-    joint_encoder = MLP(
-        input_dim=joint_encoder_cfg.input_dim,
-        output_dim=joint_encoder_cfg.output_dim,
-        hidden_dims=joint_encoder_cfg.hidden_dims,
-        activation=joint_encoder_cfg.activation,
-        dropout=joint_encoder_cfg.dropout,
-        use_layer_norm=joint_encoder_cfg.use_layer_norm,
-    ).to(device)
+def _load_fk_cfg(cfg: DictConfig) -> DictConfig:
+    fk_config_path = getattr(cfg, "fk_config", None)
+    if fk_config_path is None:
+        fk_config_path = getattr(cfg.models, "fk_config", None)
+    if fk_config_path is None:
+        raise ValueError("fk_config must be set to the FK config path")
+    return OmegaConf.load(to_absolute_path(str(fk_config_path)))
 
-    link_encoder_cfg = cfg.models.link_encoder
-    link_encoder = MLP(
-        input_dim=link_encoder_cfg.input_dim,
-        output_dim=link_encoder_cfg.output_dim,
-        hidden_dims=link_encoder_cfg.hidden_dims,
-        activation=link_encoder_cfg.activation,
-        dropout=link_encoder_cfg.dropout,
-        use_layer_norm=link_encoder_cfg.use_layer_norm,
-    ).to(device)
+
+def build_models(cfg: DictConfig, device: torch.device) -> Dict[str, torch.nn.Module]:
+    fk_models = build_fk_models(cfg, device)
+    joint_encoder = fk_models["joint_encoder"]
+    link_encoder = fk_models["link_encoder"]
 
     joint_value_encoder_cfg = cfg.models.joint_value_encoder
     joint_value_encoder = ScalarValueEncoder(
