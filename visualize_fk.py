@@ -344,7 +344,7 @@ def _validate_once(
                 out_path=out_path,
                 N=mesh_cfg.N,
                 max_batch=mesh_cfg.max_batch,
-                grid_scale=radius * 1.5,
+                grid_scale=radius * 1.4,
                 offset=mesh_cfg.get("offset", None),
                 scale=mesh_cfg.get("scale", None),
                 normalize_center=normalize_center,

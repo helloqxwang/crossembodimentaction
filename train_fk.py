@@ -184,7 +184,8 @@ def inference(
     cfg: DictConfig,
     device: torch.device = torch.device("cpu"),
     coords_override: torch.Tensor | None = None,
-) -> Tuple[torch.Tensor, torch.Tensor]:
+    return_link_tokens: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor] | Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     joint_encoder = models["joint_encoder"]
     link_encoder = models["link_encoder"]
     joint_value_encoder = models["joint_value_encoder"]
@@ -229,6 +230,8 @@ def inference(
     xyz = coords_override if coords_override is not None else sdf_samples[..., :3]
     sdf_pred = decoder_forward(decoder, latent, xyz)
 
+    if return_link_tokens:
+        return latent, sdf_pred, link_tokens
     return latent, sdf_pred
 
 

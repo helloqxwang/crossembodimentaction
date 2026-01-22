@@ -1,4 +1,4 @@
-test_instance_name: &name config_siren
+test_instance_name: &name config_mlp
 
 defaults:
   - conf_siren@_global_: *name
@@ -14,15 +14,11 @@ data:
   num_workers: 0
   drop_last: false
   fix_q_samples: true
-  siren_sdf_mode: tsdf
-  tsdf_band: 0.05
-  normalize_mode: dataset
-  normalize_center_mode: mesh
 
 validation:
   device: cuda
-  checkpoint_dir: ./checkpoints/mfk_siren
-  checkpoint_epoch: 830
+  checkpoint_dir: ./checkpoints/mfk_mlp
+  checkpoint_epoch: 310
   save_mesh_dir: ./outputs/val_meshes
   output_dir: ./outputs/validation
   max_mesh_per_batch: 2

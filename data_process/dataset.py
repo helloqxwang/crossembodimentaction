@@ -142,6 +142,20 @@ def unpack_sdf_samples_from_ram(data, subsample=None):
     return samples
 
 
+def _prepare_link_bps_scdistances(bps_info):
+    link_bps_scdistances = [
+        np.concatenate(
+            [
+                bp_info["offsets"],
+                np.ones((bp_info["offsets"].shape[0], 1)) * bp_info["scale_to_unit"],
+            ],
+            axis=-1,
+        )
+        for bp_info in bps_info
+    ]
+    return torch.tensor(np.stack(link_bps_scdistances, axis=0)).float().flatten(1)
+
+
 class SDFSamples(torch.utils.data.Dataset):
     def __init__(
         self,
@@ -377,6 +391,69 @@ class SDFSamples(torch.utils.data.Dataset):
             'links_poses': link_pose_repr if self.pose_mode else None, # Torch.Tensor of shape (num_links m, 9) 
         }
 
+
+class IKTokenSamples(torch.utils.data.Dataset):
+    """Dataset that loads precomputed SDF tokens with link masks for IK training."""
+
+    def __init__(
+        self,
+        data_source: str,
+        indices,
+        num_instances: int,
+        tokens_dir: str,
+        link_compact_repr: bool = False,
+    ) -> None:
+        self.indices = indices
+        self.num_instances = num_instances
+        self.data_source = data_source
+        self.tokens_dir = Path(tokens_dir)
+        self.link_compact_repr = link_compact_repr
+
+        self.link_features = []
+        self.joint_features = []
+        self.link_bps = []
+
+        for class_real_idx in indices:
+            chain_properties = np.load(
+                os.path.join(data_source, "out_chains_v2", f"chain_{class_real_idx}_properties.npz"),
+                allow_pickle=True,
+            )
+            links_property = torch.tensor(chain_properties["links_property"]).float()
+            joints_property = torch.tensor(chain_properties["joints_property"]).float()
+            bpses = chain_properties["bpses"]
+
+            self.link_features.append(links_property)
+            self.joint_features.append(joints_property)
+            self.link_bps.append(_prepare_link_bps_scdistances(bpses))
+
+    def __len__(self):
+        return len(self.indices) * self.num_instances
+
+    def __getitem__(self, idx):
+        class_idx = idx // self.num_instances
+        instance_idx = idx % self.num_instances
+        class_real_idx = self.indices[class_idx]
+
+        token_path = self.tokens_dir / f"cls{class_real_idx}_inst{instance_idx}.pt"
+        if not token_path.exists():
+            raise FileNotFoundError(f"Missing token file: {token_path}")
+        token_data = torch.load(token_path, weights_only=False, map_location="cpu")
+
+        sdf_tokens = torch.as_tensor(token_data["sdf_tokens"]).float()
+        link_mask = torch.as_tensor(token_data["link_mask"]).bool()
+        q_values = torch.as_tensor(token_data["q_values"]).float()
+
+        return {
+            "chain_q": q_values,  # (num_links-1,)
+            "link_features": self.link_features[class_idx],  # (num_links, 4)
+            "joint_features": self.joint_features[class_idx],  # (num_links-1, 9)
+            "link_bps_scdistances": self.link_bps[class_idx],  # (num_links, 257)
+            "sdf_tokens": sdf_tokens,  # (num_masks, token_dim)
+            "link_mask": link_mask,  # (num_masks, num_links)
+            "class_idx": int(token_data.get("cls_idx", class_real_idx)),
+            "instance_idx": int(token_data.get("instance_idx", instance_idx)),
+        }
+
 def make_collate_fn(max_num_links: int):
     def collate_fn(batch):
         B = len(batch)
@@ -443,6 +520,64 @@ def make_collate_fn(max_num_links: int):
         }
     return collate_fn
 
+
+def make_ik_collate_fn(max_num_links: int):
+    def collate_fn(batch):
+        total_masks = sum(item["sdf_tokens"].shape[0] for item in batch)
+        if total_masks == 0:
+            raise ValueError("Empty batch received in IK collate.")
+
+        link_feat_dim = batch[0]["link_features"].shape[-1]
+        joint_feat_dim = batch[0]["joint_features"].shape[-1]
+        bps_dim = batch[0]["link_bps_scdistances"].shape[-1]
+        token_dim = batch[0]["sdf_tokens"].shape[-1]
+
+        chain_q = torch.zeros(total_masks, max_num_links - 1, dtype=torch.float32)
+        link_features = torch.zeros(total_masks, max_num_links, link_feat_dim, dtype=torch.float32)
+        joint_features = torch.zeros(total_masks, max_num_links - 1, joint_feat_dim, dtype=torch.float32)
+        link_bps = torch.zeros(total_masks, max_num_links, bps_dim, dtype=torch.float32)
+        masks = torch.zeros(total_masks, 3 * max_num_links - 2, dtype=torch.bool)
+        link_masks = torch.zeros(total_masks, max_num_links, dtype=torch.bool)
+        sdf_tokens = torch.zeros(total_masks, token_dim, dtype=torch.float32)
+
+        class_idx = []
+        instance_idx = []
+
+        cursor = 0
+        for item in batch:
+            n_links = item["link_features"].shape[0]
+            if n_links > max_num_links:
+                raise ValueError(f"n_links {n_links} exceeds max_num_links {max_num_links}")
+            n_joints = n_links - 1
+            n_masks = item["sdf_tokens"].shape[0]
+
+            for m in range(n_masks):
+                chain_q[cursor, :n_joints] = item["chain_q"]
+                link_features[cursor, :n_links] = item["link_features"]
+                joint_features[cursor, :n_joints] = item["joint_features"]
+                link_bps[cursor, :n_links] = item["link_bps_scdistances"]
+                masks[cursor, : 3 * n_links - 2] = True
+                link_masks[cursor, :n_links] = item["link_mask"][m]
+                sdf_tokens[cursor] = item["sdf_tokens"][m]
+
+                class_idx.append(item["class_idx"])
+                instance_idx.append(item["instance_idx"])
+                cursor += 1
+
+        return {
+            "chain_q": chain_q,  # (B, max_num_links-1)
+            "link_features": link_features,  # (B, max_num_links, 4)
+            "joint_features": joint_features,  # (B, max_num_links-1, 9)
+            "link_bps_scdistances": link_bps,  # (B, max_num_links, 257)
+            "sdf_tokens": sdf_tokens,  # (B, token_dim)
+            "class_idx": class_idx,
+            "instance_idx": instance_idx,
+            "mask": masks,  # (B, 3*max_num_links-2)
+            "link_mask": link_masks,  # (B, max_num_links)
+        }
+
+    return collate_fn
+
 def get_dataloader(
     data_source: str,
     indices,
@@ -479,6 +614,37 @@ def get_dataloader(
         normalize_center_mode=normalize_center_mode,
     )
     collate_fn = make_collate_fn(max_num_links)
+    loader = torch.utils.data.DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        drop_last=drop_last,
+        collate_fn=collate_fn,
+    )
+    return loader
+
+
+def get_ik_dataloader(
+    data_source: str,
+    indices,
+    num_instances: int,
+    tokens_dir: str,
+    batch_size: int,
+    max_num_links: int,
+    shuffle: bool = True,
+    num_workers: int = 0,
+    drop_last: bool = True,
+    link_compact_repr: bool = False,
+):
+    dataset = IKTokenSamples(
+        data_source=data_source,
+        indices=indices,
+        num_instances=num_instances,
+        tokens_dir=tokens_dir,
+        link_compact_repr=link_compact_repr,
+    )
+    collate_fn = make_ik_collate_fn(max_num_links)
     loader = torch.utils.data.DataLoader(
         dataset,
         batch_size=batch_size,

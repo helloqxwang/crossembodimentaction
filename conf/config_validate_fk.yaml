@@ -1,0 +1,57 @@
+defaults:
+  - _self_
+
+data:
+  data_source: ./data/
+  indices:
+    start: 0
+    end: 100
+  val_indices:
+    start: 100
+    end: 110
+  eval_indices:
+    start: 100
+    end: 110
+  num_instances: 50
+  max_num_links: 5
+  fix_q_samples: true
+
+validation:
+  device: cuda
+  seed: 0
+  output_dir: ./outputs/validate_fk
+  methods:
+    - name: siren_epoch_830
+      config: conf/conf_siren/config_siren.yaml
+      checkpoint: checkpoints/mfk_siren/epoch_830.pth
+
+  metrics:
+    sdf_l1_surface:
+      enabled: true
+      num_samples: 2048
+    sdf_l1_deepsdf:
+      enabled: true
+      num_samples: 2048
+      var: 0.005
+      near_surface_ratio: 0.95
+    iou:
+      enabled: true
+      grid_res: 64
+      grid_scale_factor: 1.4
+
+  mask:
+    mode: none  # none | num_masked | specific | index | all
+    num_masked: 1
+    min_visible: 1
+    specific: []
+    index: 0
+
+  plots:
+    metric: all
+    category: all
+    length: all
+    mask_mode: num_masked  # num_masked | mask_idx | none
+    mask_values: all
+    mask_indices: all
+    save_all_combinations: false
+    save_html: true

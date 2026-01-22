@@ -1,21 +1,21 @@
 from __future__ import annotations
 
 from typing import Dict, Optional, Tuple
+import math
 import os
 
 import hydra
 import torch
+import torch.nn.functional as F
 import wandb
 from hydra.utils import to_absolute_path
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig
 from tqdm import tqdm
 
-from data_process.dataset import get_dataloader
+from data_process.dataset import get_ik_dataloader
 from networks.mlp import MLP
 from networks.transformer import TransformerEncoder
-from networks.value_encoder import ScalarValueEncoder
-from networks.flow_matching import sample_interpolants, SinusoidalTimeEmbedding, rk4_integrate
-from train_fk import build_models as build_fk_models
+from networks.value_encoder import AxisFourierEncoder
 
 
 def _prepare_device(device_str: str) -> torch.device:
@@ -53,40 +53,41 @@ def _load_pretrained(
                 p.requires_grad = False
         print("Frozen pretrained joint and link encoders")
 
-
-def masked_mse(pred: torch.Tensor, target: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-    diff = (pred - target) ** 2
-    masked = diff * mask.float()
-    denom = mask.sum().clamp_min(1)
-    return masked.sum() / denom
-
-
-def _load_fk_cfg(cfg: DictConfig) -> DictConfig:
-    fk_config_path = getattr(cfg, "fk_config", None)
-    if fk_config_path is None:
-        fk_config_path = getattr(cfg.models, "fk_config", None)
-    if fk_config_path is None:
-        raise ValueError("fk_config must be set to the FK config path")
-    return OmegaConf.load(to_absolute_path(str(fk_config_path)))
-
-
 def build_models(cfg: DictConfig, device: torch.device) -> Dict[str, torch.nn.Module]:
-    fk_models = build_fk_models(cfg, device)
-    joint_encoder = fk_models["joint_encoder"]
-    link_encoder = fk_models["link_encoder"]
+    joint_encoder_cfg = cfg.models.joint_encoder
+    if getattr(joint_encoder_cfg, "use_fourier", True):
+        joint_encoder = AxisFourierEncoder(
+            input_dim=joint_encoder_cfg.input_dim,
+            embed_dim=joint_encoder_cfg.output_dim,
+            num_frequencies=joint_encoder_cfg.num_frequencies,
+            sigma=getattr(joint_encoder_cfg, "sigma", 1.0),
+            head_hidden_dims=getattr(joint_encoder_cfg, "head_hidden_dims", None),
+            activation=getattr(joint_encoder_cfg, "activation", "gelu"),
+            dropout=getattr(joint_encoder_cfg, "dropout", 0.0),
+            use_layer_norm=getattr(joint_encoder_cfg, "use_layer_norm", False),
+        ).to(device)
+    else:
+        joint_encoder = MLP(
+            input_dim=joint_encoder_cfg.input_dim,
+            output_dim=joint_encoder_cfg.output_dim,
+            hidden_dims=getattr(
+                joint_encoder_cfg,
+                "mlp_hidden_dims",
+                getattr(joint_encoder_cfg, "head_hidden_dims", ()),
+            ),
+            activation=getattr(joint_encoder_cfg, "activation", "gelu"),
+            dropout=getattr(joint_encoder_cfg, "dropout", 0.0),
+            use_layer_norm=getattr(joint_encoder_cfg, "use_layer_norm", False),
+        ).to(device)
 
-    joint_value_encoder_cfg = cfg.models.joint_value_encoder
-    joint_value_encoder = ScalarValueEncoder(
-        embed_dim=joint_value_encoder_cfg.embed_dim,
-        use_positional=joint_value_encoder_cfg.use_positional,
-        mlp_hidden=joint_value_encoder_cfg.mlp_hidden,
-        activation=joint_value_encoder_cfg.activation,
-        dropout=joint_value_encoder_cfg.dropout,
-        use_layer_norm=joint_value_encoder_cfg.use_layer_norm,
-        num_frequencies=getattr(joint_value_encoder_cfg, "num_frequencies", 64),
-        positional_head_hidden_dims=getattr(
-            joint_value_encoder_cfg, "positional_head_hidden_dims", None
-        ),
+    link_encoder_cfg = cfg.models.link_encoder
+    link_encoder = MLP(
+        input_dim=link_encoder_cfg.input_dim,
+        output_dim=link_encoder_cfg.output_dim,
+        hidden_dims=link_encoder_cfg.hidden_dims,
+        activation=link_encoder_cfg.activation,
+        dropout=link_encoder_cfg.dropout,
+        use_layer_norm=link_encoder_cfg.use_layer_norm,
     ).to(device)
 
     transformer_cfg = cfg.models.transformer
@@ -106,31 +107,10 @@ def build_models(cfg: DictConfig, device: torch.device) -> Dict[str, torch.nn.Mo
         final_layer_norm=transformer_cfg.final_layer_norm,
     ).to(device)
 
-    joint_value_decoder_cfg = cfg.models.joint_value_decoder
-    joint_value_decoder = MLP(
-        input_dim=joint_value_decoder_cfg.input_dim,
-        output_dim=1,
-        hidden_dims=joint_value_decoder_cfg.hidden_dims,
-        activation=joint_value_decoder_cfg.activation,
-        dropout=joint_value_decoder_cfg.dropout,
-        use_layer_norm=joint_value_decoder_cfg.use_layer_norm,
-    ).to(device)
-
-    time_embed_dim = cfg.flow_matching.time_embed_dim
-    if time_embed_dim != transformer_cfg.input_dim:
-        raise ValueError("time_embed_dim must match transformer input_dim for additive conditioning")
-    time_embedder = SinusoidalTimeEmbedding(
-        dim=time_embed_dim,
-        mlp_hidden=cfg.flow_matching.get("time_mlp_hidden", None),
-    ).to(device)
-
     return {
         "joint_encoder": joint_encoder,
         "link_encoder": link_encoder,
-        "joint_value_encoder": joint_value_encoder,
         "transformer": transformer,
-        "joint_value_decoder": joint_value_decoder,
-        "time_embedder": time_embedder,
     }
 
 
@@ -164,22 +144,58 @@ def _build_tokens(
     return token_tensor, key_padding_mask, joint_indices, joint_mask
 
 
-def flow_matching_step(
+def _discretize_joint_values(
+    chain_q: torch.Tensor,
+    *,
+    num_bins: int,
+    q_min: float,
+    q_max: float,
+) -> torch.Tensor:
+    if q_max <= q_min:
+        raise ValueError("q_max must be greater than q_min")
+    q_clamped = chain_q.clamp(q_min, q_max)
+    scaled = (q_clamped - q_min) / (q_max - q_min)
+    idx = torch.floor(scaled * num_bins).long().clamp(0, num_bins - 1)
+    return idx
+
+
+def _corrupt_one_hot(
+    one_hot: torch.Tensor,
+    *,
+    corrupt_prob: float,
+    num_bins: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if corrupt_prob <= 0:
+        mask = torch.zeros(one_hot.shape[:2], dtype=torch.bool, device=one_hot.device)
+        return one_hot, mask
+    mask = torch.rand(one_hot.shape[:2], device=one_hot.device) < corrupt_prob
+    rand_idx = torch.randint(0, num_bins, mask.shape, device=one_hot.device)
+    corrupted = one_hot.clone()
+    corrupted[mask] = F.one_hot(rand_idx[mask], num_bins).float()
+    return corrupted, mask
+
+
+def ik_step(
     batch: Dict[str, torch.Tensor],
     models: Dict[str, torch.nn.Module],
     device: torch.device,
     *,
-    noise_std: float,
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    num_bins: int,
+    q_min: float,
+    q_max: float,
+    corrupt_prob: float,
+    use_compact_repr: bool,
+    supervise_only_corrupted: bool,
+) -> Tuple[torch.Tensor, float]:
     joint_encoder = models["joint_encoder"]
     link_encoder = models["link_encoder"]
-    joint_value_encoder = models["joint_value_encoder"]
     transformer = models["transformer"]
-    joint_value_decoder = models["joint_value_decoder"]
-    time_embedder = models["time_embedder"]
 
     chain_q = batch["chain_q"].to(device)
-    link_features = batch["link_bps_scdistances"].to(device)
+    if use_compact_repr:
+        link_features = batch["link_features"].to(device)
+    else:
+        link_features = batch["link_bps_scdistances"].to(device)
     joint_features = batch["joint_features"].to(device)
     mask = batch["mask"].to(device)
     geometry_tokens = batch["sdf_tokens"].to(device)
@@ -187,88 +203,44 @@ def flow_matching_step(
     joint_fts = joint_encoder(joint_features)
     link_fts = link_encoder(link_features)
 
-    xt, ut, _, t = sample_interpolants(chain_q, noise_std=noise_std)
-    joint_value_tokens = joint_value_encoder(xt)
-
-    tokens, key_padding_mask, joint_indices, joint_mask = _build_tokens(
-        link_fts, joint_fts, joint_value_tokens, geometry_tokens, mask
+    gt_idx = _discretize_joint_values(chain_q, num_bins=num_bins, q_min=q_min, q_max=q_max)
+    gt_one_hot = F.one_hot(gt_idx, num_bins).float()
+    corrupted_tokens, corrupt_mask = _corrupt_one_hot(
+        gt_one_hot, corrupt_prob=corrupt_prob, num_bins=num_bins
     )
 
-    time_emb = time_embedder(t).unsqueeze(1)
-    conditioned_tokens = tokens + time_emb
+    tokens, key_padding_mask, joint_indices, joint_mask = _build_tokens(
+        link_fts, joint_fts, corrupted_tokens, geometry_tokens, mask
+    )
 
     transformer_out = transformer(
-        conditioned_tokens,
+        tokens,
         key_padding_mask=key_padding_mask,
         causal=False,
     )
 
-    joint_token_out = transformer_out[:, joint_indices]
-    pred_velocity = joint_value_decoder(joint_token_out).squeeze(-1)
+    joint_logits = transformer_out[:, joint_indices]
+    B, L, D = joint_logits.shape
+    logits_flat = joint_logits.reshape(B * L, D)
+    gt_flat = gt_idx.reshape(B * L)
 
-    loss = masked_mse(pred_velocity, ut, joint_mask)
-    return loss, pred_velocity, ut, joint_mask
+    valid_mask = joint_mask.reshape(B * L)
+    if supervise_only_corrupted and corrupt_prob > 0:
+        corrupt_flat = corrupt_mask.reshape(B * L)
+        valid_mask = valid_mask & corrupt_flat
+        if valid_mask.sum() == 0:
+            valid_mask = joint_mask.reshape(B * L)
 
-
-def run_training_val(
-    val_batch: Dict[str, torch.Tensor],
-    models: Dict[str, torch.nn.Module],
-    device: torch.device,
-    noise_std: float,
-) -> float:
-    with torch.no_grad():
-        loss, _, _, _ = flow_matching_step(val_batch, models, device, noise_std=noise_std)
-    return loss.item()
-
-
-def run_inference_val(
-    val_batch: Dict[str, torch.Tensor],
-    models: Dict[str, torch.nn.Module],
-    device: torch.device,
-    *,
-    steps: int,
-    noise_std: float,
-) -> float:
-    joint_encoder = models["joint_encoder"]
-    link_encoder = models["link_encoder"]
-    joint_value_encoder = models["joint_value_encoder"]
-    transformer = models["transformer"]
-    joint_value_decoder = models["joint_value_decoder"]
-    time_embedder = models["time_embedder"]
-
-    chain_q = val_batch["chain_q"].to(device)
-    link_features = val_batch["link_bps_scdistances"].to(device)
-    joint_features = val_batch["joint_features"].to(device)
-    mask = val_batch["mask"].to(device)
-    geometry_tokens = val_batch["sdf_tokens"].to(device)
-
-    joint_fts = joint_encoder(joint_features)
-    link_fts = link_encoder(link_features)
-
-    batch_size = chain_q.size(0)
-    device_dtype = chain_q.dtype
-    x0 = torch.randn_like(chain_q) * noise_std
-
-    def _velocity_fn(x: torch.Tensor, t_scalar: float) -> torch.Tensor:
-        time_tensor = torch.full((batch_size,), float(t_scalar), device=device, dtype=device_dtype)
-        joint_value_tokens = joint_value_encoder(x)
-        tokens, key_padding_mask, joint_indices, joint_mask = _build_tokens(
-            link_fts, joint_fts, joint_value_tokens, geometry_tokens, mask
-        )
-        conditioned_tokens = tokens + time_embedder(time_tensor).unsqueeze(1)
-        transformer_out = transformer(
-            conditioned_tokens,
-            key_padding_mask=key_padding_mask,
-            causal=False,
-        )
-        joint_token_out = transformer_out[:, joint_indices]
-        vel = joint_value_decoder(joint_token_out).squeeze(-1)
-        return vel * joint_mask.float()
+    loss_all = F.cross_entropy(logits_flat, gt_flat, reduction="none")
+    loss = (loss_all * valid_mask.float()).sum() / valid_mask.sum().clamp_min(1)
 
     with torch.no_grad():
-        x1_pred = rk4_integrate(_velocity_fn, x0, steps=steps)
-    joint_mask = mask[:, 2::3]  # joint value slots align with every third token
-    return masked_mse(x1_pred, chain_q, joint_mask).item()
+        pred_idx = joint_logits.argmax(dim=-1)
+        acc_mask = valid_mask.reshape(B, L)
+        correct = (pred_idx == gt_idx) & acc_mask
+        acc = correct.sum().float() / acc_mask.sum().clamp_min(1)
+
+    return loss, float(acc.item())
 
 
 @hydra.main(config_path="conf", config_name="config_ik_fm", version_base="1.3")
@@ -281,37 +253,47 @@ def main(cfg: DictConfig) -> None:
     use_wandb = getattr(cfg.training, "wandb", {}).get("enabled", False)
     save_interval = getattr(cfg.training.wandb, "save_interval", 50)
     val_interval = getattr(cfg.training, "validation_interval", 1000)
-    inference_steps = getattr(cfg.training, "inference_steps", 10)
-    noise_std = float(cfg.flow_matching.noise_std)
+    num_bins = int(getattr(cfg.models, "sdf_latent_dim", cfg.models.transformer.input_dim))
+    if cfg.models.transformer.input_dim != num_bins or cfg.models.transformer.output_dim != num_bins:
+        raise ValueError(
+            "transformer.input_dim and transformer.output_dim must equal num_bins "
+            "for direct one-hot inputs and logits outputs"
+        )
+    q_min = float(getattr(cfg.training, "q_min", -2.0 * math.pi / 3.0))
+    q_max = float(getattr(cfg.training, "q_max", 2.0 * math.pi / 3.0))
+    corrupt_prob = float(getattr(cfg.training, "corrupt_prob", 0.15))
+    supervise_only_corrupted = bool(getattr(cfg.training, "supervise_only_corrupted", True))
 
     indices = list(range(cfg.data.indices.start, cfg.data.indices.end))
     val_indices = list(range(cfg.data.val_indices.start, cfg.data.val_indices.end))
     data_source = to_absolute_path(cfg.data.data_source)
+    tokens_dir = to_absolute_path(getattr(cfg.data, "sdf_token_dir", "./data/sdf_tokens"))
+    use_compact_repr = bool(getattr(cfg.models.link_encoder, "compact_repr", False))
 
-    ik_loader = get_dataloader(
+    ik_loader = get_ik_dataloader(
         data_source=data_source,
         indices=indices,
         num_instances=cfg.data.num_instances,
-        subsample=cfg.data.subsample,
+        tokens_dir=tokens_dir,
         batch_size=cfg.data.batch_size,
         max_num_links=cfg.data.max_num_links,
         shuffle=cfg.data.shuffle,
         num_workers=cfg.data.num_workers,
         drop_last=cfg.data.drop_last,
-        ik=True,
+        link_compact_repr=use_compact_repr,
     )
 
-    val_loader = get_dataloader(
+    val_loader = get_ik_dataloader(
         data_source=data_source,
         indices=val_indices,
         num_instances=cfg.data.num_instances,
-        subsample=cfg.data.subsample,
+        tokens_dir=tokens_dir,
         batch_size=cfg.data.val_batch_size,
         max_num_links=cfg.data.max_num_links,
         shuffle=False,
         num_workers=0,
         drop_last=False,
-        ik=True,
+        link_compact_repr=use_compact_repr,
     )
     val_iter = iter(val_loader)
 
@@ -342,12 +324,29 @@ def main(cfg: DictConfig) -> None:
     for epoch in range(num_epochs):
         for batch in tqdm(ik_loader, desc=f"Epoch {epoch+1}/{num_epochs}"):
             optimizer.zero_grad()
-            loss, _, _, _ = flow_matching_step(batch, models, device, noise_std=noise_std)
+            loss, acc = ik_step(
+                batch,
+                models,
+                device,
+                num_bins=num_bins,
+                q_min=q_min,
+                q_max=q_max,
+                corrupt_prob=corrupt_prob,
+                use_compact_repr=use_compact_repr,
+                supervise_only_corrupted=supervise_only_corrupted,
+            )
             loss.backward()
             optimizer.step()
 
             if use_wandb:
-                wandb.log({"train/loss": loss.item(), "step": global_step, "epoch": epoch})
+                wandb.log(
+                    {
+                        "train/loss": loss.item(),
+                        "train/acc": acc,
+                        "step": global_step,
+                        "epoch": epoch,
+                    }
+                )
             global_step += 1
 
             if val_interval > 0 and global_step % val_interval == 0:
@@ -357,20 +356,27 @@ def main(cfg: DictConfig) -> None:
                     val_iter = iter(val_loader)
                     val_batch = next(val_iter)
 
-                train_style_val = run_training_val(val_batch, models, device, noise_std)
-                inference_val = run_inference_val(
-                    val_batch, models, device, steps=inference_steps, noise_std=noise_std
-                )
+                with torch.no_grad():
+                    val_loss, val_acc = ik_step(
+                        val_batch,
+                        models,
+                        device,
+                        num_bins=num_bins,
+                        q_min=q_min,
+                        q_max=q_max,
+                        corrupt_prob=0.0,
+                        use_compact_repr=use_compact_repr,
+                        supervise_only_corrupted=False,
+                    )
 
                 print(
-                    f"[Val @ step {global_step}] train-style {train_style_val:.4f} | "
-                    f"inference {inference_val:.4f}"
+                    f"[Val @ step {global_step}] loss {val_loss:.4f} | acc {val_acc:.4f}"
                 )
                 if use_wandb:
                     wandb.log(
                         {
-                            "val/train_style": train_style_val,
-                            "val/inference": inference_val,
+                            "val/loss": val_loss,
+                            "val/acc": val_acc,
                             "step": global_step,
                             "epoch": epoch,
                         }
