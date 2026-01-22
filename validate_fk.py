@@ -3,21 +3,29 @@ from __future__ import annotations
 from dataclasses import dataclass
 import itertools
 import logging
-import math
 import os
-from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List
 
 import hydra
 import numpy as np
 import plotly.express as px
+import plotly.graph_objects as go
 import torch
+import trimesh
 from hydra.utils import to_absolute_path
 from omegaconf import DictConfig, OmegaConf
 from tqdm import tqdm
 
 from robot_model.chain_model import ChainModel
-from train_fk import build_models, decoder_forward, inference, pooled_latent
+from data_process.dataset import (
+    apply_normalization,
+    compute_chain_normalization,
+    load_chain_properties,
+    pad_chain_features,
+    resolve_normalization,
+)
+from train_fk import build_models, decoder_forward, infer_link_tokens, pooled_latent
+from visualize_fk import reconstruct_mesh
 
 
 @dataclass
@@ -29,8 +37,6 @@ class MethodBundle:
     norm_center_mode: str
     chain_centers: Dict[int, torch.Tensor]
     chain_scales: Dict[int, torch.Tensor]
-    dataset_center: Optional[torch.Tensor]
-    dataset_scale: Optional[torch.Tensor]
 
 
 def _prepare_device(device_str: str) -> torch.device:
@@ -56,29 +62,6 @@ def _load_checkpoint(models: Dict[str, torch.nn.Module], ckpt_path: str) -> Opti
     for module in models.values():
         module.eval()
     return epoch
-
-
-def _prepare_link_bps(bps_info) -> torch.Tensor:
-    link_bps_scdistances = [
-        np.concatenate(
-            [
-                bp["offsets"],
-                np.ones((bp["offsets"].shape[0], 1)) * (bp["scale_to_unit"] * 1.0),
-            ],
-            axis=-1,
-        )
-        for bp in bps_info
-    ]
-    return torch.tensor(np.stack(link_bps_scdistances, axis=0)).float().flatten(1)
-
-
-def _pad_tensor(x: torch.Tensor, *, length: int) -> torch.Tensor:
-    if x.size(0) > length:
-        raise ValueError(f"Cannot pad length {x.size(0)} to smaller length {length}")
-    if x.size(0) == length:
-        return x
-    pad = torch.zeros((length - x.size(0), *x.shape[1:]), dtype=x.dtype)
-    return torch.cat([x, pad], dim=0)
 
 
 def _enumerate_link_masks(num_links: int, *, min_visible: int = 1) -> List[torch.Tensor]:
@@ -149,117 +132,6 @@ def _select_masks(
     raise ValueError(f"Unsupported mask mode: {mode}")
 
 
-def _compute_center_scale(
-    pc: torch.Tensor,
-    center_mode: str,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    if pc.numel() == 0:
-        return torch.zeros(3), torch.tensor(1.0)
-    pts = pc[:, :3]
-    if center_mode == "mesh":
-        pts_min = pts.min(dim=0).values
-        pts_max = pts.max(dim=0).values
-        center = 0.5 * (pts_min + pts_max)
-    elif center_mode == "zero":
-        center = torch.zeros_like(pts[0])
-    else:
-        raise ValueError(f"Unsupported normalize_center_mode: {center_mode}")
-    scale = (pts - center).norm(dim=-1).max().clamp_min(1e-6)
-    return center, scale
-
-
-def _build_normalization_cache(
-    indices: Iterable[int],
-    data_source: str,
-    norm_mode: str,
-    center_mode: str,
-) -> tuple[Dict[int, torch.Tensor], Dict[int, torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
-    chain_centers: Dict[int, torch.Tensor] = {}
-    chain_scales: Dict[int, torch.Tensor] = {}
-    dataset_center = None
-    dataset_scale = None
-
-    if norm_mode not in {"chain", "dataset"}:
-        return chain_centers, chain_scales, dataset_center, dataset_scale
-
-    pcs = []
-    for class_idx in indices:
-        urdf_path = os.path.join(data_source, "out_chains_v2", f"chain_{class_idx}.urdf")
-        chain_model = ChainModel(urdf_path=urdf_path, samples_per_link=128, device="cpu")
-        chain_model.update_status(torch.zeros(chain_model.dof))
-        pc_full = chain_model.get_transformed_links_pc(
-            num_points=None,
-            mask=torch.ones(chain_model.num_links, dtype=torch.bool),
-        )[0, :, :3]
-        pcs.append(pc_full)
-        if norm_mode == "chain":
-            center, scale = _compute_center_scale(pc_full, center_mode)
-            chain_centers[class_idx] = center
-            chain_scales[class_idx] = scale
-
-    if norm_mode == "dataset":
-        all_pts = torch.cat(pcs, dim=0)
-        center, scale = _compute_center_scale(all_pts, center_mode)
-        dataset_center = center
-        dataset_scale = scale
-        for class_idx in indices:
-            chain_centers[class_idx] = center
-            chain_scales[class_idx] = scale
-
-    return chain_centers, chain_scales, dataset_center, dataset_scale
-
-
-def _apply_normalization(
-    coords: torch.Tensor,
-    sdf: Optional[torch.Tensor],
-    *,
-    norm_mode: str,
-    center_mode: str,
-    class_idx: int,
-    chain_model: ChainModel,
-    link_mask: torch.Tensor,
-    chain_centers: Dict[int, torch.Tensor],
-    chain_scales: Dict[int, torch.Tensor],
-) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
-    if norm_mode == "none":
-        return coords, sdf
-
-    if norm_mode == "instance":
-        pc_full = chain_model.get_transformed_links_pc(num_points=None, mask=link_mask)[0, :, :3]
-        center, scale = _compute_center_scale(pc_full, center_mode)
-    else:
-        if class_idx not in chain_centers:
-            current_q = chain_model.q.clone()
-            chain_model.update_status(torch.zeros(chain_model.dof))
-            pc_full = chain_model.get_transformed_links_pc(
-                num_points=None,
-                mask=torch.ones(chain_model.num_links, dtype=torch.bool),
-            )[0, :, :3]
-            center, scale = _compute_center_scale(pc_full, center_mode)
-            chain_centers[class_idx] = center
-            chain_scales[class_idx] = scale
-            chain_model.update_status(current_q.squeeze(0))
-        center = chain_centers[class_idx]
-        scale = chain_scales[class_idx]
-
-    coords = (coords - center) / scale
-    if sdf is not None:
-        sdf = sdf / scale
-    return coords, sdf
-
-
-def _build_token_mask(num_links: int, max_num_links: int) -> torch.Tensor:
-    token_mask = torch.zeros(3 * max_num_links - 2, dtype=torch.bool)
-    token_mask[: 3 * num_links - 2] = True
-    return token_mask
-
-
-def _build_link_mask_full(num_links: int, max_num_links: int) -> torch.Tensor:
-    mask = torch.zeros(max_num_links, dtype=torch.bool)
-    mask[:num_links] = True
-    return mask
-
-
 def _build_grid_points(points: torch.Tensor, grid_res: int, scale_factor: float) -> torch.Tensor:
     if points.numel() == 0:
         raise ValueError("No points to build grid from.")
@@ -285,11 +157,11 @@ def _load_method_bundle(
     norm_mode = str(getattr(cfg.data, "normalize_mode", "none")).lower()
     center_mode = str(getattr(cfg.data, "normalize_center_mode", "zero")).lower()
     norm_indices = _resolve_indices(cfg.data.get("indices")) or list(eval_indices)
-    chain_centers, chain_scales, dataset_center, dataset_scale = _build_normalization_cache(
-        norm_indices,
+    chain_centers, chain_scales = compute_chain_normalization(
         data_source,
-        norm_mode,
-        center_mode,
+        norm_indices,
+        normalize_mode=norm_mode,
+        normalize_center_mode=center_mode,
     )
 
     return MethodBundle(
@@ -300,8 +172,6 @@ def _load_method_bundle(
         norm_center_mode=center_mode,
         chain_centers=chain_centers,
         chain_scales=chain_scales,
-        dataset_center=dataset_center,
-        dataset_scale=dataset_scale,
     )
 
 
@@ -337,6 +207,59 @@ def _plot_boxplot(records: List[Dict], title: str, out_path: str, save_html: boo
         logging.warning("write_image failed (%s); wrote HTML to %s", exc, html_path)
     if save_html:
         fig.write_html(out_path + ".html")
+
+
+def _save_plotly_figure(fig: go.Figure, out_path: str, save_html: bool) -> None:
+    if out_path is None:
+        return
+    try:
+        fig.write_image(out_path)
+    except Exception as exc:
+        html_path = out_path + ".html"
+        fig.write_html(html_path)
+        logging.warning("write_image failed (%s); wrote HTML to %s", exc, html_path)
+    if save_html:
+        fig.write_html(out_path + ".html")
+
+
+def _mesh_trace(mesh: trimesh.Trimesh, *, name: str, color: str, opacity: float) -> go.Mesh3d:
+    verts = mesh.vertices
+    faces = mesh.faces
+    return go.Mesh3d(
+        x=verts[:, 0],
+        y=verts[:, 1],
+        z=verts[:, 2],
+        i=faces[:, 0],
+        j=faces[:, 1],
+        k=faces[:, 2],
+        name=name,
+        opacity=opacity,
+        color=color,
+    )
+
+
+def save_mesh_comparison(
+    *,
+    pred_mesh: trimesh.Trimesh,
+    gt_mesh: trimesh.Trimesh,
+    out_path: str,
+    save_html: bool,
+    show_pred_only: bool = False,
+) -> None:
+    pred = pred_mesh.copy()
+    gt = gt_mesh.copy()
+
+    if not show_pred_only and not gt.is_empty and not pred.is_empty:
+        bounds = pred.bounds
+        shift = bounds[1, 0] - bounds[0, 0]
+        gt.apply_translation([shift * 1.2, 0.0, 0.0])
+
+    fig = go.Figure()
+    fig.add_trace(_mesh_trace(pred, name="pred", color="#33B3FF", opacity=0.7))
+    if not show_pred_only:
+        fig.add_trace(_mesh_trace(gt, name="gt", color="#CCCCCC", opacity=0.5))
+    fig.update_layout(scene=dict(aspectmode="data"), title="Pred vs GT")
+    _save_plotly_figure(fig, out_path, save_html)
 
 
 def _filter_records(
@@ -394,12 +317,12 @@ def _save_plots(
 
     if save_all:
         metric_list = metrics_available
-        category_list = ["all"] + categories_available
-        length_list = ["all"] + lengths_available
+        category_list = ["all"] + categories_available if len(categories_available) > 1 else categories_available
+        length_list = ["all"] + lengths_available if len(lengths_available) > 1 else lengths_available
         if mask_mode == "num_masked":
-            mask_list = ["all"] + mask_nums_available
+            mask_list = ["all"] + mask_nums_available if len(mask_nums_available) > 1 else mask_nums_available
         elif mask_mode == "mask_idx":
-            mask_list = ["all"] + mask_idxs_available
+            mask_list = ["all"] + mask_idxs_available if len(mask_idxs_available) > 1 else mask_idxs_available
         else:
             mask_list = ["all"]
     else:
@@ -415,7 +338,7 @@ def _save_plots(
         if not isinstance(mask_list, list):
             mask_list = [mask_list]
 
-    for metric in metric_list:
+    for metric in tqdm(metric_list, desc="Plot metrics"):
         for category in category_list:
             for length in length_list:
                 for mask_value in mask_list:
@@ -428,6 +351,7 @@ def _save_plots(
                         mask_value=mask_value,
                     )
                     if not filtered:
+                        print(f"Skipping empty plot for {metric}, {category}, {length}, {mask_value}")
                         continue
                     title = f"{metric} | cat={category} | len={length} | mask={mask_value}"
                     fname = (
@@ -470,28 +394,35 @@ def main(cfg: DictConfig) -> None:
 
     mask_cfg = cfg.validation.mask
     metric_cfg = cfg.validation.metrics
+    vis_cfg = getattr(cfg.validation, "visualize_mesh", None)
+    vis_enabled = bool(getattr(vis_cfg, "enabled", False)) if vis_cfg is not None else False
+    if vis_enabled and not torch.cuda.is_available():
+        logging.warning("Mesh visualization disabled (CUDA required for reconstruction).")
+        vis_enabled = False
+    vis_instance_cfg = getattr(vis_cfg, "instance_idx", 0) if vis_cfg is not None else 0
+    vis_all_instances = str(vis_instance_cfg).lower() == "all"
+    vis_instance_idx = 0 if vis_all_instances else int(vis_instance_cfg)
+    mesh_out_dir = (
+        to_absolute_path(getattr(vis_cfg, "output_dir", "./outputs/validate_fk/meshes"))
+        if vis_cfg is not None
+        else None
+    )
+    if vis_enabled and mesh_out_dir is not None:
+        os.makedirs(mesh_out_dir, exist_ok=True)
 
     results: List[Dict] = []
     rng = np.random.default_rng(seed)
 
     for class_idx in tqdm(eval_indices, desc="Classes"):
-        chain_props = np.load(
-            os.path.join(data_source, "out_chains_v2", f"chain_{class_idx}_properties.npz"),
-            allow_pickle=True,
+        link_features, joint_features, link_bps, chain_props = load_chain_properties(
+            data_source, class_idx
         )
-        link_features = torch.tensor(chain_props["links_property"]).float()
-        joint_features = torch.tensor(chain_props["joints_property"]).float()
-        link_bps = _prepare_link_bps(chain_props["bpses"])
-
-        num_links = link_features.size(0)
-        if num_links > max_num_links:
-            raise ValueError(
-                f"class {class_idx} has {num_links} links > max_num_links {max_num_links}"
-            )
-
-        link_features = _pad_tensor(link_features, length=max_num_links)
-        link_bps = _pad_tensor(link_bps, length=max_num_links)
-        joint_features = _pad_tensor(joint_features, length=max_num_links - 1)
+        link_features, joint_features, link_bps, num_links = pad_chain_features(
+            link_features,
+            joint_features,
+            link_bps,
+            max_num_links=max_num_links,
+        )
 
         urdf_path = os.path.join(data_source, "out_chains_v2", f"chain_{class_idx}.urdf")
         chain_model = ChainModel(urdf_path=urdf_path, samples_per_link=128, device="cpu")
@@ -508,10 +439,7 @@ def main(cfg: DictConfig) -> None:
         else:
             q_samples = chain_model.sample_q(num_instances).float().cpu()
 
-        token_mask = _build_token_mask(num_links, max_num_links)
-        link_mask_full = _build_link_mask_full(num_links, max_num_links)
-
-        for inst_idx in tqdm(range(num_instances), desc=f"cls {class_idx}", leave=False):
+        for inst_idx in tqdm(range(num_instances), desc=f"instances in {class_idx}", leave=False):
             q = q_samples[inst_idx]
             chain_model.update_status(q)
 
@@ -520,22 +448,15 @@ def main(cfg: DictConfig) -> None:
             # Precompute per-method link tokens for this instance
             method_tokens: Dict[str, torch.Tensor] = {}
             for method in methods:
-                batch = {
-                    "sdf_samples": torch.zeros(1, 1, 4, device=device),
-                    "chain_q": q.view(1, -1).to(device),
-                    "link_features": link_features.unsqueeze(0).to(device),
-                    "joint_features": joint_features.unsqueeze(0).to(device),
-                    "link_bps_scdistances": link_bps.unsqueeze(0).to(device),
-                    "mask": token_mask.unsqueeze(0).to(device),
-                    "link_mask": link_mask_full.unsqueeze(0).to(device),
-                }
-                _, _, link_tokens = inference(
-                    batch,
-                    method.models,
+                link_tokens, _ = infer_link_tokens(
+                    class_real_idx=class_idx,
+                    q_values=q.view(1, -1),
                     cfg=method.cfg,
+                    models=method.models,
+                    data_source=data_source,
                     device=device,
-                    coords_override=torch.zeros(1, 1, 3, device=device),
-                    return_link_tokens=True,
+                    chain_props=chain_props,
+                    max_num_links=max_num_links,
                 )
                 method_tokens[method.name] = link_tokens
 
@@ -588,6 +509,17 @@ def main(cfg: DictConfig) -> None:
                         mask=mask,
                     )[0]
 
+                gt_mesh = None
+                gt_radius = None
+                if vis_enabled and (vis_all_instances or inst_idx == vis_instance_idx):
+                    gt_mesh = chain_model.get_trimesh_q(
+                        0,
+                        boolean_merged=True,
+                        mask=mask,
+                    )
+                    if not gt_mesh.is_empty and len(gt_mesh.vertices) > 0:
+                        gt_radius = float(np.linalg.norm(gt_mesh.vertices, axis=1).max())
+
                 for method in methods:
                     link_tokens = method_tokens[method.name]
                     latent = pooled_latent(
@@ -596,21 +528,64 @@ def main(cfg: DictConfig) -> None:
                         mode="max",
                     )
 
+                    center, scale = resolve_normalization(
+                        chain_model,
+                        class_real_idx=class_idx,
+                        normalize_mode=method.norm_mode,
+                        normalize_center_mode=method.norm_center_mode,
+                        chain_centers=method.chain_centers,
+                        chain_scales=method.chain_scales,
+                        link_mask=mask,
+                    )
+
                     category = _category_for_class(class_idx, seen_set, unseen_set)
                     length = num_links
 
+                    if (
+                        vis_enabled
+                        and (vis_all_instances or inst_idx == vis_instance_idx)
+                        and gt_mesh is not None
+                        and gt_radius is not None
+                    ):
+                        vis_cfg = cfg.validation.visualize_mesh
+                        method_dir = os.path.join(mesh_out_dir, method.name)
+                        os.makedirs(method_dir, exist_ok=True)
+                        out_stem = os.path.join(
+                            method_dir, f"cls{class_idx}_mask{mask_idx}_m{num_masked}"
+                        )
+                        decoder_device = next(method.models["decoder"].parameters()).device
+                        norm_center = center.to(decoder_device) if center is not None else None
+                        norm_scale = scale.to(decoder_device) if scale is not None else None
+
+                        reconstruct_mesh(
+                            decoder=method.models["decoder"],
+                            latent=latent,
+                            out_path=out_stem,
+                            N=getattr(vis_cfg, "grid_res", 128),
+                            max_batch=getattr(vis_cfg, "max_batch", 262144),
+                            grid_scale=gt_radius * float(getattr(vis_cfg, "grid_scale_factor", 1.4)),
+                            offset=None,
+                            scale=None,
+                            normalize_center=norm_center,
+                            normalize_scale=norm_scale,
+                        )
+
+                        pred_mesh = trimesh.load(out_stem + ".ply", force="mesh")
+                        save_mesh_comparison(
+                            pred_mesh=pred_mesh,
+                            gt_mesh=gt_mesh,
+                            out_path=out_stem + ".png",
+                            save_html=bool(getattr(vis_cfg, "save_html", False)),
+                            show_pred_only=bool(getattr(vis_cfg, "show_pred_only", False)),
+                        )
+
                     if metric_cfg.sdf_l1_surface.enabled and surface_pts is not None:
                         coords = surface_pts.clone()
-                        coords, _ = _apply_normalization(
+                        coords, _ = apply_normalization(
                             coords,
                             None,
-                            norm_mode=method.norm_mode,
-                            center_mode=method.norm_center_mode,
-                            class_idx=class_idx,
-                            chain_model=chain_model,
-                            link_mask=mask,
-                            chain_centers=method.chain_centers,
-                            chain_scales=method.chain_scales,
+                            center=center,
+                            scale=scale,
                         )
                         pred = decoder_forward(
                             method.models["decoder"],
@@ -635,16 +610,11 @@ def main(cfg: DictConfig) -> None:
                     if metric_cfg.sdf_l1_deepsdf.enabled and deepsdf_pts is not None:
                         coords = deepsdf_pts.clone()
                         sdf = deepsdf_sdf.clone() if deepsdf_sdf is not None else None
-                        coords, sdf = _apply_normalization(
+                        coords, sdf = apply_normalization(
                             coords,
                             sdf,
-                            norm_mode=method.norm_mode,
-                            center_mode=method.norm_center_mode,
-                            class_idx=class_idx,
-                            chain_model=chain_model,
-                            link_mask=mask,
-                            chain_centers=method.chain_centers,
-                            chain_scales=method.chain_scales,
+                            center=center,
+                            scale=scale,
                         )
                         pred = decoder_forward(
                             method.models["decoder"],
@@ -669,16 +639,11 @@ def main(cfg: DictConfig) -> None:
                     if metric_cfg.iou.enabled and iou_pts is not None:
                         coords = iou_pts.clone()
                         sdf = iou_sdf.clone() if iou_sdf is not None else None
-                        coords, sdf = _apply_normalization(
+                        coords, sdf = apply_normalization(
                             coords,
                             sdf,
-                            norm_mode=method.norm_mode,
-                            center_mode=method.norm_center_mode,
-                            class_idx=class_idx,
-                            chain_model=chain_model,
-                            link_mask=mask,
-                            chain_centers=method.chain_centers,
-                            chain_scales=method.chain_scales,
+                            center=center,
+                            scale=scale,
                         )
                         pred = decoder_forward(
                             method.models["decoder"],

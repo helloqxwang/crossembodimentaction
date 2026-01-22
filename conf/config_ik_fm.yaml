@@ -63,7 +63,7 @@ training:
   wandb:
     enabled: true
     project: action_repr
-    run_name: ik-transformer_fm
+    run_name: ik-transformer_fm_
     save_interval: 50
     save_dir: ./checkpoints
   lr_schedules: []

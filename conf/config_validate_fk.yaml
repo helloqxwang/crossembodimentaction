@@ -10,9 +10,9 @@ data:
     start: 100
     end: 110
   eval_indices:
-    start: 100
-    end: 110
-  num_instances: 50
+    start: 0
+    end: 2
+  num_instances: 5
   max_num_links: 5
   fix_q_samples: true
 
@@ -21,9 +21,15 @@ validation:
   seed: 0
   output_dir: ./outputs/validate_fk
   methods:
-    - name: siren_epoch_830
+    - name: siren_epoch_470
       config: conf/conf_siren/config_siren.yaml
-      checkpoint: checkpoints/mfk_siren/epoch_830.pth
+      checkpoint: checkpoints/mfk_siren/epoch_470.pth
+    - name: siren_fake_epoch_470
+      config: conf/conf_siren/config_siren_fake.yaml
+      checkpoint: checkpoints/mfk_siren_fake/epoch_470.pth
+    - name: mlp_epoch_470
+      config: conf/conf_siren/config_mlp.yaml
+      checkpoint: checkpoints/mfk_mlp/epoch_470.pth
 
   metrics:
     sdf_l1_surface:
@@ -53,5 +59,15 @@ validation:
     mask_mode: num_masked  # num_masked | mask_idx | none
     mask_values: all
     mask_indices: all
-    save_all_combinations: false
+    save_all_combinations: true
+    save_html: false
+
+  visualize_mesh:
+    enabled: false
+    output_dir: ./outputs/validate_fk/meshes
+    instance_idx: 0  # int or "all"
+    grid_res: 128
+    max_batch: 262144
+    grid_scale_factor: 1.4
     save_html: true
+    show_pred_only: false

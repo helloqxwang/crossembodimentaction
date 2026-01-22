@@ -2,6 +2,7 @@
 # Copyright 2004-present Facebook. All Rights Reserved.
 
 import glob
+from bisect import bisect_right
 import math
 import numpy as np
 import os
@@ -11,6 +12,7 @@ import torch.utils.data
 from tqdm import tqdm
 from pathlib import Path
 import sys
+from typing import Dict, Optional
 sys.path.append(str(Path(__file__).resolve().parent.parent / ""))
 from robot_model.chain_model import ChainModel, visualize_sdf_viser
 import torch.nn.functional as F
@@ -154,6 +156,172 @@ def _prepare_link_bps_scdistances(bps_info):
         for bp_info in bps_info
     ]
     return torch.tensor(np.stack(link_bps_scdistances, axis=0)).float().flatten(1)
+
+
+def prepare_link_bps_scdistances(bps_info):
+    return _prepare_link_bps_scdistances(bps_info)
+
+
+def _pad_tensor(x: torch.Tensor, *, length: int) -> torch.Tensor:
+    if x.size(0) > length:
+        raise ValueError(f"Cannot pad length {x.size(0)} to smaller length {length}")
+    if x.size(0) == length:
+        return x
+    pad = torch.zeros((length - x.size(0), *x.shape[1:]), dtype=x.dtype)
+    return torch.cat([x, pad], dim=0)
+
+
+def load_chain_properties(data_source: str, class_real_idx: int):
+    chain_properties = np.load(
+        os.path.join(data_source, "out_chains_v2", f"chain_{class_real_idx}_properties.npz"),
+        allow_pickle=True,
+    )
+    link_features = torch.tensor(chain_properties["links_property"]).float()
+    joint_features = torch.tensor(chain_properties["joints_property"]).float()
+    link_bps = _prepare_link_bps_scdistances(chain_properties["bpses"])
+    return link_features, joint_features, link_bps, chain_properties
+
+
+def pad_chain_features(
+    link_features: torch.Tensor,
+    joint_features: torch.Tensor,
+    link_bps: torch.Tensor,
+    *,
+    max_num_links: int,
+):
+    num_links = link_features.size(0)
+    if num_links > max_num_links:
+        raise ValueError(f"num_links {num_links} exceeds max_num_links {max_num_links}")
+    link_features = _pad_tensor(link_features, length=max_num_links)
+    link_bps = _pad_tensor(link_bps, length=max_num_links)
+    joint_features = _pad_tensor(joint_features, length=max_num_links - 1)
+    return link_features, joint_features, link_bps, num_links
+
+
+def compute_center_scale_from_points(
+    points: torch.Tensor,
+    *,
+    center_mode: str = "zero",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if points.numel() == 0:
+        return torch.zeros(3), torch.tensor(1.0)
+    pts = points[:, :3]
+    if center_mode == "mesh":
+        pts_min = pts.min(dim=0).values
+        pts_max = pts.max(dim=0).values
+        center = 0.5 * (pts_min + pts_max)
+    elif center_mode == "zero":
+        center = torch.zeros_like(pts[0])
+    else:
+        raise ValueError(f"Unsupported normalize_center_mode: {center_mode}")
+    scale = (pts - center).norm(dim=-1).max().clamp_min(1e-6)
+    return center, scale
+
+
+def compute_chain_normalization(
+    data_source: str,
+    indices: list[int],
+    *,
+    normalize_mode: str,
+    normalize_center_mode: str,
+) -> tuple[Dict[int, torch.Tensor], Dict[int, torch.Tensor]]:
+    chain_centers: Dict[int, torch.Tensor] = {}
+    chain_scales: Dict[int, torch.Tensor] = {}
+    if normalize_mode not in ("chain", "dataset"):
+        return chain_centers, chain_scales
+
+    cached_chain_pcs = []
+    for class_real_idx in indices:
+        urdf_path = os.path.join(data_source, "out_chains_v2", f"chain_{class_real_idx}.urdf")
+        chain_model = ChainModel(urdf_path=urdf_path, samples_per_link=128, device="cpu")
+        chain_model.update_status(torch.zeros(chain_model.dof))
+        pc_full = chain_model.get_transformed_links_pc(
+            num_points=None,
+            mask=torch.ones(chain_model.num_links, dtype=torch.bool),
+        )[0, :, :3]
+        cached_chain_pcs.append((class_real_idx, pc_full))
+        if normalize_mode == "chain":
+            center, scale = compute_center_scale_from_points(
+                pc_full,
+                center_mode=normalize_center_mode,
+            )
+            chain_centers[class_real_idx] = center
+            chain_scales[class_real_idx] = scale
+
+    if normalize_mode == "dataset":
+        all_pts = torch.cat([pc for _, pc in cached_chain_pcs], dim=0)
+        center, scale = compute_center_scale_from_points(
+            all_pts,
+            center_mode=normalize_center_mode,
+        )
+        for class_real_idx, _ in cached_chain_pcs:
+            chain_centers[class_real_idx] = center.clone()
+            chain_scales[class_real_idx] = scale.clone()
+
+    return chain_centers, chain_scales
+
+
+def compute_instance_center_scale(
+    chain_model: ChainModel,
+    *,
+    link_mask: torch.Tensor,
+    normalize_center_mode: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    pc_full = chain_model.get_transformed_links_pc(num_points=None, mask=link_mask)[0, :, :3]
+    return compute_center_scale_from_points(pc_full, center_mode=normalize_center_mode)
+
+
+def resolve_normalization(
+    chain_model: ChainModel,
+    *,
+    class_real_idx: int,
+    normalize_mode: str,
+    normalize_center_mode: str,
+    chain_centers: Dict[int, torch.Tensor],
+    chain_scales: Dict[int, torch.Tensor],
+    link_mask: torch.Tensor,
+) -> tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+    if normalize_mode == "none":
+        return None, None
+    if normalize_mode == "instance":
+        center, scale = compute_instance_center_scale(
+            chain_model,
+            link_mask=link_mask,
+            normalize_center_mode=normalize_center_mode,
+        )
+        return center, scale
+
+    if class_real_idx not in chain_centers:
+        current_q = chain_model.q.clone()
+        chain_model.update_status(torch.zeros(chain_model.dof))
+        pc_full = chain_model.get_transformed_links_pc(
+            num_points=None,
+            mask=torch.ones(chain_model.num_links, dtype=torch.bool),
+        )[0, :, :3]
+        center, scale = compute_center_scale_from_points(
+            pc_full,
+            center_mode=normalize_center_mode,
+        )
+        chain_centers[class_real_idx] = center
+        chain_scales[class_real_idx] = scale
+        chain_model.update_status(current_q.squeeze(0))
+
+    return chain_centers[class_real_idx], chain_scales[class_real_idx]
+
+
+def apply_normalization(
+    coords: torch.Tensor,
+    sdf: Optional[torch.Tensor],
+    *,
+    center: Optional[torch.Tensor],
+    scale: Optional[torch.Tensor],
+):
+    if center is None or scale is None:
+        return coords, sdf
+    coords = (coords - center) / scale
+    if sdf is not None:
+        sdf = sdf / scale
+    return coords, sdf
 
 
 class SDFSamples(torch.utils.data.Dataset):
@@ -412,6 +580,8 @@ class IKTokenSamples(torch.utils.data.Dataset):
         self.link_features = []
         self.joint_features = []
         self.link_bps = []
+        self.mask_counts = []
+        self.class_offsets = []
 
         for class_real_idx in indices:
             chain_properties = np.load(
@@ -426,12 +596,36 @@ class IKTokenSamples(torch.utils.data.Dataset):
             self.joint_features.append(joints_property)
             self.link_bps.append(_prepare_link_bps_scdistances(bpses))
 
+            token_path = self.tokens_dir / f"cls{class_real_idx}_inst0.pt"
+            if not token_path.exists():
+                raise FileNotFoundError(f"Missing token file: {token_path}")
+            token_data = torch.load(token_path, weights_only=False, map_location="cpu")
+            mask_count = int(torch.as_tensor(token_data["link_mask"]).shape[0])
+            if mask_count <= 0:
+                raise ValueError(f"Invalid mask count in {token_path}")
+            self.mask_counts.append(mask_count)
+
+        offset = 0
+        for count in self.mask_counts:
+            self.class_offsets.append(offset)
+            offset += int(self.num_instances) * int(count)
+        self.total_len = offset
+
     def __len__(self):
-        return len(self.indices) * self.num_instances
+        return self.total_len
 
     def __getitem__(self, idx):
-        class_idx = idx // self.num_instances
-        instance_idx = idx % self.num_instances
+        if idx < 0 or idx >= self.total_len:
+            raise IndexError(f"Index {idx} out of range for dataset of length {self.total_len}")
+
+        class_idx = bisect_right(self.class_offsets, idx) - 1
+        if class_idx < 0 or class_idx >= len(self.class_offsets):
+            raise IndexError(f"Index {idx} out of range for dataset of length {self.total_len}")
+        local_idx = idx - self.class_offsets[class_idx]
+
+        mask_count = int(self.mask_counts[class_idx])
+        instance_idx = local_idx // mask_count
+        mask_idx = local_idx % mask_count
         class_real_idx = self.indices[class_idx]
 
         token_path = self.tokens_dir / f"cls{class_real_idx}_inst{instance_idx}.pt"
@@ -448,10 +642,11 @@ class IKTokenSamples(torch.utils.data.Dataset):
             "link_features": self.link_features[class_idx],  # (num_links, 4)
             "joint_features": self.joint_features[class_idx],  # (num_links-1, 9)
             "link_bps_scdistances": self.link_bps[class_idx],  # (num_links, 257)
-            "sdf_tokens": sdf_tokens,  # (num_masks, token_dim)
-            "link_mask": link_mask,  # (num_masks, num_links)
+            "sdf_tokens": sdf_tokens[mask_idx],  # (token_dim,)
+            "link_mask": link_mask[mask_idx],  # (num_links,)
             "class_idx": int(token_data.get("cls_idx", class_real_idx)),
             "instance_idx": int(token_data.get("instance_idx", instance_idx)),
+            "mask_idx": int(mask_idx),
         }
 
 def make_collate_fn(max_num_links: int):
@@ -523,46 +718,43 @@ def make_collate_fn(max_num_links: int):
 
 def make_ik_collate_fn(max_num_links: int):
     def collate_fn(batch):
-        total_masks = sum(item["sdf_tokens"].shape[0] for item in batch)
-        if total_masks == 0:
+        if not batch:
             raise ValueError("Empty batch received in IK collate.")
-
         link_feat_dim = batch[0]["link_features"].shape[-1]
         joint_feat_dim = batch[0]["joint_features"].shape[-1]
         bps_dim = batch[0]["link_bps_scdistances"].shape[-1]
         token_dim = batch[0]["sdf_tokens"].shape[-1]
+        batch_size = len(batch)
 
-        chain_q = torch.zeros(total_masks, max_num_links - 1, dtype=torch.float32)
-        link_features = torch.zeros(total_masks, max_num_links, link_feat_dim, dtype=torch.float32)
-        joint_features = torch.zeros(total_masks, max_num_links - 1, joint_feat_dim, dtype=torch.float32)
-        link_bps = torch.zeros(total_masks, max_num_links, bps_dim, dtype=torch.float32)
-        masks = torch.zeros(total_masks, 3 * max_num_links - 2, dtype=torch.bool)
-        link_masks = torch.zeros(total_masks, max_num_links, dtype=torch.bool)
-        sdf_tokens = torch.zeros(total_masks, token_dim, dtype=torch.float32)
+        chain_q = torch.zeros(batch_size, max_num_links - 1, dtype=torch.float32)
+        link_features = torch.zeros(batch_size, max_num_links, link_feat_dim, dtype=torch.float32)
+        joint_features = torch.zeros(batch_size, max_num_links - 1, joint_feat_dim, dtype=torch.float32)
+        link_bps = torch.zeros(batch_size, max_num_links, bps_dim, dtype=torch.float32)
+        masks = torch.zeros(batch_size, 3 * max_num_links - 2, dtype=torch.bool)
+        link_masks = torch.zeros(batch_size, max_num_links, dtype=torch.bool)
+        sdf_tokens = torch.zeros(batch_size, token_dim, dtype=torch.float32)
 
         class_idx = []
         instance_idx = []
+        mask_idx = []
 
-        cursor = 0
-        for item in batch:
+        for i, item in enumerate(batch):
             n_links = item["link_features"].shape[0]
             if n_links > max_num_links:
                 raise ValueError(f"n_links {n_links} exceeds max_num_links {max_num_links}")
             n_joints = n_links - 1
-            n_masks = item["sdf_tokens"].shape[0]
 
-            for m in range(n_masks):
-                chain_q[cursor, :n_joints] = item["chain_q"]
-                link_features[cursor, :n_links] = item["link_features"]
-                joint_features[cursor, :n_joints] = item["joint_features"]
-                link_bps[cursor, :n_links] = item["link_bps_scdistances"]
-                masks[cursor, : 3 * n_links - 2] = True
-                link_masks[cursor, :n_links] = item["link_mask"][m]
-                sdf_tokens[cursor] = item["sdf_tokens"][m]
+            chain_q[i, :n_joints] = item["chain_q"]
+            link_features[i, :n_links] = item["link_features"]
+            joint_features[i, :n_joints] = item["joint_features"]
+            link_bps[i, :n_links] = item["link_bps_scdistances"]
+            masks[i, : 3 * n_links - 2] = True
+            link_masks[i, :n_links] = item["link_mask"]
+            sdf_tokens[i] = item["sdf_tokens"]
 
-                class_idx.append(item["class_idx"])
-                instance_idx.append(item["instance_idx"])
-                cursor += 1
+            class_idx.append(item["class_idx"])
+            instance_idx.append(item["instance_idx"])
+            mask_idx.append(item.get("mask_idx", 0))
 
         return {
             "chain_q": chain_q,  # (B, max_num_links-1)
@@ -572,6 +764,7 @@ def make_ik_collate_fn(max_num_links: int):
             "sdf_tokens": sdf_tokens,  # (B, token_dim)
             "class_idx": class_idx,
             "instance_idx": instance_idx,
+            "mask_idx": mask_idx,
             "mask": masks,  # (B, 3*max_num_links-2)
             "link_mask": link_masks,  # (B, max_num_links)
         }

@@ -9,7 +9,12 @@ from tqdm import tqdm
 from hydra.utils import to_absolute_path
 from omegaconf import DictConfig
 
-from data_process.dataset import get_dataloader
+from data_process.dataset import (
+    get_dataloader,
+    load_chain_properties,
+    pad_chain_features,
+    prepare_link_bps_scdistances,
+)
 from networks.deep_sdf_decoder import Decoder
 from networks.siren_decoder import SirenDecoder, SirenSplitDecoder
 from networks.mlp import MLP
@@ -233,6 +238,89 @@ def inference(
     if return_link_tokens:
         return latent, sdf_pred, link_tokens
     return latent, sdf_pred
+
+
+def build_fk_batch(
+    *,
+    class_real_idx: int,
+    q_values: torch.Tensor,
+    cfg: DictConfig,
+    data_source: str,
+    device: torch.device,
+    chain_props=None,
+    max_num_links: int | None = None,
+) -> Tuple[Dict[str, torch.Tensor], int]:
+    if chain_props is None:
+        link_features, joint_features, link_bps, chain_props = load_chain_properties(
+            data_source, class_real_idx
+        )
+    else:
+        link_features = torch.tensor(chain_props["links_property"]).float()
+        joint_features = torch.tensor(chain_props["joints_property"]).float()
+        link_bps = prepare_link_bps_scdistances(chain_props["bpses"])
+
+    max_links = max_num_links or int(cfg.data.max_num_links)
+    link_features, joint_features, link_bps, num_links = pad_chain_features(
+        link_features,
+        joint_features,
+        link_bps,
+        max_num_links=max_links,
+    )
+
+    if q_values.dim() == 1:
+        q_values = q_values.unsqueeze(0)
+
+    chain_q = torch.zeros(q_values.size(0), max_links - 1, dtype=torch.float32)
+    chain_q[:, : q_values.size(1)] = q_values
+    chain_q = chain_q.to(device)
+
+    token_mask = torch.zeros(3 * max_links - 2, dtype=torch.bool, device=device)
+    token_mask[: 3 * num_links - 2] = True
+    link_mask_full = torch.zeros(max_links, dtype=torch.bool, device=device)
+    link_mask_full[:num_links] = True
+
+    batch = {
+        "sdf_samples": torch.zeros(chain_q.size(0), 1, 4, device=device),
+        "chain_q": chain_q,
+        "link_features": link_features.unsqueeze(0).expand(chain_q.size(0), -1, -1).to(device),
+        "joint_features": joint_features.unsqueeze(0).expand(chain_q.size(0), -1, -1).to(device),
+        "link_bps_scdistances": link_bps.unsqueeze(0).expand(chain_q.size(0), -1, -1).to(device),
+        "mask": token_mask.unsqueeze(0).expand(chain_q.size(0), -1),
+        "link_mask": link_mask_full.unsqueeze(0).expand(chain_q.size(0), -1),
+    }
+
+    return batch, num_links
+
+
+def infer_link_tokens(
+    *,
+    class_real_idx: int,
+    q_values: torch.Tensor,
+    cfg: DictConfig,
+    models: Dict[str, torch.nn.Module],
+    data_source: str,
+    device: torch.device,
+    chain_props=None,
+    max_num_links: int | None = None,
+) -> Tuple[torch.Tensor, int]:
+    batch, num_links = build_fk_batch(
+        class_real_idx=class_real_idx,
+        q_values=q_values,
+        cfg=cfg,
+        data_source=data_source,
+        device=device,
+        chain_props=chain_props,
+        max_num_links=max_num_links,
+    )
+    _, _, link_tokens = inference(
+        batch,
+        models,
+        cfg=cfg,
+        device=device,
+        coords_override=torch.zeros(batch["chain_q"].size(0), 1, 3, device=device),
+        return_link_tokens=True,
+    )
+    return link_tokens, num_links
 
 
 def siren_sdf_loss(
