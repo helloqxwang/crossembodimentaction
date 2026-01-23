@@ -8,11 +8,11 @@ data:
     end: 100
   val_indices:
     start: 100
-    end: 110
+    end: 200
   eval_indices:
-    start: 0
-    end: 2
-  num_instances: 5
+    start: 70
+    end: 120
+  num_instances: 20
   max_num_links: 5
   fix_q_samples: true
 
@@ -27,6 +27,12 @@ validation:
     - name: siren_fake_epoch_470
       config: conf/conf_siren/config_siren_fake.yaml
       checkpoint: checkpoints/mfk_siren_fake/epoch_470.pth
+    - name: siren_split_epoch_470
+      config: conf/conf_siren/config_siren_split.yaml
+      checkpoint: checkpoints/mfk_siren_split/epoch_470.pth
+    - name: siren_nonorm_epoch_470
+      config: conf/conf_siren/config_siren_nonorm.yaml
+      checkpoint: checkpoints/mfk_siren_nonorm/epoch_470.pth
     - name: mlp_epoch_470
       config: conf/conf_siren/config_mlp.yaml
       checkpoint: checkpoints/mfk_mlp/epoch_470.pth
@@ -46,7 +52,7 @@ validation:
       grid_scale_factor: 1.4
 
   mask:
-    mode: none  # none | num_masked | specific | index | all
+    mode: all  # none | num_masked | specific | index | all
     num_masked: 1
     min_visible: 1
     specific: []
@@ -63,9 +69,9 @@ validation:
     save_html: false
 
   visualize_mesh:
-    enabled: false
+    enabled: true
     output_dir: ./outputs/validate_fk/meshes
-    instance_idx: 0  # int or "all"
+    instance_idx: [0]  # list[int] or "all"
     grid_res: 128
     max_batch: 262144
     grid_scale_factor: 1.4

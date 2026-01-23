@@ -4,9 +4,10 @@ from dataclasses import dataclass
 import itertools
 import logging
 import os
-from typing import Dict, Iterable, List
+from typing import Dict, Iterable, List, Optional
 
 import hydra
+import omegaconf
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
@@ -27,6 +28,9 @@ from data_process.dataset import (
 from train_fk import build_models, decoder_forward, infer_link_tokens, pooled_latent
 from visualize_fk import reconstruct_mesh
 
+import logging
+logging.getLogger("kaleido").setLevel(logging.WARNING)
+logging.getLogger("choreographer").setLevel(logging.WARNING)
 
 @dataclass
 class MethodBundle:
@@ -194,7 +198,7 @@ def _category_for_class(cls: int, seen_set: set[int], unseen_set: set[int]) -> s
     return "unknown"
 
 
-def _plot_boxplot(records: List[Dict], title: str, out_path: str, save_html: bool) -> None:
+def _plot_boxplot_plotly(records: List[Dict], title: str, out_path: str, save_html: bool) -> None:
     if not records:
         return
     fig = px.box(records, x="method", y="value", points="outliers")
@@ -207,6 +211,30 @@ def _plot_boxplot(records: List[Dict], title: str, out_path: str, save_html: boo
         logging.warning("write_image failed (%s); wrote HTML to %s", exc, html_path)
     if save_html:
         fig.write_html(out_path + ".html")
+
+def _plot_boxplot_matplotlib(records: List[Dict], title: str, out_path: str, save_html: bool) -> None:
+    if not records:
+        return
+
+    import matplotlib.pyplot as plt
+    import pandas as pd
+
+    df = pd.DataFrame(records)
+    fig, ax = plt.subplots(figsize=(8, 4))
+    df.boxplot(column="value", by="method", ax=ax, showfliers=True)
+    ax.set_title(title)
+    ax.set_xlabel("method")
+    ax.set_ylabel("metric")
+    fig.suptitle("")
+    try:
+        fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    except Exception as exc:
+        html_path = out_path + ".html"
+        df.to_html(html_path, index=False)
+        logging.warning("savefig failed (%s); wrote HTML to %s", exc, html_path)
+    if save_html:
+        df.to_html(out_path + ".html", index=False)
+    plt.close(fig)
 
 
 def _save_plotly_figure(fig: go.Figure, out_path: str, save_html: bool) -> None:
@@ -360,7 +388,7 @@ def _save_plots(
                         f"_mask-{_stringify_token(mask_value)}.png"
                     )
                     out_path = os.path.join(output_dir, fname)
-                    _plot_boxplot(filtered, title=title, out_path=out_path, save_html=save_html)
+                    _plot_boxplot_matplotlib(filtered, title=title, out_path=out_path, save_html=save_html)
 
 
 @hydra.main(config_path="conf", config_name="config_validate_fk", version_base="1.3")
@@ -401,7 +429,12 @@ def main(cfg: DictConfig) -> None:
         vis_enabled = False
     vis_instance_cfg = getattr(vis_cfg, "instance_idx", 0) if vis_cfg is not None else 0
     vis_all_instances = str(vis_instance_cfg).lower() == "all"
-    vis_instance_idx = 0 if vis_all_instances else int(vis_instance_cfg)
+    if vis_all_instances:
+        vis_instance_set = None
+    elif isinstance(vis_instance_cfg, omegaconf.listconfig.ListConfig):
+        vis_instance_set = {int(x) for x in vis_instance_cfg}
+    else:
+        vis_instance_set = {int(vis_instance_cfg)}
     mesh_out_dir = (
         to_absolute_path(getattr(vis_cfg, "output_dir", "./outputs/validate_fk/meshes"))
         if vis_cfg is not None
@@ -511,7 +544,7 @@ def main(cfg: DictConfig) -> None:
 
                 gt_mesh = None
                 gt_radius = None
-                if vis_enabled and (vis_all_instances or inst_idx == vis_instance_idx):
+                if vis_enabled and (vis_all_instances or inst_idx in vis_instance_set):
                     gt_mesh = chain_model.get_trimesh_q(
                         0,
                         boolean_merged=True,
@@ -543,7 +576,7 @@ def main(cfg: DictConfig) -> None:
 
                     if (
                         vis_enabled
-                        and (vis_all_instances or inst_idx == vis_instance_idx)
+                        and (vis_all_instances or inst_idx in vis_instance_set)
                         and gt_mesh is not None
                         and gt_radius is not None
                     ):
@@ -557,27 +590,36 @@ def main(cfg: DictConfig) -> None:
                         norm_center = center.to(decoder_device) if center is not None else None
                         norm_scale = scale.to(decoder_device) if scale is not None else None
 
-                        reconstruct_mesh(
-                            decoder=method.models["decoder"],
-                            latent=latent,
-                            out_path=out_stem,
-                            N=getattr(vis_cfg, "grid_res", 128),
-                            max_batch=getattr(vis_cfg, "max_batch", 262144),
-                            grid_scale=gt_radius * float(getattr(vis_cfg, "grid_scale_factor", 1.4)),
-                            offset=None,
-                            scale=None,
-                            normalize_center=norm_center,
-                            normalize_scale=norm_scale,
-                        )
+                        try:
+                            reconstruct_mesh(
+                                decoder=method.models["decoder"],
+                                latent=latent,
+                                out_path=out_stem,
+                                N=getattr(vis_cfg, "grid_res", 128),
+                                max_batch=getattr(vis_cfg, "max_batch", 262144),
+                                grid_scale=gt_radius * float(getattr(vis_cfg, "grid_scale_factor", 1.4)),
+                                offset=None,
+                                scale=None,
+                                normalize_center=norm_center,
+                                normalize_scale=norm_scale,
+                            )
 
-                        pred_mesh = trimesh.load(out_stem + ".ply", force="mesh")
-                        save_mesh_comparison(
-                            pred_mesh=pred_mesh,
-                            gt_mesh=gt_mesh,
-                            out_path=out_stem + ".png",
-                            save_html=bool(getattr(vis_cfg, "save_html", False)),
-                            show_pred_only=bool(getattr(vis_cfg, "show_pred_only", False)),
-                        )
+                            pred_mesh = trimesh.load(out_stem + ".ply", force="mesh")
+                            save_mesh_comparison(
+                                pred_mesh=pred_mesh,
+                                gt_mesh=gt_mesh,
+                                out_path=out_stem + ".png",
+                                save_html=bool(getattr(vis_cfg, "save_html", False)),
+                                show_pred_only=bool(getattr(vis_cfg, "show_pred_only", False)),
+                            )
+                        except Exception as exc:
+                            logging.warning(
+                                "Mesh reconstruction failed for class %d instance %d mask %d: %s",
+                                class_idx,
+                                inst_idx,
+                                mask_idx,
+                                exc,
+                            )
 
                     if metric_cfg.sdf_l1_surface.enabled and surface_pts is not None:
                         coords = surface_pts.clone()

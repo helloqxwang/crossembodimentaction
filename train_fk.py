@@ -1,4 +1,4 @@
-from typing import Dict, Tuple
+from typing import Dict, Tuple, Optional
 import os
 
 import wandb
@@ -149,6 +149,28 @@ def build_models(cfg: DictConfig, device: torch.device) -> Dict[str, torch.nn.Mo
         # "aggregator": aggregator,
         "decoder": decoder,
     }
+
+
+def load_models_from_checkpoint(
+    cfg: DictConfig, device: torch.device, checkpoint: str
+) -> tuple[Dict[str, torch.nn.Module], Optional[int]]:
+    models = build_models(cfg, device)
+    ckpt_path = to_absolute_path(str(checkpoint))
+    if not os.path.isfile(ckpt_path):
+        raise FileNotFoundError(f"checkpoint not found: {ckpt_path}")
+
+    torch.serialization.add_safe_globals([DictConfig])
+    state = torch.load(ckpt_path, map_location=device, weights_only=False)
+    epoch = state.get("epoch") if isinstance(state, dict) else None
+    state_dicts = state.get("models", state)
+    for name, module in models.items():
+        if name in state_dicts:
+            module.load_state_dict(state_dicts[name], strict=False)
+        else:
+            raise KeyError(f"model '{name}' not found in checkpoint")
+    for m in models.values():
+        m.eval()
+    return models, epoch
 
 
 def pooled_latent(

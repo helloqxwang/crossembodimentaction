@@ -1,0 +1,35 @@
+defaults:
+  - config_ik_fm
+  - _self_
+
+data:
+  data_source: ./data/
+  sdf_token_dir: ./data/sdf_tokens
+  batch_size: 1
+  val_batch_size: 1
+  indices:
+    start: 0
+    end: 100
+  val_indices:
+    start: 101
+    end: 110
+
+visualize:
+  test_ckpt: checkpoints/ik-fm/epoch_15600.pth
+  max_mesh: 32
+  port: 9010
+  show_pred_only: false
+  q_min: -2.09439510239
+  q_max: 2.09439510239
+  inference:
+    steps: 10
+    step_size: null
+    noise_std: 1.0
+  fk_tokens:
+    enabled: false
+    config: conf/conf_siren/config_siren.yaml
+    checkpoint: checkpoints/mfk_siren/epoch_830.pth
+  attention:
+    enabled: true
+    output_dir: ./outputs/ik_attention
+    sample_idx: 0

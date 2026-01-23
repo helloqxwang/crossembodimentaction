@@ -18,33 +18,9 @@ from hydra.utils import to_absolute_path
 from omegaconf import DictConfig, OmegaConf
 
 from robot_model.chain_model import ChainModel
-from train_fk import build_models, infer_link_tokens, pooled_latent, _prepare_device
+from train_fk import load_models_from_checkpoint, infer_link_tokens, pooled_latent, _prepare_device
 from data_process.dataset import load_chain_properties
 from tqdm import tqdm
-
-
-def _load_models(
-    cfg: DictConfig, device: torch.device, checkpoint: str
-) -> Tuple[Dict[str, torch.nn.Module], Optional[int]]:
-    models = build_models(cfg, device)
-    ckpt_path = to_absolute_path(checkpoint)
-    if not os.path.isfile(ckpt_path):
-        raise FileNotFoundError(f"checkpoint not found: {ckpt_path}")
-
-    # Allow OmegaConf objects inside checkpoints saved from train_fk.
-    torch.serialization.add_safe_globals([DictConfig])
-
-    state = torch.load(ckpt_path, map_location=device, weights_only=False)
-    epoch = state.get("epoch") if isinstance(state, dict) else None
-    state_dicts = state.get("models", state)
-    for name, module in models.items():
-        if name in state_dicts:
-            module.load_state_dict(state_dicts[name], strict=False)
-        else:
-            raise KeyError(f"model '{name}' not found in checkpoint")
-    for m in models.values():
-        m.eval()
-    return models, epoch
 
 
 def _parse_args() -> argparse.Namespace:
@@ -111,7 +87,7 @@ def main() -> None:
     num_instances = args.instance_nums or cfg.data.num_instances
     max_num_links = int(cfg.data.max_num_links)
 
-    models, epoch = _load_models(cfg, device, args.checkpoint)
+    models, epoch = load_models_from_checkpoint(cfg, device, args.checkpoint)
     if epoch is not None:
         print(f"Loaded checkpoint at epoch {epoch}")
 

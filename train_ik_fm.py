@@ -18,6 +18,32 @@ from networks.transformer import TransformerEncoder
 from networks.value_encoder import AxisFourierEncoder
 
 
+def _apply_mlp_per_joint(mlp: torch.nn.Module, x: torch.Tensor) -> torch.Tensor:
+    B, L, D = x.shape
+    out = mlp(x.reshape(B * L, D))
+    return out.view(B, L, -1)
+
+
+def _time_embedding(t: torch.Tensor, dim: int) -> torch.Tensor:
+    if dim <= 0:
+        raise ValueError("time embedding dim must be positive")
+    if t.dim() != 2 or t.size(1) != 1:
+        raise ValueError(f"Expected t with shape (B,1), got {tuple(t.shape)}")
+    half = dim // 2
+    freqs = torch.exp(
+        -math.log(10000.0) * torch.arange(half, device=t.device, dtype=t.dtype) / max(half, 1)
+    )
+    args = t * freqs.unsqueeze(0)
+    emb = torch.cat([torch.sin(args), torch.cos(args)], dim=-1)
+    if dim % 2 == 1:
+        emb = F.pad(emb, (0, 1), value=0.0)
+    return emb
+
+
+def _sincos_from_q(chain_q: torch.Tensor) -> torch.Tensor:
+    return torch.stack([torch.sin(chain_q), torch.cos(chain_q)], dim=-1)
+
+
 def _prepare_device(device_str: str) -> torch.device:
     if device_str.startswith("cuda") and not torch.cuda.is_available():
         return torch.device("cpu")
@@ -90,6 +116,16 @@ def build_models(cfg: DictConfig, device: torch.device) -> Dict[str, torch.nn.Mo
         use_layer_norm=link_encoder_cfg.use_layer_norm,
     ).to(device)
 
+    joint_value_encoder_cfg = cfg.models.joint_value_encoder
+    joint_value_encoder = MLP(
+        input_dim=joint_value_encoder_cfg.input_dim,
+        output_dim=joint_value_encoder_cfg.output_dim,
+        hidden_dims=getattr(joint_value_encoder_cfg, "hidden_dims", ()),
+        activation=getattr(joint_value_encoder_cfg, "activation", "gelu"),
+        dropout=getattr(joint_value_encoder_cfg, "dropout", 0.0),
+        use_layer_norm=getattr(joint_value_encoder_cfg, "use_layer_norm", False),
+    ).to(device)
+
     transformer_cfg = cfg.models.transformer
     transformer = TransformerEncoder(
         input_dim=transformer_cfg.input_dim,
@@ -107,10 +143,33 @@ def build_models(cfg: DictConfig, device: torch.device) -> Dict[str, torch.nn.Mo
         final_layer_norm=transformer_cfg.final_layer_norm,
     ).to(device)
 
+    flow_head_cfg = cfg.models.flow_head
+    flow_head = MLP(
+        input_dim=flow_head_cfg.input_dim,
+        output_dim=flow_head_cfg.output_dim,
+        hidden_dims=flow_head_cfg.hidden_dims,
+        activation=flow_head_cfg.activation,
+        dropout=flow_head_cfg.dropout,
+        use_layer_norm=flow_head_cfg.use_layer_norm,
+    ).to(device)
+
+    time_mlp_hidden = int(getattr(cfg.flow_matching, "time_mlp_hidden", 128))
+    time_mlp = MLP(
+        input_dim=int(cfg.flow_matching.time_embed_dim),
+        output_dim=transformer_cfg.input_dim,
+        hidden_dims=(time_mlp_hidden,),
+        activation=getattr(cfg.flow_matching, "time_mlp_activation", "silu"),
+        dropout=0.0,
+        use_layer_norm=False,
+    ).to(device)
+
     return {
         "joint_encoder": joint_encoder,
         "link_encoder": link_encoder,
+        "joint_value_encoder": joint_value_encoder,
         "transformer": transformer,
+        "flow_head": flow_head,
+        "time_mlp": time_mlp,
     }
 
 
@@ -144,54 +203,33 @@ def _build_tokens(
     return token_tensor, key_padding_mask, joint_indices, joint_mask
 
 
-def _discretize_joint_values(
-    chain_q: torch.Tensor,
+def build_ik_tokens(
+    link_fts: torch.Tensor,
+    joint_fts: torch.Tensor,
+    joint_value_tokens: torch.Tensor,
+    geometry_tokens: torch.Tensor,
+    mask: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, list[int], torch.Tensor]:
+    return _build_tokens(link_fts, joint_fts, joint_value_tokens, geometry_tokens, mask)
+
+
+def _flow_forward(
     *,
-    num_bins: int,
-    q_min: float,
-    q_max: float,
-) -> torch.Tensor:
-    if q_max <= q_min:
-        raise ValueError("q_max must be greater than q_min")
-    q_clamped = chain_q.clamp(q_min, q_max)
-    scaled = (q_clamped - q_min) / (q_max - q_min)
-    idx = torch.floor(scaled * num_bins).long().clamp(0, num_bins - 1)
-    return idx
-
-
-def _corrupt_one_hot(
-    one_hot: torch.Tensor,
-    *,
-    corrupt_prob: float,
-    num_bins: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    if corrupt_prob <= 0:
-        mask = torch.zeros(one_hot.shape[:2], dtype=torch.bool, device=one_hot.device)
-        return one_hot, mask
-    mask = torch.rand(one_hot.shape[:2], device=one_hot.device) < corrupt_prob
-    rand_idx = torch.randint(0, num_bins, mask.shape, device=one_hot.device)
-    corrupted = one_hot.clone()
-    corrupted[mask] = F.one_hot(rand_idx[mask], num_bins).float()
-    return corrupted, mask
-
-
-def ik_step(
+    joint_state: torch.Tensor,
+    t: torch.Tensor,
     batch: Dict[str, torch.Tensor],
     models: Dict[str, torch.nn.Module],
     device: torch.device,
-    *,
-    num_bins: int,
-    q_min: float,
-    q_max: float,
-    corrupt_prob: float,
+    time_embed_dim: int,
     use_compact_repr: bool,
-    supervise_only_corrupted: bool,
-) -> Tuple[torch.Tensor, float]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     joint_encoder = models["joint_encoder"]
     link_encoder = models["link_encoder"]
+    joint_value_encoder = models["joint_value_encoder"]
     transformer = models["transformer"]
+    flow_head = models["flow_head"]
+    time_mlp = models["time_mlp"]
 
-    chain_q = batch["chain_q"].to(device)
     if use_compact_repr:
         link_features = batch["link_features"].to(device)
     else:
@@ -202,16 +240,13 @@ def ik_step(
 
     joint_fts = joint_encoder(joint_features)
     link_fts = link_encoder(link_features)
-
-    gt_idx = _discretize_joint_values(chain_q, num_bins=num_bins, q_min=q_min, q_max=q_max)
-    gt_one_hot = F.one_hot(gt_idx, num_bins).float()
-    corrupted_tokens, corrupt_mask = _corrupt_one_hot(
-        gt_one_hot, corrupt_prob=corrupt_prob, num_bins=num_bins
-    )
+    joint_value_tokens = _apply_mlp_per_joint(joint_value_encoder, joint_state)
 
     tokens, key_padding_mask, joint_indices, joint_mask = _build_tokens(
-        link_fts, joint_fts, corrupted_tokens, geometry_tokens, mask
+        link_fts, joint_fts, joint_value_tokens, geometry_tokens, mask
     )
+    time_embed = time_mlp(_time_embedding(t, time_embed_dim))
+    tokens = tokens + time_embed[:, None, :]
 
     transformer_out = transformer(
         tokens,
@@ -219,28 +254,105 @@ def ik_step(
         causal=False,
     )
 
-    joint_logits = transformer_out[:, joint_indices]
-    B, L, D = joint_logits.shape
-    logits_flat = joint_logits.reshape(B * L, D)
-    gt_flat = gt_idx.reshape(B * L)
+    joint_out = transformer_out[:, joint_indices]
+    v_pred = _apply_mlp_per_joint(flow_head, joint_out)
 
-    valid_mask = joint_mask.reshape(B * L)
-    if supervise_only_corrupted and corrupt_prob > 0:
-        corrupt_flat = corrupt_mask.reshape(B * L)
-        valid_mask = valid_mask & corrupt_flat
-        if valid_mask.sum() == 0:
-            valid_mask = joint_mask.reshape(B * L)
+    return v_pred, joint_mask, tokens, key_padding_mask
 
-    loss_all = F.cross_entropy(logits_flat, gt_flat, reduction="none")
-    loss = (loss_all * valid_mask.float()).sum() / valid_mask.sum().clamp_min(1)
+
+def ik_step(
+    batch: Dict[str, torch.Tensor],
+    models: Dict[str, torch.nn.Module],
+    device: torch.device,
+    *,
+    noise_std: float,
+    time_embed_dim: int,
+    use_compact_repr: bool,
+    q_min: float | None = None,
+    q_max: float | None = None,
+) -> Tuple[torch.Tensor, float | None]:
+    chain_q = batch["chain_q"].to(device)
+    x0 = _sincos_from_q(chain_q)
+    noise = torch.randn_like(x0) * float(noise_std)
+    B = chain_q.size(0)
+    t = torch.rand(B, 1, device=device)
+    x_t = (1.0 - t.unsqueeze(-1)) * x0 + t.unsqueeze(-1) * noise
+    v_target = noise - x0
+
+    v_pred, joint_mask, _, _ = _flow_forward(
+        joint_state=x_t,
+        t=t,
+        batch=batch,
+        models=models,
+        device=device,
+        time_embed_dim=time_embed_dim,
+        use_compact_repr=use_compact_repr,
+    )
+
+    loss = (v_pred - v_target).pow(2).sum(dim=-1)
+    loss = (loss * joint_mask.float()).sum() / joint_mask.sum().clamp_min(1)
 
     with torch.no_grad():
-        pred_idx = joint_logits.argmax(dim=-1)
-        acc_mask = valid_mask.reshape(B, L)
-        correct = (pred_idx == gt_idx) & acc_mask
-        acc = correct.sum().float() / acc_mask.sum().clamp_min(1)
+        x0_pred = x_t - t.unsqueeze(-1) * v_pred
+        q_pred = torch.atan2(x0_pred[..., 0], x0_pred[..., 1])
+        if q_min is not None and q_max is not None:
+            q_pred = q_pred.clamp(q_min, q_max)
+        err = torch.abs(q_pred - chain_q)
+        err = (err * joint_mask.float()).sum() / joint_mask.sum().clamp_min(1)
 
-    return loss, float(acc.item())
+    return loss, float(err.item())
+
+
+def infer_ik_flow(
+    batch: Dict[str, torch.Tensor],
+    models: Dict[str, torch.nn.Module],
+    device: torch.device,
+    *,
+    noise_std: float,
+    time_embed_dim: int,
+    steps: int = 10,
+    step_size: float | None = None,
+    use_compact_repr: bool,
+    return_tokens: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor] | Tuple[
+    torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor
+]:
+    """ODE integration for flow-matching model in joint sin/cos space."""
+    if steps <= 0:
+        raise ValueError("steps must be >= 1 for flow inference")
+
+    chain_q = batch["chain_q"].to(device)
+    x = torch.randn_like(_sincos_from_q(chain_q)) * float(noise_std)
+
+    dt = step_size if step_size is not None else 1.0 / float(steps)
+    last_tokens = None
+    last_key_padding = None
+    joint_mask = None
+
+    for step in range(steps):
+        t_val = 1.0 - step / float(steps)
+        t = torch.full((x.size(0), 1), t_val, device=device, dtype=x.dtype)
+        v_pred, joint_mask, tokens, key_padding_mask = _flow_forward(
+            joint_state=x,
+            t=t,
+            batch=batch,
+            models=models,
+            device=device,
+            time_embed_dim=time_embed_dim,
+            use_compact_repr=use_compact_repr,
+        )
+        x = x - v_pred * dt
+        if joint_mask is not None:
+            x = torch.where(joint_mask.unsqueeze(-1), x, torch.zeros_like(x))
+        last_tokens = tokens
+        last_key_padding = key_padding_mask
+
+    if joint_mask is None:
+        raise RuntimeError("Flow inference failed to produce joint mask")
+
+    if return_tokens:
+        return x, joint_mask, last_tokens, last_key_padding
+    return x, joint_mask
 
 
 @hydra.main(config_path="conf", config_name="config_ik_fm", version_base="1.3")
@@ -253,16 +365,10 @@ def main(cfg: DictConfig) -> None:
     use_wandb = getattr(cfg.training, "wandb", {}).get("enabled", False)
     save_interval = getattr(cfg.training.wandb, "save_interval", 50)
     val_interval = getattr(cfg.training, "validation_interval", 1000)
-    num_bins = int(getattr(cfg.models, "sdf_latent_dim", cfg.models.transformer.input_dim))
-    if cfg.models.transformer.input_dim != num_bins or cfg.models.transformer.output_dim != num_bins:
-        raise ValueError(
-            "transformer.input_dim and transformer.output_dim must equal num_bins "
-            "for direct one-hot inputs and logits outputs"
-        )
     q_min = float(getattr(cfg.training, "q_min", -2.0 * math.pi / 3.0))
     q_max = float(getattr(cfg.training, "q_max", 2.0 * math.pi / 3.0))
-    corrupt_prob = float(getattr(cfg.training, "corrupt_prob", 0.15))
-    supervise_only_corrupted = bool(getattr(cfg.training, "supervise_only_corrupted", True))
+    noise_std = float(getattr(cfg.flow_matching, "noise_std", 1.0))
+    time_embed_dim = int(getattr(cfg.flow_matching, "time_embed_dim", 128))
 
     indices = list(range(cfg.data.indices.start, cfg.data.indices.end))
     val_indices = list(range(cfg.data.val_indices.start, cfg.data.val_indices.end))
@@ -324,16 +430,15 @@ def main(cfg: DictConfig) -> None:
     for epoch in range(num_epochs):
         for batch in tqdm(ik_loader, desc=f"Epoch {epoch+1}/{num_epochs}"):
             optimizer.zero_grad()
-            loss, acc = ik_step(
+            loss, err = ik_step(
                 batch,
                 models,
                 device,
-                num_bins=num_bins,
+                noise_std=noise_std,
+                time_embed_dim=time_embed_dim,
+                use_compact_repr=use_compact_repr,
                 q_min=q_min,
                 q_max=q_max,
-                corrupt_prob=corrupt_prob,
-                use_compact_repr=use_compact_repr,
-                supervise_only_corrupted=supervise_only_corrupted,
             )
             loss.backward()
             optimizer.step()
@@ -342,7 +447,7 @@ def main(cfg: DictConfig) -> None:
                 wandb.log(
                     {
                         "train/loss": loss.item(),
-                        "train/acc": acc,
+                        "train/angle_err": err,
                         "step": global_step,
                         "epoch": epoch,
                     }
@@ -357,26 +462,25 @@ def main(cfg: DictConfig) -> None:
                     val_batch = next(val_iter)
 
                 with torch.no_grad():
-                    val_loss, val_acc = ik_step(
+                    val_loss, val_err = ik_step(
                         val_batch,
                         models,
                         device,
-                        num_bins=num_bins,
+                        noise_std=noise_std,
+                        time_embed_dim=time_embed_dim,
+                        use_compact_repr=use_compact_repr,
                         q_min=q_min,
                         q_max=q_max,
-                        corrupt_prob=0.0,
-                        use_compact_repr=use_compact_repr,
-                        supervise_only_corrupted=False,
                     )
 
                 print(
-                    f"[Val @ step {global_step}] loss {val_loss:.4f} | acc {val_acc:.4f}"
+                    f"[Val @ step {global_step}] loss {val_loss:.4f} | angle_err {val_err:.4f}"
                 )
                 if use_wandb:
                     wandb.log(
                         {
                             "val/loss": val_loss,
-                            "val/acc": val_acc,
+                            "val/angle_err": val_err,
                             "step": global_step,
                             "epoch": epoch,
                         }

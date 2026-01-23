@@ -9,9 +9,9 @@ data:
     start: 0
     end: 100
   val_indices:
-    start: 101
+    start: 100
     end: 110
-  num_instances: 100
+  num_instances: 50
   subsample: 4096
   batch_size: 64
   val_batch_size: 64
@@ -38,9 +38,17 @@ models:
     max_length: 16
     norm_first: true
     final_layer_norm: true
-  joint_value_decoder:
+  joint_value_encoder:
+    input_dim: 2
+    output_dim: *sld
+    hidden_dims: [*hd]
+    activation: gelu
+    dropout: 0.0
+    use_layer_norm: false
+  flow_head:
     input_dim: *sld
-    hidden_dims: [*hd, *sld]
+    output_dim: 2
+    hidden_dims: [*hd, *hd]
     activation: gelu
     dropout: 0.0
     use_layer_norm: false
@@ -49,6 +57,7 @@ flow_matching:
   noise_std: 1.0
   time_embed_dim: 128
   time_mlp_hidden: 256
+  time_mlp_activation: silu
 
 training:
   device: cuda
@@ -56,15 +65,13 @@ training:
   lr: 1e-4
   num_epochs: 1e6
   validation_interval: 500
-  corrupt_prob: 0.15
-  supervise_only_corrupted: true
   q_min: -2.09439510239
   q_max: 2.09439510239
   wandb:
     enabled: true
     project: action_repr
-    run_name: ik-transformer_fm_
-    save_interval: 50
+    run_name: ik-fm
+    save_interval: 200
     save_dir: ./checkpoints
   lr_schedules: []
   pretrained_ckpt: null
