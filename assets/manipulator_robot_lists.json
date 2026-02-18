@@ -1,0 +1,36 @@
+{
+  "both_hands": [
+    "spider/ability/left",
+    "spider/ability/right",
+    "spider/allegro/left",
+    "spider/allegro/right",
+    "dro/barrett/model_extended",
+    "dro/ezgripper/ezgripper_extended",
+    "spider/inspire/left",
+    "spider/inspire/right",
+    "dro/leaphand/leap_hand_right",
+    "spider/mano/left",
+    "spider/mano/right",
+    "spider/metahand/left",
+    "spider/metahand/right",
+    "spider/schunk/left",
+    "spider/schunk/right",
+    "dro/shadowhand/shadow_hand_right",
+    "dro/urdf/robotiq_3finger_description",
+    "spider/xhand/left",
+    "spider/xhand/right"
+  ],
+  "right_hands": [
+    "spider/ability/right",
+    "spider/allegro/right",
+    "dro/barrett/model",
+    "dro/ezgripper/ezgripper_extended",
+    "spider/inspire/right",
+    "dro/leaphand/leap_hand_right",
+    "spider/mano/right",
+    "spider/schunk/right",
+    "dro/shadowhand/shadow_hand_right",
+    "dro/urdf/robotiq_3finger_description",
+    "spider/xhand/right"
+  ]
+}

@@ -1,0 +1,58 @@
+defaults:
+  - _self_
+
+seed: 42
+
+paths:
+  spider_root: ../spider
+  dro_root: ../DRO-Grasp
+
+input:
+  mode: generated  # generated or cmap_gt
+  max_samples_per_robot: 50  # -1 means all
+  max_total_samples: 200  # -1 means all
+  shuffle: true
+
+  generated:
+    results_path: ./outputs/cross_cvae/validation/generated_grasps.pt
+    source_filter: null  # null means all sources in file, e.g. pred + no-data
+    q_key: q_pred  # q_pred or q_gt
+
+  cmap_gt:
+    split: validate
+    robot_names:
+      - allegro
+      - barrett
+      - ezgripper
+      - shadowhand
+
+mujoco:
+  num_steps: 1000
+  object_pose6: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+  sim_dt: 0.005
+  steps_per_frame: 1
+  in_hand_distance_threshold: 0.25
+
+  show_viewer: true
+  save_video: false
+  render_fps: null 
+  render_width: 720
+  render_height: 480
+  render_every_n_steps: 1
+  use_visual_mesh_for_viewer: true
+
+  hand_kp: 40.0
+  hand_kd: 5.0
+  hand_max_force: 10.0
+
+output:
+  save_path: ./outputs/cross_cvae/mujoco/mujoco_eval.pt
+  save_full_rollout: false
+  video_dir: ./outputs/cross_cvae/mujoco/videos
+  urdf_patch_dir: ./outputs/cross_cvae/mujoco/urdf_patches
+
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}_mujoco_cross_cvae
+  job:
+    chdir: false

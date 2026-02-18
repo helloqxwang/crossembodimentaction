@@ -15,6 +15,17 @@
             }
         },
         {
+            "name": "Current File Spider",
+            "python": "/home/qianxu/Project/spider/.venv/bin/python",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal",
+            "env": {
+                "WANDB_MODE": "disabled"
+            }
+        },
+        {
             "name": "SDF Samples Analytical",
             "type": "debugpy",
             "request": "launch",

@@ -1,0 +1,23 @@
+defaults:
+  - _self_
+
+visualization:
+  results_path: ./outputs/cross_cvae/validation/generated_grasps.pt
+  dro_root: ../DRO-Grasp  # null -> read from results meta
+  robot_names: null  # null -> all robots in result file
+  max_samples: 500  # -1 means all
+
+  host: 127.0.0.1
+  port: 8080
+  initial_display_mode: 2  # 0=pred, 1=gt, 2=both
+
+  object_opacity: 1.0
+  hand_opacity: 0.8
+  pred_color: [102, 192, 255]
+  gt_color: [255, 180, 80]
+
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}_visualize_cross_cvae
+  job:
+    chdir: false

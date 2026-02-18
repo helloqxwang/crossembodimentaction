@@ -1,0 +1,57 @@
+defaults:
+  - _self_
+
+seed: 42
+
+experiment:
+  name: cross_embodiment_cvae_mvp
+
+dataset:
+  # Path to DRO-Grasp root directory.
+  dro_root: ../DRO-Grasp
+  robot_names:
+    - allegro
+    - barrett
+    - ezgripper
+    - shadowhand
+  num_points: 512
+  batch_size: 64
+  val_batch_size: 128
+  num_workers: 8
+  pin_memory: true
+  drop_last: true
+
+model:
+  dgcnn_k: 20
+  object_emb_dim: 256
+  embodiment_dim: 8
+  latent_dim: 32
+  encoder_hidden_dims: [512, 256]
+  decoder_hidden_dims: [256, 256]
+
+training:
+  device: cuda
+  epochs: 100
+  lr: 1e-4
+  weight_decay: 0.0
+  recon_weight: 1.0
+  kl_weight: 1e-3
+  grad_clip_norm: 1.0
+  log_every: 20
+  max_train_batches: -1
+  max_val_batches: -1
+  save_every_n_epoch: 10
+  save_dir: ./checkpoints/cross_embodiment_cvae_mvp
+
+wandb:
+  enabled: true
+  project: action_repr
+  entity: null
+  name: cross-embodiment-cvae-mvp
+  mode: online
+
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}_cross_cvae
+  job:
+    chdir: false

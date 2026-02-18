@@ -1,4 +1,4 @@
-test_instance_name: &name config_mlp
+test_instance_name: &name config_siren
 
 defaults:
   - conf_siren@_global_: *name
@@ -17,18 +17,23 @@ data:
 
 validation:
   device: cuda
-  checkpoint_dir: ./checkpoints/mfk_mlp
-  checkpoint_epoch: 310
+  checkpoint_dir: ./checkpoints/mfk_siren
+  checkpoint_epoch: 470
   save_mesh_dir: ./outputs/val_meshes
   output_dir: ./outputs/validation
   max_mesh_per_batch: 2
+  attention:
+    enabled: true
+    output_dir: ./outputs/validation/attention
+    sample_idx: 0
+    max_batches: 1
   mesh:
     N: 256
     max_batch: 262144
     offset: null
     scale: null
   visualize:
-    enable: True
+    enable: true
     port: 8080
     gt_mesh_template: null  # e.g. "${data.data_source}/chain_samples/chain_{class_idx}_{instance_idx}/mesh.ply"
     show_pred_only: false

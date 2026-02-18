@@ -1,0 +1,5 @@
+{
+  "robot_name": "spider/schunk/schunk_hand_right_6dof",
+  "robot_path": "assets/spider_robots/schunk/schunk_hand_right_6dof.urdf",
+  "links": {}
+}

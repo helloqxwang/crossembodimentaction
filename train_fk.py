@@ -205,34 +205,28 @@ def decoder_forward(
     decoder_out = decoder(decoder_in.view(B * N, -1))
     return decoder_out.view(B, N, -1)
 
-def inference(
+
+def build_token_tensor(
     batch: Dict[str, torch.Tensor],
     models: Dict[str, torch.nn.Module],
     cfg: DictConfig,
-    device: torch.device = torch.device("cpu"),
-    coords_override: torch.Tensor | None = None,
-    return_link_tokens: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor] | Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    device: torch.device,
+) -> Tuple[torch.Tensor, torch.Tensor]:
     joint_encoder = models["joint_encoder"]
     link_encoder = models["link_encoder"]
     joint_value_encoder = models["joint_value_encoder"]
-    transformer = models["transformer"]
-    # aggregator = models["aggregator"]
-    decoder = models["decoder"]
 
-    sdf_samples = batch["sdf_samples"].to(device)
     chain_q = batch["chain_q"].to(device)  # (B, L-1)
     if cfg.models.link_encoder.compact_repr:
-        link_features = batch['link_features'].to(device)  # (B, L, 4)
+        link_features = batch["link_features"].to(device)  # (B, L, 4)
     else:
         link_features = batch["link_bps_scdistances"].to(device)  # (B, L, 256 * 4)
     joint_features = batch["joint_features"].to(device)  # (B, L-1, 9)
     mask = batch["mask"].to(device)  # (B, 3*L-2)
-    links_mask = batch["link_mask"].to(device)  # (B, L)
 
     joint_fts = joint_encoder(joint_features)
-    link_fts = link_encoder(link_features)             # (B, L, D)
-    joint_vals = joint_value_encoder(chain_q)          # (B, L-1, D)
+    link_fts = link_encoder(link_features)  # (B, L, D)
+    joint_vals = joint_value_encoder(chain_q)  # (B, L-1, D)
 
     max_num_links = link_features.size(1)
     tokens = []
@@ -244,6 +238,24 @@ def inference(
 
     token_tensor = torch.stack(tokens, dim=1)  # (B, T, D)
     key_padding_mask = ~mask  # transformer expects True for padding
+    return token_tensor, key_padding_mask
+
+def inference(
+    batch: Dict[str, torch.Tensor],
+    models: Dict[str, torch.nn.Module],
+    cfg: DictConfig,
+    device: torch.device = torch.device("cpu"),
+    coords_override: torch.Tensor | None = None,
+    return_link_tokens: bool = False,
+) -> Tuple[torch.Tensor, torch.Tensor] | Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    transformer = models["transformer"]
+    # aggregator = models["aggregator"]
+    decoder = models["decoder"]
+
+    sdf_samples = batch["sdf_samples"].to(device)
+    links_mask = batch["link_mask"].to(device)  # (B, L)
+
+    token_tensor, key_padding_mask = build_token_tensor(batch, models, cfg, device)
 
     transformer_out = transformer(
         token_tensor,

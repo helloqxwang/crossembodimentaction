@@ -1,0 +1,338 @@
+{
+  "dro/allegro/allegro_hand_left": {
+    "name": "dro/allegro/allegro_hand_left",
+    "format": "urdf",
+    "path": "dro_urdf_robot/allegro/allegro_hand_left.urdf",
+    "source": "dro"
+  },
+  "dro/allegro/allegro_hand_left_extended": {
+    "name": "dro/allegro/allegro_hand_left_extended",
+    "format": "urdf",
+    "path": "dro_urdf_robot/allegro/allegro_hand_left_extended.urdf",
+    "source": "dro"
+  },
+  "dro/barrett/model": {
+    "name": "dro/barrett/model",
+    "format": "urdf",
+    "path": "dro_urdf_robot/barrett/model.urdf",
+    "source": "dro"
+  },
+  "dro/barrett/model_extended": {
+    "name": "dro/barrett/model_extended",
+    "format": "urdf",
+    "path": "dro_urdf_robot/barrett/model_extended.urdf",
+    "source": "dro"
+  },
+  "dro/ezgripper/ezgripper": {
+    "name": "dro/ezgripper/ezgripper",
+    "format": "urdf",
+    "path": "dro_urdf_robot/ezgripper/ezgripper.urdf",
+    "source": "dro"
+  },
+  "dro/ezgripper/ezgripper_extended": {
+    "name": "dro/ezgripper/ezgripper_extended",
+    "format": "urdf",
+    "path": "dro_urdf_robot/ezgripper/ezgripper_extended.urdf",
+    "source": "dro"
+  },
+  "dro/leaphand/leap_hand_right": {
+    "name": "dro/leaphand/leap_hand_right",
+    "format": "urdf",
+    "path": "dro_urdf_robot/leaphand/leap_hand_right.urdf",
+    "source": "dro"
+  },
+  "dro/leaphand/leap_hand_right_extended": {
+    "name": "dro/leaphand/leap_hand_right_extended",
+    "format": "urdf",
+    "path": "dro_urdf_robot/leaphand/leap_hand_right_extended.urdf",
+    "source": "dro"
+  },
+  "dro/shadowhand/shadow_hand_right": {
+    "name": "dro/shadowhand/shadow_hand_right",
+    "format": "urdf",
+    "path": "dro_urdf_robot/shadowhand/shadow_hand_right.urdf",
+    "source": "dro"
+  },
+  "dro/shadowhand/shadow_hand_right_extended": {
+    "name": "dro/shadowhand/shadow_hand_right_extended",
+    "format": "urdf",
+    "path": "dro_urdf_robot/shadowhand/shadow_hand_right_extended.urdf",
+    "source": "dro"
+  },
+  "dro/urdf/robotiq_3finger_description": {
+    "name": "dro/urdf/robotiq_3finger_description",
+    "format": "urdf",
+    "path": "dro_urdf_robot/robotiq_3finger/urdf/robotiq_3finger_description.urdf",
+    "source": "dro"
+  },
+  "dro/urdf/robotiq_3finger_description_extended": {
+    "name": "dro/urdf/robotiq_3finger_description_extended",
+    "format": "urdf",
+    "path": "dro_urdf_robot/robotiq_3finger/urdf/robotiq_3finger_description_extended.urdf",
+    "source": "dro"
+  },
+  "spider/ability/ability_hand_left_6dof": {
+    "name": "spider/ability/ability_hand_left_6dof",
+    "format": "urdf",
+    "path": "spider_robots/ability/ability_hand_left_6dof.urdf",
+    "source": "spider"
+  },
+  "spider/ability/ability_hand_right_6dof": {
+    "name": "spider/ability/ability_hand_right_6dof",
+    "format": "urdf",
+    "path": "spider_robots/ability/ability_hand_right_6dof.urdf",
+    "source": "spider"
+  },
+  "spider/ability/left": {
+    "name": "spider/ability/left",
+    "format": "xml",
+    "path": "spider_robots/ability/left.xml",
+    "source": "spider"
+  },
+  "spider/ability/right": {
+    "name": "spider/ability/right",
+    "format": "xml",
+    "path": "spider_robots/ability/right.xml",
+    "source": "spider"
+  },
+  "spider/allegro/left": {
+    "name": "spider/allegro/left",
+    "format": "xml",
+    "path": "spider_robots/allegro/left.xml",
+    "source": "spider"
+  },
+  "spider/allegro/right": {
+    "name": "spider/allegro/right",
+    "format": "xml",
+    "path": "spider_robots/allegro/right.xml",
+    "source": "spider"
+  },
+  "spider/booster_t1/T1_locomotion": {
+    "name": "spider/booster_t1/T1_locomotion",
+    "format": "xml",
+    "path": "spider_robots/booster_t1/T1_locomotion.xml",
+    "source": "spider"
+  },
+  "spider/booster_t1/T1_serial": {
+    "name": "spider/booster_t1/T1_serial",
+    "format": "xml",
+    "path": "spider_robots/booster_t1/T1_serial.xml",
+    "source": "spider"
+  },
+  "spider/booster_t1/robot": {
+    "name": "spider/booster_t1/robot",
+    "format": "xml",
+    "path": "spider_robots/booster_t1/robot.xml",
+    "source": "spider"
+  },
+  "spider/booster_t1/scene": {
+    "name": "spider/booster_t1/scene",
+    "format": "xml",
+    "path": "spider_robots/booster_t1/scene.xml",
+    "source": "spider"
+  },
+  "spider/fourier_n1/n1_mocap": {
+    "name": "spider/fourier_n1/n1_mocap",
+    "format": "xml",
+    "path": "spider_robots/fourier_n1/n1_mocap.xml",
+    "source": "spider"
+  },
+  "spider/fourier_n1/robot": {
+    "name": "spider/fourier_n1/robot",
+    "format": "xml",
+    "path": "spider_robots/fourier_n1/robot.xml",
+    "source": "spider"
+  },
+  "spider/fourier_n1/scene": {
+    "name": "spider/fourier_n1/scene",
+    "format": "xml",
+    "path": "spider_robots/fourier_n1/scene.xml",
+    "source": "spider"
+  },
+  "spider/inspire/left": {
+    "name": "spider/inspire/left",
+    "format": "xml",
+    "path": "spider_robots/inspire/left.xml",
+    "source": "spider"
+  },
+  "spider/inspire/right": {
+    "name": "spider/inspire/right",
+    "format": "xml",
+    "path": "spider_robots/inspire/right.xml",
+    "source": "spider"
+  },
+  "spider/mano/left": {
+    "name": "spider/mano/left",
+    "format": "xml",
+    "path": "spider_robots/mano/left.xml",
+    "source": "spider"
+  },
+  "spider/mano/right": {
+    "name": "spider/mano/right",
+    "format": "xml",
+    "path": "spider_robots/mano/right.xml",
+    "source": "spider"
+  },
+  "spider/metahand/left": {
+    "name": "spider/metahand/left",
+    "format": "xml",
+    "path": "spider_robots/metahand/left.xml",
+    "source": "spider"
+  },
+  "spider/metahand/right": {
+    "name": "spider/metahand/right",
+    "format": "xml",
+    "path": "spider_robots/metahand/right.xml",
+    "source": "spider"
+  },
+  "spider/schunk/left": {
+    "name": "spider/schunk/left",
+    "format": "xml",
+    "path": "spider_robots/schunk/left.xml",
+    "source": "spider"
+  },
+  "spider/schunk/right": {
+    "name": "spider/schunk/right",
+    "format": "xml",
+    "path": "spider_robots/schunk/right.xml",
+    "source": "spider"
+  },
+  "spider/schunk/schunk_hand_left_6dof": {
+    "name": "spider/schunk/schunk_hand_left_6dof",
+    "format": "urdf",
+    "path": "spider_robots/schunk/schunk_hand_left_6dof.urdf",
+    "source": "spider"
+  },
+  "spider/schunk/schunk_hand_right_6dof": {
+    "name": "spider/schunk/schunk_hand_right_6dof",
+    "format": "urdf",
+    "path": "spider_robots/schunk/schunk_hand_right_6dof.urdf",
+    "source": "spider"
+  },
+  "spider/unitree_g1/g1_custom_collision_29dof": {
+    "name": "spider/unitree_g1/g1_custom_collision_29dof",
+    "format": "urdf",
+    "path": "spider_robots/unitree_g1/g1_custom_collision_29dof.urdf",
+    "source": "spider"
+  },
+  "spider/unitree_g1/g1_mocap_29dof": {
+    "name": "spider/unitree_g1/g1_mocap_29dof",
+    "format": "xml",
+    "path": "spider_robots/unitree_g1/g1_mocap_29dof.xml",
+    "source": "spider"
+  },
+  "spider/unitree_g1/g1_mocap_29dof_with_hands": {
+    "name": "spider/unitree_g1/g1_mocap_29dof_with_hands",
+    "format": "xml",
+    "path": "spider_robots/unitree_g1/g1_mocap_29dof_with_hands.xml",
+    "source": "spider"
+  },
+  "spider/unitree_g1/robot": {
+    "name": "spider/unitree_g1/robot",
+    "format": "xml",
+    "path": "spider_robots/unitree_g1/robot.xml",
+    "source": "spider"
+  },
+  "spider/unitree_g1/scene": {
+    "name": "spider/unitree_g1/scene",
+    "format": "xml",
+    "path": "spider_robots/unitree_g1/scene.xml",
+    "source": "spider"
+  },
+  "spider/unitree_g1/scene_simple": {
+    "name": "spider/unitree_g1/scene_simple",
+    "format": "xml",
+    "path": "spider_robots/unitree_g1/scene_simple.xml",
+    "source": "spider"
+  },
+  "spider/unitree_g1/scene_soft": {
+    "name": "spider/unitree_g1/scene_soft",
+    "format": "xml",
+    "path": "spider_robots/unitree_g1/scene_soft.xml",
+    "source": "spider"
+  },
+  "spider/unitree_h1_2/h1_2": {
+    "name": "spider/unitree_h1_2/h1_2",
+    "format": "xml",
+    "path": "spider_robots/unitree_h1_2/h1_2.xml",
+    "source": "spider"
+  },
+  "spider/unitree_h1_2/h1_2_handless": {
+    "name": "spider/unitree_h1_2/h1_2_handless",
+    "format": "xml",
+    "path": "spider_robots/unitree_h1_2/h1_2_handless.xml",
+    "source": "spider"
+  },
+  "spider/unitree_h1_2/robot": {
+    "name": "spider/unitree_h1_2/robot",
+    "format": "xml",
+    "path": "spider_robots/unitree_h1_2/robot.xml",
+    "source": "spider"
+  },
+  "spider/unitree_h1_2/robot_hand": {
+    "name": "spider/unitree_h1_2/robot_hand",
+    "format": "xml",
+    "path": "spider_robots/unitree_h1_2/robot_hand.xml",
+    "source": "spider"
+  },
+  "spider/unitree_h1_2/scene": {
+    "name": "spider/unitree_h1_2/scene",
+    "format": "xml",
+    "path": "spider_robots/unitree_h1_2/scene.xml",
+    "source": "spider"
+  },
+  "spider/unitree_h1_2/scene_hand": {
+    "name": "spider/unitree_h1_2/scene_hand",
+    "format": "xml",
+    "path": "spider_robots/unitree_h1_2/scene_hand.xml",
+    "source": "spider"
+  },
+  "spider/xhand/left": {
+    "name": "spider/xhand/left",
+    "format": "xml",
+    "path": "spider_robots/xhand/left.xml",
+    "source": "spider"
+  },
+  "spider/xhand/right": {
+    "name": "spider/xhand/right",
+    "format": "xml",
+    "path": "spider_robots/xhand/right.xml",
+    "source": "spider"
+  },
+  "spider/xhand/xhand_left": {
+    "name": "spider/xhand/xhand_left",
+    "format": "urdf",
+    "path": "spider_robots/xhand/xhand_left.urdf",
+    "source": "spider"
+  },
+  "spider/xhand/xhand_left_6dof": {
+    "name": "spider/xhand/xhand_left_6dof",
+    "format": "urdf",
+    "path": "spider_robots/xhand/xhand_left_6dof.urdf",
+    "source": "spider"
+  },
+  "spider/xhand/xhand_left_copy": {
+    "name": "spider/xhand/xhand_left_copy",
+    "format": "urdf",
+    "path": "spider_robots/xhand/xhand_left_copy.urdf",
+    "source": "spider"
+  },
+  "spider/xhand/xhand_right": {
+    "name": "spider/xhand/xhand_right",
+    "format": "urdf",
+    "path": "spider_robots/xhand/xhand_right.urdf",
+    "source": "spider"
+  },
+  "spider/xhand/xhand_right_6dof": {
+    "name": "spider/xhand/xhand_right_6dof",
+    "format": "urdf",
+    "path": "spider_robots/xhand/xhand_right_6dof.urdf",
+    "source": "spider"
+  },
+  "spider/xhand/xhand_right_copy": {
+    "name": "spider/xhand/xhand_right_copy",
+    "format": "urdf",
+    "path": "spider_robots/xhand/xhand_right_copy.urdf",
+    "source": "spider"
+  }
+}

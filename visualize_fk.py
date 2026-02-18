@@ -13,13 +13,18 @@ from tqdm import tqdm
 
 from data_process.dataset import get_dataloader
 from data_process.visualize_samples import visualize_sdf_points_plotly
-from train_fk import build_models, inference
+from train_fk import build_models, build_token_tensor, inference
 import time
 import numpy as np
 import plyfile
 import skimage.measure
 from robot_model.chain_model import ChainModel
-from visualize_ik import visualize_meshes
+from visualize_ik import (
+    _collect_attention_maps,
+    _save_attention_plots,
+    _token_labels,
+    visualize_meshes,
+)
 
 def convert_sdf_samples_to_ply(
     pytorch_3d_sdf_tensor,
@@ -252,6 +257,7 @@ def _validate_once(
     mesh_counter: int,
     chain_error_dict: Dict,
     sample_vis_state: Dict,
+    attention_state: Dict,
 ) -> int:
     loss_fn = torch.nn.L1Loss(reduction='none')
     with torch.no_grad():
@@ -265,6 +271,31 @@ def _validate_once(
             if cls not in chain_error_dict:
                 chain_error_dict[cls] = []
             chain_error_dict[cls].append(loss_vals[i].item())
+
+    attn_cfg = getattr(cfg.validation, "attention", None)
+    if attn_cfg and getattr(attn_cfg, "enabled", False):
+        max_batches = int(getattr(attn_cfg, "max_batches", 1))
+        if attention_state.get("count", 0) < max_batches:
+            token_tensor, key_padding_mask = build_token_tensor(batch, models, cfg, device)
+            attn_maps = _collect_attention_maps(
+                models["transformer"],
+                token_tensor,
+                key_padding_mask=key_padding_mask,
+                causal=False,
+            )
+            out_dir = to_absolute_path(
+                getattr(attn_cfg, "output_dir", "./outputs/validation/attention")
+            )
+            sample_idx = int(getattr(attn_cfg, "sample_idx", 0))
+            sample_idx = min(sample_idx, max(int(token_tensor.size(0)) - 1, 0))
+            token_labels = _token_labels(cfg.data.max_num_links, token_tensor.size(1))
+            _save_attention_plots(
+                attn_maps,
+                out_dir=out_dir,
+                sample_idx=sample_idx,
+                token_labels=token_labels,
+            )
+            attention_state["count"] = attention_state.get("count", 0) + 1
 
     vis_cfg = getattr(cfg.validation, "sample_visualize", None)
     if vis_cfg and getattr(vis_cfg, "enable", False):
@@ -594,8 +625,18 @@ def main(cfg: DictConfig) -> None:
         "count": 0,
         "rng": np.random.default_rng(getattr(vis_cfg, "seed", 0) if vis_cfg else 0),
     }
+    attention_state = {"count": 0}
     for b_idx, batch in enumerate(tqdm(val_loader, desc="Validating", leave=False)):
-        mesh_counter = _validate_once(cfg, models, device, batch, mesh_counter, chain_error_dict, sample_vis_state)
+        mesh_counter = _validate_once(
+            cfg,
+            models,
+            device,
+            batch,
+            mesh_counter,
+            chain_error_dict,
+            sample_vis_state,
+            attention_state,
+        )
 
     length_errors, boxes_per_length = summarize_errors_by_length_and_boxes(
         chain_error_dict,

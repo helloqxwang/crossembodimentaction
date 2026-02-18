@@ -1,0 +1,5 @@
+{
+  "robot_name": "spider/xhand/xhand_right",
+  "robot_path": "assets/spider_robots/xhand/xhand_right.urdf",
+  "links": {}
+}
