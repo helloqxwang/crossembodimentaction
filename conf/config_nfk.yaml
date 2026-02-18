@@ -1,0 +1,50 @@
+defaults:
+  - _self_
+
+data:
+  assets_dir: ./assets
+  robot_list_file: ""
+  robot_list_key: right_hands
+  dataset_device: cpu
+  link_num_points: 512
+  box_fit_override: false
+  train_dataset_size: 20000
+  val_dataset_size: 4000
+  batch_size: 32
+  val_batch_size: 32
+  shuffle: true
+  num_workers: 0
+  drop_last: true
+
+model:
+  pair_dim: 6
+  token_dim: 128
+  model_dim: 128
+  enc_num_heads: 4
+  enc_num_layers: 2
+  att_num_heads: 4
+  att_num_layers: 2
+  codebook_size: 32
+  vq_beta: 0.25
+  dropout: 0.1
+  attn_dropout: 0.0
+  activation: gelu
+  max_points: 128
+
+loss:
+  w_pos: 1.0
+  w_nrm: 1.0
+  w_vq: 1.0
+
+training:
+  seed: 0
+  device: cuda
+  lr: 1e-4
+  num_epochs: 200
+  save_interval: 5
+  val_interval: 1
+  wandb:
+    enabled: true
+    project: action_repr
+    run_name: nfk_setvq
+    save_dir: ./checkpoints
