@@ -62,6 +62,15 @@ python3 contact_gen/visualize_surface_graph.py \
   --vis-port 8092
 ```
 
+Unified entry (same functionality in `robot_model/robot_model_vis.py`):
+
+```bash
+cd /home/qianxu/Project/crossembodimentaction
+python3 robot_model/robot_model_vis.py surface_graph \
+  --num-surface-points 512 \
+  --vis-port 8092
+```
+
 ## 5) Generate Random Contact Masks (Hydra, data-less runtime)
 
 ```bash

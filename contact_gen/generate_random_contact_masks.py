@@ -31,6 +31,19 @@ def _to_int_list(x: Any) -> list[int]:
     return [int(x)]
 
 
+def _compute_sample_count_map(robot_names: list[str], sample_count: int, mode: str) -> dict[str, int]:
+    n = len(robot_names)
+    if n <= 0:
+        return {}
+    if mode == "total":
+        base = int(sample_count) // n
+        rem = int(sample_count) % n
+        return {name: int(base + (1 if i < rem else 0)) for i, name in enumerate(robot_names)}
+    if mode == "per_robot":
+        return {name: int(sample_count) for name in robot_names}
+    raise ValueError(f"Invalid sample_count_mode: {mode}. Expected 'per_robot' or 'total'.")
+
+
 @hydra.main(config_path=".", config_name="config_generate_random_contact_masks", version_base="1.3")
 def main(cfg: DictConfig) -> None:
     torch.manual_seed(int(cfg.seed))
@@ -49,6 +62,19 @@ def main(cfg: DictConfig) -> None:
 
     robot_names_cfg = list(cfg.robot_names) if cfg.robot_names is not None else []
     robot_names = robot_names_cfg if len(robot_names_cfg) > 0 else sorted(hparams_robots.keys())
+    sample_count_mode = str(getattr(cfg, "sample_count_mode", "per_robot"))
+    sample_count_map = _compute_sample_count_map(
+        robot_names=robot_names,
+        sample_count=int(cfg.sample_count),
+        mode=sample_count_mode,
+    )
+    total_jobs = int(sum(sample_count_map.values()))
+    print(
+        f"[sampling] mode={sample_count_mode} requested={int(cfg.sample_count)} "
+        f"robots={len(robot_names)} total_masks_to_generate={total_jobs}"
+    )
+    for r in robot_names:
+        print(f"[sampling] {r}: {sample_count_map[r]} masks")
 
     output_dir = _abs_path(str(cfg.output_dir))
     os.makedirs(output_dir, exist_ok=True)
@@ -98,7 +124,7 @@ def main(cfg: DictConfig) -> None:
         sampled_masks_list = []
         sampled_q_list = []
         vis_samples = []
-        remain = int(cfg.sample_count)
+        remain = int(sample_count_map[robot_name])
         chunk = int(max(1, int(cfg.sample_chunk)))
         vis_budget = int(max(0, int(cfg.save_visualization_samples)))
         pbar = tqdm(total=remain, desc=f"sample_masks:{robot_name}")
@@ -158,7 +184,9 @@ def main(cfg: DictConfig) -> None:
                 "threshold": float(cfg.threshold),
                 "align_exp_scale": float(cfg.align_exp_scale),
                 "sigmoid_scale": float(cfg.sigmoid_scale),
-                "sample_count": int(cfg.sample_count),
+                "sample_count_requested": int(cfg.sample_count),
+                "sample_count_mode": sample_count_mode,
+                "sample_count_effective": int(sample_count_map[robot_name]),
                 "component_range_fit": [int(comp_lo_fit), int(comp_hi_fit)],
                 "component_range_used": [int(comp_lo), int(comp_hi)],
                 "surface_template_hash": model_template_hash,

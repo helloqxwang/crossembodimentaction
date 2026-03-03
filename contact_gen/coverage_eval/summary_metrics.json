@@ -1,0 +1,57 @@
+{
+  "allegro": {
+    "count_wasserstein": 14.526776313781738,
+    "occupancy_js_divergence": 0.2946696877479553,
+    "coverage_iou_ge_03": 0.3167082369327545,
+    "coverage_iou_ge_05": 0.00041562761180102825,
+    "coverage_iou_ge_07": 0.0,
+    "median_best_iou": 0.2786885201931,
+    "one_nn_separability_acc": 0.8479999899864197,
+    "real_count_mean": 57.39692306518555,
+    "sampled_count_mean": 71.92369842529297
+  },
+  "barrett": {
+    "count_wasserstein": 18.83504295349121,
+    "occupancy_js_divergence": 0.34282559156417847,
+    "coverage_iou_ge_03": 0.4355373978614807,
+    "coverage_iou_ge_05": 0.0001276487164432183,
+    "coverage_iou_ge_07": 0.0,
+    "median_best_iou": 0.29203540086746216,
+    "one_nn_separability_acc": 0.9097499847412109,
+    "real_count_mean": 59.96055603027344,
+    "sampled_count_mean": 78.79560089111328
+  },
+  "ezgripper": {
+    "count_wasserstein": 13.470762252807617,
+    "occupancy_js_divergence": 0.43348562717437744,
+    "coverage_iou_ge_03": 0.9496130347251892,
+    "coverage_iou_ge_05": 0.05450354143977165,
+    "coverage_iou_ge_07": 0.0,
+    "median_best_iou": 0.402515709400177,
+    "one_nn_separability_acc": 0.956250011920929,
+    "real_count_mean": 92.04330444335938,
+    "sampled_count_mean": 85.54209899902344
+  },
+  "robotiq_3finger": {
+    "count_wasserstein": 2.311467170715332,
+    "occupancy_js_divergence": 0.4066704511642456,
+    "coverage_iou_ge_03": 0.6041666865348816,
+    "coverage_iou_ge_05": 0.0381944440305233,
+    "coverage_iou_ge_07": 0.0,
+    "median_best_iou": 0.31578946113586426,
+    "one_nn_separability_acc": 0.8767458200454712,
+    "real_count_mean": 22.057870864868164,
+    "sampled_count_mean": 19.772199630737305
+  },
+  "shadowhand": {
+    "count_wasserstein": 26.586380004882812,
+    "occupancy_js_divergence": 0.2747511863708496,
+    "coverage_iou_ge_03": 0.3825516402721405,
+    "coverage_iou_ge_05": 0.0,
+    "coverage_iou_ge_07": 0.0,
+    "median_best_iou": 0.28723403811454773,
+    "one_nn_separability_acc": 0.8495000004768372,
+    "real_count_mean": 73.73422241210938,
+    "sampled_count_mean": 100.32060241699219
+  }
+}
