@@ -5,3 +5,6 @@ outputs/
 checkpoints/
 __pycache__/
 */__pycache__/
+*pt
+*.pt
+*.pth

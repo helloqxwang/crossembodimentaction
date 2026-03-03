@@ -32,6 +32,9 @@ def build_model(cfg: DictConfig, device: torch.device) -> NFKModel:
         att_num_layers=cfg.model.att_num_layers,
         codebook_size=cfg.model.codebook_size,
         vq_beta=cfg.model.vq_beta,
+        usage_temperature=float(getattr(cfg.model, "usage_temperature", 0.5)),
+        usage_ema_decay=float(getattr(cfg.model, "usage_ema_decay", 0.99)),
+        usage_eps=float(getattr(cfg.model, "usage_eps", 1e-8)),
         dropout=cfg.model.dropout,
         attn_dropout=cfg.model.attn_dropout,
         activation=cfg.model.activation,
@@ -48,6 +51,24 @@ def move_batch_to_device(batch: Dict[str, torch.Tensor | list], device: torch.de
         else:
             out[key] = val
     return out
+
+
+def _usage_kl_weight(cfg: DictConfig, global_step: int) -> float:
+    max_w = float(getattr(cfg.loss, "w_usage_kl", 0.0))
+    if max_w <= 0.0:
+        return 0.0
+
+    warmup_steps = int(getattr(cfg.loss, "usage_kl_warmup_steps", 0))
+    warmup_start = int(getattr(cfg.loss, "usage_kl_warmup_start_step", 0))
+
+    if global_step < warmup_start:
+        return 0.0
+    if warmup_steps <= 0:
+        return max_w
+
+    progress = float(global_step - warmup_start) / float(max(warmup_steps, 1))
+    progress = max(0.0, min(1.0, progress))
+    return max_w * progress
 
 
 def train_one_epoch(
@@ -79,7 +100,12 @@ def train_one_epoch(
             w_pos=float(cfg.loss.w_pos),
             w_nrm=float(cfg.loss.w_nrm),
         )
-        loss_total = recon_terms["loss_recon"] + float(cfg.loss.w_vq) * outputs["vq_loss"]
+        usage_weight = _usage_kl_weight(cfg, global_step)
+        loss_total = (
+            recon_terms["loss_recon"]
+            + float(cfg.loss.w_vq) * outputs["vq_loss"]
+            + usage_weight * outputs["usage_kl_loss"]
+        )
         loss_total.backward()
         optimizer.step()
 
@@ -93,6 +119,9 @@ def train_one_epoch(
                     "train/loss_vq": float(outputs["vq_loss"].item()),
                     "train/loss_codebook": float(outputs["codebook_loss"].item()),
                     "train/loss_commit": float(outputs["commit_loss"].item()),
+                    "train/loss_usage_kl": float(outputs["usage_kl_loss"].item()),
+                    "train/usage_kl_weight": float(usage_weight),
+                    "train/usage_entropy": float(outputs["usage_entropy"].item()),
                     "train/perplexity": float(outputs["perplexity"].item()),
                     "train/active_codes": float(outputs["active_codes"].item()),
                     "epoch": epoch,
@@ -122,9 +151,12 @@ def validate(
         "val/loss_pos": 0.0,
         "val/loss_nrm": 0.0,
         "val/loss_vq": 0.0,
+        "val/loss_usage_kl": 0.0,
+        "val/usage_entropy": 0.0,
         "val/perplexity": 0.0,
         "val/active_codes": 0.0,
     }
+    usage_weight = _usage_kl_weight(cfg, int(step_tag))
     n_batches = 0
     for batch in tqdm(loader, desc=f"Val {epoch+1}"):
         batch = move_batch_to_device(batch, device)
@@ -140,13 +172,19 @@ def validate(
             w_pos=float(cfg.loss.w_pos),
             w_nrm=float(cfg.loss.w_nrm),
         )
-        loss_total = recon_terms["loss_recon"] + float(cfg.loss.w_vq) * outputs["vq_loss"]
+        loss_total = (
+            recon_terms["loss_recon"]
+            + float(cfg.loss.w_vq) * outputs["vq_loss"]
+            + usage_weight * outputs["usage_kl_loss"]
+        )
 
         stats["val/loss_total"] += float(loss_total.item())
         stats["val/loss_recon"] += float(recon_terms["loss_recon"].item())
         stats["val/loss_pos"] += float(recon_terms["loss_recon_pos"].item())
         stats["val/loss_nrm"] += float(recon_terms["loss_recon_nrm"].item())
         stats["val/loss_vq"] += float(outputs["vq_loss"].item())
+        stats["val/loss_usage_kl"] += float(outputs["usage_kl_loss"].item())
+        stats["val/usage_entropy"] += float(outputs["usage_entropy"].item())
         stats["val/perplexity"] += float(outputs["perplexity"].item())
         stats["val/active_codes"] += float(outputs["active_codes"].item())
         n_batches += 1
@@ -154,6 +192,7 @@ def validate(
     if n_batches > 0:
         for key in stats.keys():
             stats[key] /= n_batches
+    stats["val/usage_kl_weight"] = float(usage_weight)
 
     if use_wandb:
         payload = dict(stats)

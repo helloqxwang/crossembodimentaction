@@ -1,19 +1,23 @@
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import io
 import json
 import math
 import random
 import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
 import trimesh
 import pytorch_kinematics as pk
+from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation
+from scipy.sparse import coo_matrix
+from scipy.sparse.csgraph import dijkstra
 
 from pytorch3d.ops import sample_farthest_points
 
@@ -21,6 +25,33 @@ from pytorch3d.ops import sample_farthest_points
 ROOT_DIR = Path(__file__).resolve().parents[1]
 DEFAULT_ASSETS_DIR = ROOT_DIR / "assets"
 DEFAULT_MANIPULATOR_LISTS_JSON = DEFAULT_ASSETS_DIR / "manipulator_robot_lists.json"
+
+
+def _stable_int_seed(key: str) -> int:
+    digest = hashlib.sha1(key.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], byteorder="little", signed=False) % (2**31 - 1)
+
+
+@contextlib.contextmanager
+def _temporary_global_seed(seed: int):
+    np_state = np.random.get_state()
+    py_state = random.getstate()
+    torch_state = torch.random.get_rng_state()
+    cuda_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+
+    np.random.seed(int(seed) % (2**32 - 1))
+    random.seed(int(seed))
+    torch.manual_seed(int(seed))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(int(seed))
+    try:
+        yield
+    finally:
+        np.random.set_state(np_state)
+        random.setstate(py_state)
+        torch.random.set_rng_state(torch_state)
+        if cuda_states is not None:
+            torch.cuda.set_rng_state_all(cuda_states)
 
 
 def _build_chain_quiet(urdf_data: bytes | str) -> pk.chain.Chain:
@@ -1040,7 +1071,7 @@ class RobotModel:
         robot_name: str,
         robot_path: Path,
         device: torch.device,
-        link_num_points: int = 512,
+        num_points: int = 512,
     ) -> None:
         self.robot_name = robot_name
         self.robot_path = Path(robot_path)
@@ -1059,7 +1090,11 @@ class RobotModel:
 
         self.pk_chain = chain
         self.dof = len(self.pk_chain.get_joint_parameter_names())
-        self.link_num_points = int(link_num_points)
+        self.joint_orders = [joint.name for joint in self.pk_chain.get_joints()]
+        self.base_translation_indices = self._infer_base_translation_indices()
+        # NOTE: num_points now means whole-hand surface point count.
+        self.link_num_points = int(num_points)
+        self.surface_num_points = int(num_points)
 
         # Keep original-link assets and box-link assets separately.
         self.meshes_original = {k: v.copy() for k, v in meshes.items()}
@@ -1084,17 +1119,502 @@ class RobotModel:
         self.vertices = self.vertices_original
         self.box_fits_default_dir = DEFAULT_ASSETS_DIR / "box_fits"
 
-        self.frame_status = None
+        # Whole-hand surface template (local frame) and graph.
+        self.surface_template_by_link: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
+        self.surface_template_points_local = torch.zeros((0, 3), dtype=torch.float32, device=self.device)
+        self.surface_template_normals_local = torch.zeros((0, 3), dtype=torch.float32, device=self.device)
+        self.surface_template_link_indices = torch.zeros((0,), dtype=torch.long, device=self.device)
+        self.surface_template_points_canonical_world = torch.zeros((0, 3), dtype=torch.float32, device=self.device)
+        self.surface_template_normals_canonical_world = torch.zeros((0, 3), dtype=torch.float32, device=self.device)
+        self.surface_union_mesh_canonical: Optional[trimesh.Trimesh] = None
+        self.surface_graph_neighbors_strict: List[List[int]] = []
+        self.surface_graph_neighbors: List[List[int]] = []
 
-    def _sample_points_from_meshes(self, mesh_dict: Dict[str, trimesh.Trimesh]) -> Dict[str, torch.Tensor]:
-        vertices: Dict[str, torch.Tensor] = {}
-        for link_name, link_mesh in mesh_dict.items():
+        # Contact-mask sampler fitted state.
+        self.contact_mask_sampler_state: Optional[Dict[str, torch.Tensor]] = None
+
+        self.frame_status = None
+        self.surface_template_seed = _stable_int_seed(
+            f"{self.robot_name}|{self.surface_num_points}|surface_template_v2"
+        )
+        with _temporary_global_seed(self.surface_template_seed):
+            self._build_surface_template(num_points=self.surface_num_points)
+        self._build_surface_connectivity_graph()
+
+    def _allocate_points_over_meshes(
+        self,
+        mesh_dict: Dict[str, trimesh.Trimesh],
+        total_points: int,
+    ) -> Dict[str, int]:
+        if total_points <= 0:
+            raise ValueError("total_points must be positive")
+        link_names = list(mesh_dict.keys())
+        if len(link_names) == 0:
+            return {}
+
+        areas = np.array([float(max(mesh_dict[n].area, 1e-8)) for n in link_names], dtype=np.float64)
+        areas = areas / np.clip(areas.sum(), 1e-8, None)
+        raw = areas * float(total_points)
+        counts = np.floor(raw).astype(np.int64)
+        remain = int(total_points - counts.sum())
+        if remain > 0:
+            frac = raw - counts
+            order = np.argsort(-frac)
+            for i in range(remain):
+                counts[order[i % len(order)]] += 1
+
+        return {name: int(count) for name, count in zip(link_names, counts)}
+
+    def _sample_mesh_points_normals(
+        self,
+        mesh: trimesh.Trimesh,
+        count: int,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if count <= 0:
+            empty = torch.zeros((0, 3), dtype=torch.float32, device=self.device)
+            return empty, empty
+
+        try:
+            pts_np, face_idx = mesh.sample(int(count), return_index=True)
+            nrm_np = mesh.face_normals[face_idx]
+            pts = torch.tensor(pts_np, dtype=torch.float32, device=self.device)
+            nrms = torch.tensor(nrm_np, dtype=torch.float32, device=self.device)
+        except Exception:
+            verts = np.asarray(mesh.vertices, dtype=np.float32)
+            if verts.shape[0] == 0:
+                empty = torch.zeros((count, 3), dtype=torch.float32, device=self.device)
+                return empty, empty
+            idx = np.random.randint(0, verts.shape[0], size=(count,))
+            pts = torch.tensor(verts[idx], dtype=torch.float32, device=self.device)
+            nrms = torch.zeros_like(pts)
+
+        nrms = nrms / torch.norm(nrms, dim=1, keepdim=True).clamp_min(1e-8)
+        return pts, nrms
+
+    @staticmethod
+    def _robot_scale(meshes: List[trimesh.Trimesh]) -> float:
+        if len(meshes) == 0:
+            return 0.2
+        mins = []
+        maxs = []
+        for mesh in meshes:
+            if mesh is None or len(mesh.vertices) == 0:
+                continue
+            b = np.asarray(mesh.bounds, dtype=np.float64)
+            mins.append(b[0])
+            maxs.append(b[1])
+        if len(mins) == 0:
+            return 0.2
+        bb_min = np.min(np.stack(mins, axis=0), axis=0)
+        bb_max = np.max(np.stack(maxs, axis=0), axis=0)
+        return float(max(np.linalg.norm(bb_max - bb_min), 1e-3))
+
+    @staticmethod
+    def _surface_proxy_pitch_from_scale(scale: float) -> float:
+        # Use a finer grid to preserve finger gaps and palm geometry.
+        return float(np.clip(scale / 500.0, 0.0002, 0.0008))
+
+    @staticmethod
+    def _to_watertight_proxy_mesh(
+        mesh: trimesh.Trimesh,
+        pitch: float,
+    ) -> trimesh.Trimesh:
+        vg = mesh.voxelized(pitch=float(pitch))
+        try:
+            vg = vg.fill()
+        except Exception:
+            pass
+        proxy = _as_mesh(vg.marching_cubes)
+        if proxy is None or len(proxy.faces) == 0:
+            raise RuntimeError("Failed to create watertight proxy mesh from voxelization.")
+        # In trimesh 4.x, marching_cubes can be returned in voxel index coordinates.
+        # Detect this and map back to world using voxel transform.
+        mesh_diag = float(np.linalg.norm(np.asarray(mesh.bounds[1] - mesh.bounds[0], dtype=np.float64)))
+        proxy_diag = float(np.linalg.norm(np.asarray(proxy.bounds[1] - proxy.bounds[0], dtype=np.float64)))
+        if proxy_diag > 4.0 * max(mesh_diag, 1e-6):
+            proxy = proxy.copy()
+            proxy.apply_transform(vg.transform)
+        proxy = trimesh.Trimesh(
+            vertices=np.asarray(proxy.vertices, dtype=np.float64),
+            faces=np.asarray(proxy.faces, dtype=np.int64),
+            process=True,
+        )
+        if hasattr(trimesh.repair, "fix_normals"):
+            trimesh.repair.fix_normals(proxy)
+        return proxy
+
+    @staticmethod
+    def _orient_watertight_components_outward(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
+        try:
+            comps = list(mesh.split(only_watertight=False))
+        except Exception:
+            comps = []
+        if len(comps) == 0:
+            out = mesh.copy()
+        else:
+            fixed = []
+            for comp in comps:
+                c = comp.copy()
+                try:
+                    vol = float(c.volume)
+                    if np.isfinite(vol) and vol < 0.0:
+                        c.invert()
+                except Exception:
+                    pass
+                fixed.append(c)
+            out = _as_mesh(trimesh.util.concatenate(fixed))
+            if out is None:
+                out = mesh.copy()
+        if hasattr(trimesh.repair, "fix_normals"):
+            trimesh.repair.fix_normals(out)
+        return out
+
+    def _build_boolean_union_mesh(
+        self,
+        meshes_world: List[trimesh.Trimesh],
+        pitch: Optional[float] = None,
+    ) -> trimesh.Trimesh:
+        if len(meshes_world) == 0:
+            raise RuntimeError("Cannot build union mesh from empty mesh list.")
+
+        scale = self._robot_scale(meshes_world)
+        proxy_pitch = float(self._surface_proxy_pitch_from_scale(scale) if pitch is None else pitch)
+
+        proxy_meshes: List[trimesh.Trimesh] = []
+        for mesh in meshes_world:
+            if mesh is None or len(mesh.faces) == 0 or len(mesh.vertices) == 0:
+                continue
             try:
-                points = link_mesh.sample(self.link_num_points)
+                if bool(mesh.is_volume) and bool(mesh.is_watertight):
+                    proxy = mesh.copy()
+                else:
+                    proxy = self._to_watertight_proxy_mesh(mesh=mesh, pitch=proxy_pitch)
             except Exception:
                 continue
-            vertices[link_name] = torch.tensor(points, dtype=torch.float32, device=self.device)
+            if proxy is not None and len(proxy.faces) > 0:
+                proxy_meshes.append(proxy)
+
+        if len(proxy_meshes) == 0:
+            raise RuntimeError(f"Failed to create proxy meshes for robot: {self.robot_name}")
+
+        if len(proxy_meshes) == 1:
+            mesh_union = proxy_meshes[0]
+        else:
+            mesh_union = _as_mesh(trimesh.boolean.union(proxy_meshes, engine="manifold"))
+        if mesh_union is None or len(mesh_union.faces) == 0:
+            raise RuntimeError(f"Failed to build boolean-union mesh for robot: {self.robot_name}")
+        mesh_union = trimesh.Trimesh(
+            vertices=np.asarray(mesh_union.vertices, dtype=np.float64),
+            faces=np.asarray(mesh_union.faces, dtype=np.int64),
+            process=True,
+        )
+        # Ensure final simplified mesh is a clean outer shell.
+        if (not bool(mesh_union.is_watertight)) or (not bool(mesh_union.is_volume)):
+            mesh_union = self._to_watertight_proxy_mesh(mesh=mesh_union, pitch=proxy_pitch)
+        mesh_union = self._orient_watertight_components_outward(mesh_union)
+        return mesh_union
+
+    def _sample_surface_points_normals_from_mesh(
+        self,
+        mesh: trimesh.Trimesh,
+        num_points: int,
+        oversample_ratio: int = 12,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if int(num_points) <= 0:
+            raise ValueError("num_points must be positive.")
+        n_query = int(max(num_points, num_points * max(1, int(oversample_ratio))))
+        try:
+            pts_np, face_idx = mesh.sample(n_query, return_index=True)
+            nrms_np = np.asarray(mesh.face_normals[face_idx], dtype=np.float32)
+        except Exception:
+            verts = np.asarray(mesh.vertices, dtype=np.float32)
+            if verts.shape[0] == 0:
+                raise RuntimeError("Cannot sample surface points from empty union mesh.")
+            rand_idx = np.random.randint(0, verts.shape[0], size=(n_query,))
+            pts_np = verts[rand_idx]
+            nrms_np = np.zeros_like(pts_np, dtype=np.float32)
+
+        pts = torch.tensor(pts_np, dtype=torch.float32, device=self.device)
+        nrms = torch.tensor(nrms_np, dtype=torch.float32, device=self.device)
+        nrms = nrms / torch.norm(nrms, dim=1, keepdim=True).clamp_min(1e-8)
+
+        if int(pts.shape[0]) > int(num_points):
+            _, keep = farthest_point_sampling(pts, int(num_points))
+            keep = keep.long()
+            pts = pts[keep]
+            nrms = nrms[keep]
+        elif int(pts.shape[0]) < int(num_points):
+            extra_n = int(num_points - pts.shape[0])
+            extra_idx = torch.randint(0, int(pts.shape[0]), (extra_n,), device=self.device)
+            pts = torch.cat([pts, pts[extra_idx]], dim=0)
+            nrms = torch.cat([nrms, nrms[extra_idx]], dim=0)
+
+        # Enforce outward normals on watertight simplified mesh.
+        if bool(getattr(mesh, "is_watertight", False)) and int(pts.shape[0]) > 0:
+            try:
+                pts_np = pts.detach().cpu().numpy().astype(np.float64)
+                nrms_np = nrms.detach().cpu().numpy().astype(np.float64)
+                mesh_diag = float(np.linalg.norm(np.asarray(mesh.bounds[1] - mesh.bounds[0], dtype=np.float64)))
+                eps = max(1e-5, 1e-4 * mesh_diag)
+                plus_inside = np.asarray(mesh.contains(pts_np + nrms_np * eps), dtype=bool).reshape(-1)
+                minus_inside = np.asarray(mesh.contains(pts_np - nrms_np * eps), dtype=bool).reshape(-1)
+                flip = plus_inside & (~minus_inside)
+                if bool(np.any(flip)):
+                    nrms_np[flip] *= -1.0
+                    nrms = torch.tensor(nrms_np, dtype=torch.float32, device=self.device)
+            except Exception:
+                pass
+
+        return pts, nrms
+
+    def _assign_union_points_to_links(
+        self,
+        points_world: torch.Tensor,
+        normals_world: torch.Tensor,
+        link_meshes_world: Dict[str, trimesh.Trimesh],
+        link_names: List[str],
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        n_total = int(points_world.shape[0])
+        if n_total == 0:
+            raise RuntimeError("No union points to assign to robot links.")
+
+        query_np = points_world.detach().cpu().numpy().astype(np.float64)
+        dist_stack = np.full((len(link_names), n_total), np.inf, dtype=np.float64)
+        for link_i, link_name in enumerate(link_names):
+            mesh_world = link_meshes_world.get(link_name, None)
+            if mesh_world is None or len(mesh_world.vertices) == 0:
+                continue
+            try:
+                _, dist, _ = trimesh.proximity.closest_point(mesh_world, query_np)
+                d = np.asarray(dist, dtype=np.float64).reshape(-1)
+            except Exception:
+                verts = np.asarray(mesh_world.vertices, dtype=np.float64)
+                if verts.shape[0] == 0:
+                    continue
+                tree = cKDTree(verts)
+                d, _ = tree.query(query_np, k=1)
+                d = np.asarray(d, dtype=np.float64).reshape(-1)
+            if d.shape[0] == n_total:
+                dist_stack[link_i] = d
+
+        if not bool(np.isfinite(dist_stack).any()):
+            raise RuntimeError("Failed to compute link assignment distances for union points.")
+
+        link_idx_np = np.argmin(dist_stack, axis=0).astype(np.int64)
+        link_idx = torch.tensor(link_idx_np, dtype=torch.long, device=self.device)
+
+        points_local = torch.zeros_like(points_world)
+        normals_local = torch.zeros_like(normals_world)
+        for link_i, link_name in enumerate(link_names):
+            sel = link_idx == int(link_i)
+            if not bool(sel.any()):
+                continue
+            if link_name not in self.frame_status:
+                continue
+            tf = self.frame_status[link_name].get_matrix()[0].to(self.device)
+            rot = tf[:3, :3]
+            trans = tf[:3, 3].view(1, 3)
+            points_local[sel] = (points_world[sel] - trans) @ rot
+            normals_local[sel] = normals_world[sel] @ rot
+        normals_local = normals_local / torch.norm(normals_local, dim=1, keepdim=True).clamp_min(1e-8)
+        return points_local, normals_local, link_idx
+
+    def _get_canonical_link_meshes_world(
+        self,
+    ) -> Tuple[List[str], Dict[str, trimesh.Trimesh]]:
+        q_ref = self._zero_base_translation_in_q(self.get_canonical_q().detach().clone())
+        self.update_status(q_ref)
+        link_names = list(self.meshes_original.keys())
+        link_meshes_world: Dict[str, trimesh.Trimesh] = {}
+        for link_name in link_names:
+            if link_name not in self.frame_status:
+                continue
+            mesh_local = self.meshes_original.get(link_name, None)
+            if mesh_local is None or len(mesh_local.faces) == 0:
+                continue
+            tf = self.frame_status[link_name].get_matrix()[0].detach().cpu().numpy()
+            mesh_world = mesh_local.copy()
+            mesh_world.apply_transform(tf)
+            if len(mesh_world.faces) == 0:
+                continue
+            link_meshes_world[link_name] = mesh_world
+        if len(link_meshes_world) == 0:
+            raise RuntimeError(f"Failed to build canonical meshes for robot: {self.robot_name}")
+        return link_names, link_meshes_world
+
+    def _build_surface_template(self, num_points: int) -> None:
+        if int(num_points) <= 0:
+            raise ValueError("num_points must be positive.")
+
+        link_names, link_meshes_world = self._get_canonical_link_meshes_world()
+
+        union_mesh = self._build_boolean_union_mesh(list(link_meshes_world.values()))
+        points_world, normals_world = self._sample_surface_points_normals_from_mesh(
+            mesh=union_mesh,
+            num_points=int(num_points),
+            oversample_ratio=12,
+        )
+        points_local, normals_local, link_idx = self._assign_union_points_to_links(
+            points_world=points_world,
+            normals_world=normals_world,
+            link_meshes_world=link_meshes_world,
+            link_names=link_names,
+        )
+
+        by_link: Dict[str, Tuple[torch.Tensor, torch.Tensor]] = {}
+        for link_i, link_name in enumerate(link_names):
+            mask = link_idx == int(link_i)
+            by_link[link_name] = (points_local[mask], normals_local[mask])
+
+        self.surface_template_by_link = by_link
+        self.surface_template_points_local = points_local
+        self.surface_template_normals_local = normals_local
+        self.surface_template_link_indices = link_idx
+        self.surface_template_points_canonical_world = points_world
+        self.surface_template_normals_canonical_world = normals_world
+        self.surface_union_mesh_canonical = union_mesh
+
+    @staticmethod
+    def _build_strict_surface_graph_from_union_mesh(
+        union_mesh: trimesh.Trimesh,
+        sample_points_world: np.ndarray,
+    ) -> List[List[int]]:
+        n = int(sample_points_world.shape[0])
+        strict_sets = [set() for _ in range(n)]
+        if n <= 1:
+            return [[] for _ in range(n)]
+
+        verts = np.asarray(union_mesh.vertices, dtype=np.float64)
+        edges = np.asarray(union_mesh.edges_unique, dtype=np.int64)
+        if verts.shape[0] == 0 or edges.shape[0] == 0:
+            return [[] for _ in range(n)]
+
+        # Build weighted mesh graph (geodesic graph on simplified surface mesh).
+        e0 = edges[:, 0].astype(np.int64)
+        e1 = edges[:, 1].astype(np.int64)
+        w = np.linalg.norm(verts[e0] - verts[e1], axis=1).astype(np.float64)
+        valid_edge = np.isfinite(w) & (w > 0.0)
+        if not bool(np.any(valid_edge)):
+            return [[] for _ in range(n)]
+        e0 = e0[valid_edge]
+        e1 = e1[valid_edge]
+        w = w[valid_edge]
+
+        rows = np.concatenate([e0, e1], axis=0)
+        cols = np.concatenate([e1, e0], axis=0)
+        data = np.concatenate([w, w], axis=0)
+        mesh_graph = coo_matrix((data, (rows, cols)), shape=(verts.shape[0], verts.shape[0])).tocsr()
+
+        # Anchor each sampled point to the nearest mesh vertex.
+        vertex_tree = cKDTree(verts)
+        _, sample_vidx = vertex_tree.query(sample_points_world, k=1)
+        sample_vidx = np.asarray(sample_vidx, dtype=np.int64).reshape(-1)
+        sample_vidx = np.clip(sample_vidx, 0, max(0, verts.shape[0] - 1))
+
+        # Radius from sample density to keep adjacency local and avoid cross-part shortcuts.
+        point_tree = cKDTree(sample_points_world)
+        d_nn, _ = point_tree.query(sample_points_world, k=2)
+        d_nn = np.asarray(d_nn, dtype=np.float64)
+        nn = d_nn[:, 1] if d_nn.ndim == 2 and d_nn.shape[1] > 1 else np.full((n,), np.inf, dtype=np.float64)
+        finite_nn = nn[np.isfinite(nn) & (nn > 0.0)]
+        if finite_nn.size == 0:
+            return [[] for _ in range(n)]
+        nn_med = float(np.median(finite_nn))
+        nn_q90 = float(np.quantile(finite_nn, 0.90))
+        geodesic_radius = max(1.55 * nn_med, 1.20 * nn_q90)
+        geodesic_radius = max(geodesic_radius, float(np.median(w) * 3.0))
+
+        # Geodesic distances between sampled points through mesh edges.
+        geo_to_vertices = dijkstra(
+            csgraph=mesh_graph,
+            directed=False,
+            indices=sample_vidx,
+            limit=float(geodesic_radius),
+        )
+        geo_sample = np.asarray(geo_to_vertices[:, sample_vidx], dtype=np.float64)  # (N, N)
+
+        max_neighbors = 12
+        for i in range(n):
+            row = geo_sample[i]
+            valid = np.isfinite(row) & (row > 1e-12) & (row <= geodesic_radius)
+            cand = np.where(valid)[0]
+            if cand.size == 0:
+                continue
+            order = cand[np.argsort(row[cand])]
+            keep = order[:max_neighbors]
+            for j in keep.tolist():
+                if i == j:
+                    continue
+                strict_sets[i].add(int(j))
+                strict_sets[int(j)].add(i)
+
+        # Prevent isolated nodes for component counting stability.
+        for i in range(n):
+            if len(strict_sets[i]) > 0:
+                continue
+            _, nn_idx = point_tree.query(sample_points_world[i], k=2)
+            nn_idx = np.asarray(nn_idx, dtype=np.int64).reshape(-1)
+            if nn_idx.size < 2:
+                continue
+            j = int(nn_idx[1])
+            if i == j:
+                continue
+            strict_sets[i].add(j)
+            strict_sets[j].add(i)
+
+        return [sorted(s) for s in strict_sets]
+
+    def _build_surface_connectivity_graph(self) -> None:
+        n_total = int(self.surface_template_points_canonical_world.shape[0])
+        self.surface_graph_neighbors_strict = [[] for _ in range(n_total)]
+        self.surface_graph_neighbors = [[] for _ in range(n_total)]
+        if n_total <= 1:
+            return
+
+        points_np = self.surface_template_points_canonical_world.detach().cpu().numpy().astype(np.float64)
+
+        if self.surface_union_mesh_canonical is None:
+            _, link_meshes_world = self._get_canonical_link_meshes_world()
+            mesh_union = trimesh.util.concatenate(list(link_meshes_world.values()))
+        else:
+            mesh_union = self.surface_union_mesh_canonical
+
+        strict = self._build_strict_surface_graph_from_union_mesh(
+            union_mesh=mesh_union,
+            sample_points_world=points_np,
+        )
+
+        self.surface_graph_neighbors_strict = strict
+        self.surface_graph_neighbors = strict
+
+    def _sample_points_from_meshes(self, mesh_dict: Dict[str, trimesh.Trimesh]) -> Dict[str, torch.Tensor]:
+        counts = self._allocate_points_over_meshes(mesh_dict, total_points=self.surface_num_points)
+        vertices: Dict[str, torch.Tensor] = {}
+        for link_name, link_mesh in mesh_dict.items():
+            c = int(counts.get(link_name, 0))
+            if c <= 0:
+                vertices[link_name] = torch.zeros((0, 3), dtype=torch.float32, device=self.device)
+                continue
+            pts, _ = self._sample_mesh_points_normals(link_mesh, c)
+            vertices[link_name] = pts
         return vertices
+
+    def get_surface_template(self) -> Dict[str, torch.Tensor]:
+        return {
+            "points_local": self.surface_template_points_local.detach().clone(),
+            "normals_local": self.surface_template_normals_local.detach().clone(),
+            "link_indices": self.surface_template_link_indices.detach().clone(),
+        }
+
+    def get_surface_template_hash(self) -> str:
+        h = hashlib.sha1()
+        pts = np.ascontiguousarray(self.surface_template_points_local.detach().cpu().numpy().astype(np.float32))
+        nrms = np.ascontiguousarray(self.surface_template_normals_local.detach().cpu().numpy().astype(np.float32))
+        idx = np.ascontiguousarray(self.surface_template_link_indices.detach().cpu().numpy().astype(np.int64))
+        h.update(pts.tobytes())
+        h.update(nrms.tobytes())
+        h.update(idx.tobytes())
+        return h.hexdigest()
 
     def _set_active_mode_assets(self, mode: str) -> None:
         if mode == "original":
@@ -1385,7 +1905,64 @@ class RobotModel:
         return torch.stack(points_all, dim=0), torch.stack(normals_all, dim=0)
 
     def get_joint_orders(self) -> List[str]:
-        return [joint.name for joint in self.pk_chain.get_joints()]
+        return list(self.joint_orders)
+
+    def _infer_base_translation_indices(self) -> List[int]:
+        idx: List[int] = []
+        direct = {
+            "rootx",
+            "rooty",
+            "rootz",
+            "root_x",
+            "root_y",
+            "root_z",
+            "base_x",
+            "base_y",
+            "base_z",
+            "world_x",
+            "world_y",
+            "world_z",
+            "global_x",
+            "global_y",
+            "global_z",
+            "trans_x",
+            "trans_y",
+            "trans_z",
+            "translation_x",
+            "translation_y",
+            "translation_z",
+            "floating_x",
+            "floating_y",
+            "floating_z",
+            "virtual_joint_x",
+            "virtual_joint_y",
+            "virtual_joint_z",
+            "virtual_x",
+            "virtual_y",
+            "virtual_z",
+        }
+        for i, name in enumerate(self.joint_orders):
+            n = name.lower().replace("-", "_").replace(" ", "")
+            if n in direct:
+                idx.append(i)
+                continue
+            has_base_token = any(t in n for t in ("root", "base", "world", "global", "floating", "trans", "virtual"))
+            if not has_base_token:
+                continue
+            axis_suffix = n.endswith("_x") or n.endswith("_y") or n.endswith("_z") or n.endswith("x") or n.endswith("y") or n.endswith("z")
+            if not axis_suffix:
+                continue
+            if any(t in n for t in ("roll", "pitch", "yaw", "rot", "_rx", "_ry", "_rz")):
+                continue
+            idx.append(i)
+        return sorted(set(idx))
+
+    def _zero_base_translation_in_q(self, q: torch.Tensor) -> torch.Tensor:
+        if len(self.base_translation_indices) == 0:
+            return q
+        q_out = q.clone()
+        q_out[self.base_translation_indices] = 0.0
+        return q_out
 
     def update_status(self, q: torch.Tensor) -> None:
         if q.ndim == 1:
@@ -1430,6 +2007,369 @@ class RobotModel:
             return torch.zeros((0, 4), dtype=torch.float32, device=self.device)
 
         return torch.cat(all_pc_se3, dim=0)
+
+    def get_surface_points_normals(self, q: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        if q is None:
+            q = torch.zeros(self.dof, dtype=torch.float32, device=self.device)
+        self.update_status(q)
+
+        n_total = int(self.surface_template_points_local.shape[0])
+        if n_total <= 0:
+            empty = torch.zeros((self.surface_num_points, 3), dtype=torch.float32, device=self.device)
+            return empty, empty
+
+        points = torch.zeros((n_total, 3), dtype=torch.float32, device=self.device)
+        normals = torch.zeros((n_total, 3), dtype=torch.float32, device=self.device)
+        link_idx = self.surface_template_link_indices
+        link_names = list(self.meshes_original.keys())
+
+        for link_i, link_name in enumerate(link_names):
+            mask = link_idx == int(link_i)
+            if not bool(mask.any()):
+                continue
+            if link_name not in self.frame_status:
+                continue
+            pts_local = self.surface_template_points_local[mask]
+            nrms_local = self.surface_template_normals_local[mask]
+
+            tf = self.frame_status[link_name].get_matrix()[0].to(self.device)
+            rot = tf[:3, :3]
+            pts_h = torch.cat(
+                [pts_local, torch.ones((pts_local.shape[0], 1), dtype=torch.float32, device=self.device)],
+                dim=1,
+            )
+            pts_world = (pts_h @ tf.T)[:, :3]
+            nrms_world = nrms_local @ rot.T
+            nrms_world = nrms_world / torch.norm(nrms_world, dim=1, keepdim=True).clamp_min(1e-8)
+
+            points[mask] = pts_world
+            normals[mask] = nrms_world
+
+        return points, normals
+
+    @staticmethod
+    def _compute_gendex_contact_value_source_target(
+        source_points: torch.Tensor,
+        source_normals: torch.Tensor,
+        target_points: torch.Tensor,
+        align_exp_scale: float = 2.0,
+        sigmoid_scale: float = 10.0,
+    ) -> torch.Tensor:
+        if source_points.numel() == 0:
+            return torch.zeros((0,), dtype=torch.float32, device=source_points.device)
+        if target_points.numel() == 0:
+            return torch.zeros((source_points.shape[0],), dtype=torch.float32, device=source_points.device)
+
+        source_points = source_points.float()
+        source_normals = source_normals.float()
+        target_points = target_points.float()
+
+        ss = (source_points * source_points).sum(dim=1, keepdim=True)
+        tt = (target_points * target_points).sum(dim=1).unsqueeze(0)
+        st = source_points @ target_points.T
+        source_target_dist = torch.sqrt((ss + tt - 2.0 * st).clamp_min(0.0))
+
+        target_dot_normal = target_points @ source_normals.T
+        source_dot_normal = (source_points * source_normals).sum(dim=1, keepdim=True)
+        source_target_align = target_dot_normal.T - source_dot_normal
+        source_target_align = source_target_align / (source_target_dist + 1e-5)
+
+        source_target_align_dist = source_target_dist * torch.exp(
+            float(align_exp_scale) * (1.0 - source_target_align)
+        )
+        contact_dist = torch.sqrt(source_target_align_dist.min(dim=1).values.clamp_min(0.0))
+        contact_value = 1.0 - 2.0 * (torch.sigmoid(float(sigmoid_scale) * contact_dist) - 0.5)
+        return contact_value.clamp(0.0, 1.0)
+
+    def _mask_component_count(self, mask: torch.Tensor) -> int:
+        mask_bool = mask.detach().bool().cpu()
+        n = int(mask_bool.numel())
+        if n == 0 or int(mask_bool.sum()) == 0:
+            return 0
+        neighbors = self.surface_graph_neighbors
+        if len(neighbors) != n:
+            raise RuntimeError(
+                "Surface connectivity graph is not aligned with mask size. "
+                "Rebuild the graph or check surface template consistency."
+            )
+
+        active = mask_bool.numpy()
+        visited = np.zeros((n,), dtype=bool)
+        components = 0
+
+        for root in np.where(active)[0].tolist():
+            if visited[root]:
+                continue
+            components += 1
+            stack = [root]
+            visited[root] = True
+            while stack:
+                i = stack.pop()
+                for j in neighbors[i]:
+                    if (not visited[j]) and active[j]:
+                        visited[j] = True
+                        stack.append(j)
+        return int(components)
+
+    @staticmethod
+    def _random_tangent_basis(normals: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        ref = torch.tensor([1.0, 0.0, 0.0], dtype=torch.float32, device=normals.device).unsqueeze(0).repeat(normals.shape[0], 1)
+        alt = torch.tensor([0.0, 1.0, 0.0], dtype=torch.float32, device=normals.device).unsqueeze(0).repeat(normals.shape[0], 1)
+        use_alt = torch.abs((normals * ref).sum(dim=1)) > 0.9
+        ref[use_alt] = alt[use_alt]
+        t1 = torch.cross(normals, ref, dim=1)
+        t1 = t1 / torch.norm(t1, dim=1, keepdim=True).clamp_min(1e-8)
+        t2 = torch.cross(normals, t1, dim=1)
+        t2 = t2 / torch.norm(t2, dim=1, keepdim=True).clamp_min(1e-8)
+        return t1, t2
+
+    def _sample_virtual_object_patches(
+        self,
+        hand_points: torch.Tensor,
+        hand_normals: torch.Tensor,
+        num_anchors: int,
+        total_patch_points: int,
+        generator: Optional[torch.Generator] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        n_pts = int(hand_points.shape[0])
+        if n_pts == 0:
+            empty = torch.zeros((0, 3), dtype=torch.float32, device=self.device)
+            return empty, {"anchor_indices": torch.zeros((0,), dtype=torch.long), "patch_types": torch.zeros((0,), dtype=torch.long)}
+
+        n_anchors = int(max(1, min(num_anchors, n_pts)))
+        anchor_indices = torch.randperm(n_pts, device=self.device, generator=generator)[:n_anchors]
+        anchor_points = hand_points[anchor_indices]
+        anchor_normals = hand_normals[anchor_indices]
+        t1, t2 = self._random_tangent_basis(anchor_normals)
+
+        base = total_patch_points // n_anchors
+        rem = total_patch_points % n_anchors
+        counts = [base + (1 if i < rem else 0) for i in range(n_anchors)]
+        patch_types = []
+        patch_points = []
+        for i in range(n_anchors):
+            m = int(max(1, counts[i]))
+            p = anchor_points[i]
+            n = anchor_normals[i]
+            b1 = t1[i]
+            b2 = t2[i]
+
+            scale = float(torch.empty(1, device=self.device).uniform_(0.002, 0.02, generator=generator).item())
+            depth = float(torch.empty(1, device=self.device).uniform_(0.0005, 0.012, generator=generator).item())
+            lateral = torch.empty(2, device=self.device).uniform_(-0.35 * scale, 0.35 * scale, generator=generator)
+            center = p - depth * n + lateral[0] * b1 + lateral[1] * b2
+
+            u = torch.randn((m,), device=self.device, generator=generator) * scale
+            v = torch.randn((m,), device=self.device, generator=generator) * scale
+            patch_type = int(torch.randint(0, 5, (1,), device=self.device, generator=generator).item())
+            patch_types.append(patch_type)
+
+            if patch_type == 0:  # plane
+                h = torch.zeros((m,), device=self.device)
+            elif patch_type == 1:  # sphere cap
+                radius = float(torch.empty(1, device=self.device).uniform_(1.2 * scale, 3.0 * scale, generator=generator).item())
+                inside = (radius * radius - u * u - v * v).clamp_min(0.0)
+                sign = -1.0 if bool(torch.randint(0, 2, (1,), device=self.device, generator=generator).item()) else 1.0
+                h = sign * (torch.sqrt(inside) - radius)
+            elif patch_type == 2:  # cylinder strip
+                radius = float(torch.empty(1, device=self.device).uniform_(1.0 * scale, 2.4 * scale, generator=generator).item())
+                inside = (radius * radius - u * u).clamp_min(0.0)
+                sign = -1.0 if bool(torch.randint(0, 2, (1,), device=self.device, generator=generator).item()) else 1.0
+                h = sign * (torch.sqrt(inside) - radius)
+            elif patch_type == 3:  # edge
+                coef = float(torch.empty(1, device=self.device).uniform_(0.15, 0.9, generator=generator).item())
+                sign = -1.0 if bool(torch.randint(0, 2, (1,), device=self.device, generator=generator).item()) else 1.0
+                h = sign * coef * torch.abs(u)
+            else:  # corner
+                coef = float(torch.empty(1, device=self.device).uniform_(0.1, 0.65, generator=generator).item())
+                sign = -1.0 if bool(torch.randint(0, 2, (1,), device=self.device, generator=generator).item()) else 1.0
+                h = sign * coef * (torch.abs(u) + torch.abs(v))
+
+            pts = center.unsqueeze(0) + u.unsqueeze(1) * b1.unsqueeze(0) + v.unsqueeze(1) * b2.unsqueeze(0) + h.unsqueeze(1) * n.unsqueeze(0)
+            pts += torch.randn_like(pts, device=self.device) * (0.05 * scale)
+            patch_points.append(pts)
+
+        object_points = torch.cat(patch_points, dim=0)
+        patch_types_t = torch.tensor(patch_types, dtype=torch.long, device=self.device)
+        return object_points, {"anchor_indices": anchor_indices, "patch_types": patch_types_t}
+
+    def set_contact_mask_sampler_state(self, state: Dict[str, torch.Tensor]) -> None:
+        self.contact_mask_sampler_state = {}
+        for k, v in state.items():
+            if torch.is_tensor(v):
+                self.contact_mask_sampler_state[k] = v.detach().cpu()
+            else:
+                self.contact_mask_sampler_state[k] = torch.tensor(v)
+
+    def load_contact_mask_sampler_state(self, path: str) -> None:
+        state = torch.load(path, map_location="cpu")
+        if not isinstance(state, dict):
+            raise ValueError(f"Invalid sampler state at {path}")
+        self.set_contact_mask_sampler_state(state)
+
+    def fit_contact_mask_sampler(
+        self,
+        real_masks: torch.Tensor,
+        max_component_samples: int = 5000,
+    ) -> Dict[str, torch.Tensor]:
+        masks = real_masks.detach().bool().cpu()
+        if masks.ndim != 2:
+            raise ValueError(f"Expected real_masks shape (M,N), got {tuple(masks.shape)}")
+        if int(masks.shape[1]) != int(self.surface_num_points):
+            raise ValueError(
+                f"real_masks N={masks.shape[1]} does not match surface_num_points={self.surface_num_points}"
+            )
+
+        counts = masks.sum(dim=1).long()
+        count_hist = torch.bincount(counts, minlength=self.surface_num_points + 1).float()
+
+        max_comp = 32
+        comp_hist = torch.zeros((max_comp + 1,), dtype=torch.float32)
+        comp_values: List[int] = []
+        n_comp_eval = min(int(max_component_samples), int(masks.shape[0]))
+        if n_comp_eval > 0:
+            idx = torch.randperm(int(masks.shape[0]))[:n_comp_eval]
+            for i in idx.tolist():
+                c = self._mask_component_count(masks[i].to(self.device))
+                comp_values.append(int(c))
+                c = int(min(c, max_comp))
+                comp_hist[c] += 1.0
+        if comp_hist.sum() <= 0:
+            comp_hist[1] = 1.0
+            comp_values = [1]
+
+        comp_t = torch.tensor(comp_values, dtype=torch.float32)
+        if comp_t.numel() == 0:
+            comp_lo = 1
+            comp_hi = 4
+        else:
+            comp_t = comp_t.clamp_min(1.0)
+            comp_lo = int(torch.quantile(comp_t, q=0.1).round().item())
+            comp_hi = int(torch.quantile(comp_t, q=0.9).round().item())
+            comp_lo = max(1, comp_lo)
+            comp_hi = max(comp_lo, comp_hi)
+        comp_lo = min(comp_lo, 8)
+        comp_hi = max(comp_lo, min(comp_hi, 8))
+
+        state: Dict[str, torch.Tensor] = {
+            "count_hist": count_hist,
+            "component_hist": comp_hist,
+            "component_range": torch.tensor([comp_lo, comp_hi], dtype=torch.long),
+            "num_real_samples": torch.tensor([int(masks.shape[0])], dtype=torch.long),
+        }
+
+        self.set_contact_mask_sampler_state(state)
+        return state
+
+    def _sample_q_for_contact(self, generator: Optional[torch.Generator] = None) -> torch.Tensor:
+        lower, upper = self.pk_chain.get_joint_limits()
+        lower_t = torch.tensor(lower, dtype=torch.float32, device=self.device)
+        upper_t = torch.tensor(upper, dtype=torch.float32, device=self.device)
+        finite = torch.isfinite(lower_t) & torch.isfinite(upper_t)
+        q = torch.zeros(self.dof, dtype=torch.float32, device=self.device)
+        if finite.any():
+            u = torch.rand(self.dof, device=self.device, generator=generator)
+            q[finite] = lower_t[finite] + u[finite] * (upper_t[finite] - lower_t[finite])
+        if (~finite).any():
+            cnt = int((~finite).sum().item())
+            q[~finite] = (torch.rand(cnt, device=self.device, generator=generator) * 2.0 - 1.0) * torch.pi
+        return self._zero_base_translation_in_q(q)
+
+    def sample_contact_masks_with_details(
+        self,
+        B: int,
+        threshold: float = 0.4,
+        align_exp_scale: float = 2.0,
+        sigmoid_scale: float = 10.0,
+        patch_points: int = 96,
+        component_min: Optional[int] = None,
+        component_max: Optional[int] = None,
+        seed: Optional[int] = None,
+    ) -> Dict[str, torch.Tensor]:
+        if int(B) <= 0:
+            raise ValueError("B must be positive")
+        generator = None
+        if seed is not None:
+            generator = torch.Generator(device=self.device.type)
+            generator.manual_seed(int(seed))
+
+        comp_lo_default, comp_hi_default = 1, 4
+        if self.contact_mask_sampler_state is not None:
+            comp_range = self.contact_mask_sampler_state.get("component_range")
+            if comp_range is not None and torch.is_tensor(comp_range) and comp_range.numel() >= 2:
+                comp_lo_default = int(comp_range[0].item())
+                comp_hi_default = int(comp_range[1].item())
+        comp_lo = int(comp_lo_default if component_min is None else component_min)
+        comp_hi = int(comp_hi_default if component_max is None else component_max)
+        comp_lo = max(1, min(comp_lo, 8))
+        comp_hi = max(comp_lo, min(comp_hi, 8))
+
+        masks = torch.zeros((B, self.surface_num_points), dtype=torch.bool, device=self.device)
+        values = torch.zeros((B, self.surface_num_points), dtype=torch.float32, device=self.device)
+        q_batch = torch.zeros((B, self.dof), dtype=torch.float32, device=self.device)
+        hand_points_batch = torch.zeros((B, self.surface_num_points, 3), dtype=torch.float32, device=self.device)
+        object_points_padded = torch.zeros((B, patch_points, 3), dtype=torch.float32, device=self.device)
+        object_points_mask = torch.zeros((B, patch_points), dtype=torch.bool, device=self.device)
+        anchor_indices_padded = torch.full((B, 8), -1, dtype=torch.long, device=self.device)
+        patch_types_padded = torch.full((B, 8), -1, dtype=torch.long, device=self.device)
+
+        for b in range(B):
+            q = self._sample_q_for_contact(generator=generator)
+            hand_points, hand_normals = self.get_surface_points_normals(q=q)
+            n_anchor = int(torch.randint(comp_lo, comp_hi + 1, (1,), device=self.device, generator=generator).item())
+            obj_pts, patch_meta = self._sample_virtual_object_patches(
+                hand_points=hand_points,
+                hand_normals=hand_normals,
+                num_anchors=n_anchor,
+                total_patch_points=int(patch_points),
+                generator=generator,
+            )
+            val = self._compute_gendex_contact_value_source_target(
+                source_points=hand_points,
+                source_normals=hand_normals,
+                target_points=obj_pts,
+                align_exp_scale=float(align_exp_scale),
+                sigmoid_scale=float(sigmoid_scale),
+            )
+            mask = val >= float(threshold)
+            masks[b] = mask
+            values[b] = val
+            q_batch[b] = q
+            hand_points_batch[b] = hand_points
+
+            n_obj = int(min(obj_pts.shape[0], patch_points))
+            object_points_padded[b, :n_obj] = obj_pts[:n_obj]
+            object_points_mask[b, :n_obj] = True
+            na = int(min(patch_meta["anchor_indices"].shape[0], 8))
+            anchor_indices_padded[b, :na] = patch_meta["anchor_indices"][:na]
+            patch_types_padded[b, :na] = patch_meta["patch_types"][:na]
+
+        return {
+            "masks": masks.detach().cpu(),
+            "contact_values": values.detach().cpu(),
+            "q": q_batch.detach().cpu(),
+            "hand_points": hand_points_batch.detach().cpu(),
+            "object_patch_points": object_points_padded.detach().cpu(),
+            "object_patch_mask": object_points_mask.detach().cpu(),
+            "anchor_indices": anchor_indices_padded.detach().cpu(),
+            "patch_types": patch_types_padded.detach().cpu(),
+        }
+
+    def sample_contact_masks(
+        self,
+        B: int,
+        threshold: float = 0.4,
+        align_exp_scale: float = 2.0,
+        sigmoid_scale: float = 10.0,
+        seed: Optional[int] = None,
+    ) -> torch.Tensor:
+        return self.sample_contact_masks_with_details(
+            B=B,
+            threshold=threshold,
+            align_exp_scale=align_exp_scale,
+            sigmoid_scale=sigmoid_scale,
+            seed=seed,
+        )["masks"]
 
     def get_sampled_pc(
         self,
@@ -1583,7 +2523,7 @@ def create_robot_model(
             force_override=remove_special_bases_override,
         )
 
-    return RobotModel(robot_name, robot_path, device=device, link_num_points=num_points)
+    return RobotModel(robot_name, robot_path, device=device, num_points=num_points)
 
 
 def dump_robot_assets_index(

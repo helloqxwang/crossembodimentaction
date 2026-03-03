@@ -27,12 +27,12 @@ def _empty_mesh(server: viser.ViserServer, name: str) -> None:
     )
 
 
-def _empty_pc(server: viser.ViserServer, name: str) -> None:
+def _empty_pc(server: viser.ViserServer, name: str, point_size: float = 0.004) -> None:
     server.scene.add_point_cloud(
         name=name,
         points=np.zeros((0, 3), dtype=np.float32),
         colors=np.zeros((0, 3), dtype=np.float32),
-        point_size=0.004,
+        point_size=float(point_size),
         point_shape="circle",
     )
 
@@ -69,21 +69,6 @@ def _is_humanoid_model(robot_name: str, model) -> bool:
     has_leg_pattern = ("hip" in jnames) and ("knee" in jnames) and ("ankle" in jnames)
     return bool(has_leg_pattern and model.dof >= 20)
 
-
-def _downsample_points(points: np.ndarray, max_points: int) -> np.ndarray:
-    if points.shape[0] <= max_points:
-        return points
-    idx = np.random.choice(points.shape[0], size=max_points, replace=False)
-    return points[idx]
-
-
-def _downsample_points_normals(points: np.ndarray, normals: np.ndarray, max_points: int) -> tuple[np.ndarray, np.ndarray]:
-    if points.shape[0] <= max_points:
-        return points, normals
-    idx = np.random.choice(points.shape[0], size=max_points, replace=False)
-    return points[idx], normals[idx]
-
-
 def _load_robot_subset_from_list(
     all_names: list[str],
     list_file: Path,
@@ -116,6 +101,7 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=9402)
     parser.add_argument("--device", type=str, default=("cuda" if torch.cuda.is_available() else "cpu"))
     parser.add_argument("--num-points", type=int, default=2048)
+    parser.add_argument("--vis-point-size", type=float, default=0.002)
     parser.add_argument("--only-manipulators", action="store_true")
     parser.add_argument("--robot-list-file", type=str, default=str(ROOT_DIR / "assets" / "manipulator_robot_lists.json"))
     parser.add_argument("--robot-list-key", type=str, default="all", choices=["all", "both_hands", "right_hands"])
@@ -143,7 +129,7 @@ def main() -> None:
 
     for name in candidate_names:
         try:
-            model = create_robot_model(name, device=device, num_points=512, assets_dir=assets_dir)
+            model = create_robot_model(name, device=device, num_points=args.num_points, assets_dir=assets_dir)
             if args.only_manipulators and _is_humanoid_model(name, model):
                 continue
             models[name] = model
@@ -175,7 +161,7 @@ def main() -> None:
         initial_value=0,
     )
     vis_slider = server.gui.add_slider(
-        "vis_mode (0=mesh,1=pc,2=both,3=pts+normals@orig,4=pts+normals@box)",
+        "vis_mode (0=mesh,1=pc(filtered),2=both,3=pts+normals@orig,4=pts+normals@box)",
         min=0,
         max=4,
         step=1,
@@ -193,6 +179,7 @@ def main() -> None:
         ridx = int(robot_slider.value)
         vis_mode = int(vis_slider.value)
         link_mode = int(link_slider.value)
+        vis_point_size = float(args.vis_point_size)
 
         robot_name = robot_names[ridx]
         model = models[robot_name]
@@ -212,8 +199,9 @@ def main() -> None:
             include_box = link_mode in (1, 2)
 
             if include_original:
-                pc = model.get_transformed_links_pc(q=q, mode="original")
-                original_pc = pc[:, :3].detach().cpu().numpy() if pc.numel() else np.zeros((0, 3), dtype=np.float32)
+                # Use filtered whole-hand surface template points.
+                pc, _ = model.get_surface_points_normals(q=q)
+                original_pc = pc.detach().cpu().numpy() if pc.numel() else np.zeros((0, 3), dtype=np.float32)
                 original_mesh = model.get_trimesh_q(q, mode="original")["visual"]
 
             if include_box:
@@ -290,30 +278,30 @@ def main() -> None:
             _empty_mesh(server, "robot_mesh_box")
 
         if show_pc and original_pc.shape[0] > 0:
-            pc_show = _downsample_points(original_pc - center, args.num_points)
+            pc_show = original_pc - center
             colors = _uniform_colors(pc_show.shape[0], (0.25, 0.60, 1.00))
             server.scene.add_point_cloud(
                 name="robot_pc_original",
                 points=pc_show.astype(np.float32),
                 colors=colors,
-                point_size=0.0035,
+                point_size=vis_point_size,
                 point_shape="circle",
             )
         else:
-            _empty_pc(server, "robot_pc_original")
+            _empty_pc(server, "robot_pc_original", point_size=vis_point_size)
 
         if show_pc and box_pc.shape[0] > 0:
-            pc_show = _downsample_points(box_pc - center, args.num_points)
+            pc_show = box_pc - center
             colors = _uniform_colors(pc_show.shape[0], (1.00, 0.60, 0.15))
             server.scene.add_point_cloud(
                 name="robot_pc_box",
                 points=pc_show.astype(np.float32),
                 colors=colors,
-                point_size=0.0035,
+                point_size=vis_point_size,
                 point_shape="circle",
             )
         else:
-            _empty_pc(server, "robot_pc_box")
+            _empty_pc(server, "robot_pc_box", point_size=vis_point_size)
 
         # Mode 3/4: box-face points + normals.
         if vis_mode in (3, 4):
@@ -327,7 +315,6 @@ def main() -> None:
                 valid = valid & (np.linalg.norm(nrm, axis=1) > 1e-8)
                 pts = pts[valid]
                 nrm = nrm[valid]
-                pts, nrm = _downsample_points_normals(pts, nrm, args.num_points)
                 pts = pts - center
 
                 if pts.shape[0] > 0:
@@ -335,7 +322,7 @@ def main() -> None:
                         name="box_face_points",
                         points=pts.astype(np.float32),
                         colors=_uniform_colors(pts.shape[0], (1.0, 0.95, 0.25)),
-                        point_size=0.006,
+                        point_size=vis_point_size,
                         point_shape="circle",
                     )
 
@@ -347,13 +334,13 @@ def main() -> None:
                         line_width=2.0,
                     )
                 else:
-                    _empty_pc(server, "box_face_points")
+                    _empty_pc(server, "box_face_points", point_size=vis_point_size)
                     _empty_lines(server, "box_face_normals")
             else:
-                _empty_pc(server, "box_face_points")
+                _empty_pc(server, "box_face_points", point_size=vis_point_size)
                 _empty_lines(server, "box_face_normals")
         else:
-            _empty_pc(server, "box_face_points")
+            _empty_pc(server, "box_face_points", point_size=vis_point_size)
             _empty_lines(server, "box_face_normals")
 
     @robot_slider.on_update

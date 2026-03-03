@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Dict, Literal, Tuple
 
 import torch
@@ -118,13 +119,28 @@ class SetTokenEncoder(nn.Module):
 
 
 class VectorQuantizer(nn.Module):
-    def __init__(self, codebook_size: int, embed_dim: int, beta: float = 0.25) -> None:
+    def __init__(
+        self,
+        codebook_size: int,
+        embed_dim: int,
+        beta: float = 0.25,
+        usage_temperature: float = 0.5,
+        usage_ema_decay: float = 0.99,
+        eps: float = 1e-8,
+    ) -> None:
         super().__init__()
         self.codebook_size = int(codebook_size)
         self.embed_dim = int(embed_dim)
         self.beta = float(beta)
+        self.usage_temperature = float(usage_temperature)
+        self.usage_ema_decay = float(usage_ema_decay)
+        self.eps = float(eps)
         self.embedding = nn.Embedding(self.codebook_size, self.embed_dim)
         self.embedding.weight.data.uniform_(-1.0 / self.codebook_size, 1.0 / self.codebook_size)
+        self.register_buffer(
+            "ema_usage_probs",
+            torch.full((self.codebook_size,), 1.0 / self.codebook_size, dtype=torch.float32),
+        )
 
     def forward(self, z_e: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         # z_e: (B, D)
@@ -142,17 +158,40 @@ class VectorQuantizer(nn.Module):
 
         z_q_st = z + (z_q - z).detach()
 
+        temperature = max(self.usage_temperature, self.eps)
+        soft_assign = F.softmax(-dist / temperature, dim=-1)  # (B, K)
+        usage_probs_batch = soft_assign.mean(dim=0)  # (K,)
+        usage_probs_batch = usage_probs_batch / usage_probs_batch.sum().clamp_min(self.eps)
+
         with torch.no_grad():
-            one_hot = F.one_hot(indices, num_classes=self.codebook_size).float()
-            avg_probs = one_hot.mean(dim=0)
-            perplexity = torch.exp(-(avg_probs * torch.log(avg_probs + 1e-10)).sum())
-            active_codes = (avg_probs > 0).sum()
+            if self.training:
+                self.ema_usage_probs.mul_(self.usage_ema_decay).add_(
+                    (1.0 - self.usage_ema_decay) * usage_probs_batch.detach()
+                )
+                self.ema_usage_probs.div_(self.ema_usage_probs.sum().clamp_min(self.eps))
+
+        usage_probs_ema = self.ema_usage_probs / self.ema_usage_probs.sum().clamp_min(self.eps)
+        uniform_prob = 1.0 / float(self.codebook_size)
+
+        usage_kl_loss = (
+            usage_probs_batch
+            * (torch.log(usage_probs_batch + self.eps) - math.log(uniform_prob))
+        ).sum()
+        usage_entropy = -(usage_probs_batch * torch.log(usage_probs_batch + self.eps)).sum()
+
+        perplexity = torch.exp(-(usage_probs_ema * torch.log(usage_probs_ema + self.eps)).sum())
+        active_threshold = max(0.25 * uniform_prob, 1e-4)
+        active_codes = (usage_probs_ema > active_threshold).sum()
 
         stats = {
             "vq_loss": vq_loss,
             "codebook_loss": codebook_loss,
             "commit_loss": commit_loss,
             "indices": indices,
+            "usage_kl_loss": usage_kl_loss,
+            "usage_entropy": usage_entropy,
+            "usage_probs_batch": usage_probs_batch,
+            "usage_probs_ema": usage_probs_ema,
             "perplexity": perplexity,
             "active_codes": active_codes.float(),
         }
@@ -172,6 +211,9 @@ class NFKModel(nn.Module):
         att_num_layers: int = 2,
         codebook_size: int = 32,
         vq_beta: float = 0.25,
+        usage_temperature: float = 0.5,
+        usage_ema_decay: float = 0.99,
+        usage_eps: float = 1e-8,
         dropout: float = 0.1,
         attn_dropout: float = 0.0,
         activation: str = "gelu",
@@ -220,6 +262,9 @@ class NFKModel(nn.Module):
             codebook_size=codebook_size,
             embed_dim=self.token_dim,
             beta=vq_beta,
+            usage_temperature=usage_temperature,
+            usage_ema_decay=usage_ema_decay,
+            eps=usage_eps,
         )
 
         self.att = TransformerEncoder(
@@ -272,6 +317,8 @@ class NFKModel(nn.Module):
                 "vq_loss": torch.tensor(0.0, dtype=zeros.dtype, device=zeros.device),
                 "codebook_loss": torch.tensor(0.0, dtype=zeros.dtype, device=zeros.device),
                 "commit_loss": torch.tensor(0.0, dtype=zeros.dtype, device=zeros.device),
+                "usage_kl_loss": torch.tensor(0.0, dtype=zeros.dtype, device=zeros.device),
+                "usage_entropy": torch.tensor(0.0, dtype=zeros.dtype, device=zeros.device),
                 "perplexity": torch.tensor(0.0, dtype=zeros.dtype, device=zeros.device),
                 "active_codes": torch.tensor(0.0, dtype=zeros.dtype, device=zeros.device),
             }
@@ -304,6 +351,8 @@ class NFKModel(nn.Module):
             "vq_loss": qstats["vq_loss"],
             "codebook_loss": qstats["codebook_loss"],
             "commit_loss": qstats["commit_loss"],
+            "usage_kl_loss": qstats["usage_kl_loss"],
+            "usage_entropy": qstats["usage_entropy"],
             "perplexity": qstats["perplexity"],
             "active_codes": qstats["active_codes"],
         }

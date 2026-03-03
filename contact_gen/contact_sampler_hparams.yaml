@@ -1,0 +1,56 @@
+meta:
+  created_at: '2026-03-02T21:27:04'
+  real_masks_path: /home/qianxu/Project/crossembodimentaction/contact_gen/contact_points_validate.pt
+  source: extract_contact_points.py
+  method: fit from real masks only; used later for data-less random generation
+robots:
+  allegro:
+    robot_model_name: dro/allegro/allegro_hand_left_extended
+    num_surface_points: 512
+    surface_template_hash: b92c937a8f0c805f3e906a9325ec35aa88162720
+    component_range:
+    - 4
+    - 8
+    num_real_samples: 4812
+    real_count_mean: 28.64380645751953
+    real_count_std: 11.16059684753418
+  barrett:
+    robot_model_name: dro/barrett/model_extended
+    num_surface_points: 512
+    surface_template_hash: 7eafcc48c359a5357623114db4338d6ce5badb90
+    component_range:
+    - 5
+    - 8
+    num_real_samples: 7834
+    real_count_mean: 28.760530471801758
+    real_count_std: 12.047258377075195
+  ezgripper:
+    robot_model_name: dro/ezgripper/ezgripper_extended
+    num_surface_points: 512
+    surface_template_hash: 35b10cc4119729d5465789b86ec17c89c74602fe
+    component_range:
+    - 8
+    - 8
+    num_real_samples: 6073
+    real_count_mean: 38.54092025756836
+    real_count_std: 13.613226890563965
+  robotiq_3finger:
+    robot_model_name: dro/urdf/robotiq_3finger_description_extended
+    num_surface_points: 512
+    surface_template_hash: 4b7e99fa78a0e52f0dea8fdcd097ab8eb481636f
+    component_range:
+    - 2
+    - 8
+    num_real_samples: 864
+    real_count_mean: 10.290509223937988
+    real_count_std: 5.73650598526001
+  shadowhand:
+    robot_model_name: dro/shadowhand/shadow_hand_right_extended
+    num_surface_points: 512
+    surface_template_hash: af76cefb5af8a1283077f908cc7a46190a173d1f
+    component_range:
+    - 3
+    - 8
+    num_real_samples: 5181
+    real_count_mean: 38.93630599975586
+    real_count_std: 15.386025428771973

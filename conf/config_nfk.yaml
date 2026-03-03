@@ -26,6 +26,9 @@ model:
   att_num_layers: 2
   codebook_size: 32
   vq_beta: 0.25
+  usage_temperature: 0.5
+  usage_ema_decay: 0.99
+  usage_eps: 1e-8
   dropout: 0.1
   attn_dropout: 0.0
   activation: gelu
@@ -35,6 +38,9 @@ loss:
   w_pos: 1.0
   w_nrm: 1.0
   w_vq: 1.0
+  w_usage_kl: 0.05
+  usage_kl_warmup_steps: 20000
+  usage_kl_warmup_start_step: 0
 
 training:
   seed: 0
@@ -46,5 +52,5 @@ training:
   wandb:
     enabled: true
     project: action_repr
-    run_name: nfk_setvq
+    run_name: nfk_setvq_kl
     save_dir: ./checkpoints

@@ -1,0 +1,32 @@
+hparams_path: contact_gen/contact_sampler_hparams.yaml
+
+robot_names:
+  - allegro
+  - barrett
+  - ezgripper
+  - robotiq_3finger
+  - shadowhand
+
+device: cpu
+seed: 42
+
+threshold: 0.4
+align_exp_scale: 2.0
+sigmoid_scale: 10.0
+
+sample_count: 10000
+sample_chunk: 2000
+patch_points: 64
+save_visualization_samples: 200
+
+# -1 means use inferred range from hparams yaml.
+component_min: -1
+component_max: -1
+
+check_template_hash: true
+output_dir: contact_gen/generated_masks
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null
