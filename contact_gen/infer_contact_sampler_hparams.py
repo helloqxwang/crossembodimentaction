@@ -9,6 +9,7 @@ from typing import Any
 
 import yaml
 import torch
+import numpy as np
 
 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -54,13 +55,13 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Output YAML path.",
     )
     parser.add_argument(
-        "--vis-graph",
+        "--vis-components",
         action="store_true",
-        help="Visualize surface connectivity graph after inferring hyperparameters.",
+        help="Open viewer for connected components of extracted contact masks.",
     )
     parser.add_argument("--vis-host", type=str, default="127.0.0.1")
-    parser.add_argument("--vis-port", type=int, default=8092)
-    parser.add_argument("--vis-point-size", type=float, default=0.002)
+    parser.add_argument("--vis-port", type=int, default=8094)
+    parser.add_argument("--vis-point-size", type=float, default=0.0025)
     parser.add_argument("--vis-hand-opacity", type=float, default=0.35)
     return parser
 
@@ -94,22 +95,73 @@ def _resolve_robot_model_name(robot_name: str, asset_names: set[str], hint: str 
     return candidates[0]
 
 
-def _visualize_surface_graph(
-    models: dict[str, Any],
+def _mask_component_labels(mask: torch.Tensor, neighbors: list[list[int]]) -> tuple[torch.Tensor, int]:
+    m = torch.as_tensor(mask).bool().view(-1).cpu().numpy()
+    n = int(m.shape[0])
+    labels = np.full((n,), -1, dtype=np.int64)
+    if n == 0 or int(m.sum()) == 0:
+        return torch.tensor(labels, dtype=torch.long), 0
+    if len(neighbors) != n:
+        raise RuntimeError(
+            f"Mask length ({n}) does not match graph length ({len(neighbors)}). "
+            "Regenerate masks or ensure surface template consistency."
+        )
+
+    comp_id = 0
+    for root in np.where(m)[0].tolist():
+        if labels[root] >= 0:
+            continue
+        labels[root] = comp_id
+        stack = [int(root)]
+        while stack:
+            i = stack.pop()
+            for j in neighbors[i]:
+                j = int(j)
+                if j < 0 or j >= n:
+                    continue
+                if (not m[j]) or (labels[j] >= 0):
+                    continue
+                labels[j] = comp_id
+                stack.append(j)
+        comp_id += 1
+    return torch.tensor(labels, dtype=torch.long), int(comp_id)
+
+
+def _palette_rgb(k: int) -> np.ndarray:
+    if k <= 0:
+        return np.zeros((0, 3), dtype=np.float32)
+    import colorsys
+
+    out = np.zeros((k, 3), dtype=np.float32)
+    for i in range(k):
+        h = float(i) / float(max(1, k))
+        s = 0.85
+        v = 1.0
+        r, g, b = colorsys.hsv_to_rgb(h, s, v)
+        out[i] = np.array([r, g, b], dtype=np.float32)
+    return out
+
+
+def _visualize_contact_components(
+    vis_payload: dict[str, dict[str, Any]],
     host: str,
     port: int,
     point_size: float,
     hand_opacity: float,
 ) -> None:
-    import numpy as np
     import viser
 
-    if len(models) == 0:
-        raise RuntimeError("No models available for graph visualization.")
+    if len(vis_payload) == 0:
+        raise RuntimeError("No data for visualization.")
 
-    robot_names = sorted(models.keys())
-    max_points = max(int(models[n].surface_template_points_local.shape[0]) for n in robot_names)
-    max_points = max(1, max_points)
+    robot_names = sorted(vis_payload.keys())
+    max_samples = max(len(vis_payload[r]["samples"]) for r in robot_names)
+    max_components = max(
+        max((int(s["num_components"]) for s in vis_payload[r]["samples"]), default=0)
+        for r in robot_names
+    )
+    max_samples = max(1, int(max_samples))
+    max_components = max(1, int(max_components))
 
     server = viser.ViserServer(host=host, port=int(port))
     robot_slider = server.gui.add_slider(
@@ -119,171 +171,93 @@ def _visualize_surface_graph(
         step=1,
         initial_value=0,
     )
-    point_slider = server.gui.add_slider(
-        "point_index",
+    sample_slider = server.gui.add_slider(
+        "sample_index",
         min=0,
-        max=max_points - 1,
+        max=max_samples - 1,
         step=1,
         initial_value=0,
     )
-    mesh_mode_slider = server.gui.add_slider(
-        "mesh_mode (0=none,1=simplified,2=original,3=both)",
+    mode_slider = server.gui.add_slider(
+        "vis_mode (0=together,1=single_component)",
         min=0,
-        max=3,
+        max=1,
         step=1,
-        initial_value=3,
+        initial_value=0,
     )
-    normal_scale_slider = server.gui.add_slider(
-        "normal_scale",
-        min=0.0,
-        max=0.03,
-        step=0.0005,
-        initial_value=0.0,
+    component_slider = server.gui.add_slider(
+        "component_index",
+        min=0,
+        max=max_components - 1,
+        step=1,
+        initial_value=0,
     )
+    show_mesh = server.gui.add_checkbox("show_hand_mesh", initial_value=True)
 
     def _render() -> None:
-        ridx = int(robot_slider.value)
-        robot_name = robot_names[ridx]
-        model = models[robot_name]
-
-        q = model.get_canonical_q().detach().clone()
-        if hasattr(model, "base_translation_indices") and len(model.base_translation_indices) > 0:
-            q[model.base_translation_indices] = 0.0
-
-        points, normals = model.get_surface_points_normals(q)
-        points = points.detach().cpu()
-        normals = normals.detach().cpu()
-        n = int(points.shape[0])
-        if n == 0:
+        rname = robot_names[int(robot_slider.value)]
+        robot_data = vis_payload[rname]
+        samples = robot_data["samples"]
+        if len(samples) == 0:
             return
-        pidx = int(max(0, min(int(point_slider.value), n - 1)))
 
-        graph = model.surface_graph_neighbors
-        neighbors = graph[pidx] if pidx < len(graph) else []
+        sidx = int(max(0, min(int(sample_slider.value), len(samples) - 1)))
+        sample = samples[sidx]
+        model = robot_data["model"]
+        q = sample["q"]
+        points = sample["points"].detach().cpu()
+        labels = sample["component_labels"].detach().cpu().numpy().astype(np.int64)
+        n_comp = int(sample["num_components"])
+        vis_mode = int(mode_slider.value)
+        selected_comp = int(max(0, min(int(component_slider.value), max(0, n_comp - 1))))
 
-        colors = np.zeros((n, 3), dtype=np.float32)
-        colors[:, 0] = 0.25
-        colors[:, 1] = 0.62
-        colors[:, 2] = 1.00
-
-        mesh_mode = int(mesh_mode_slider.value)
-        show_simplified = mesh_mode in (1, 3)
-        show_original = mesh_mode in (2, 3)
-
-        simplified_mesh = getattr(model, "surface_union_mesh_canonical", None)
-        if simplified_mesh is None:
-            simplified_mesh = model.get_trimesh_q(q)["visual"]
-
-        original_mesh = model.get_trimesh_q(q)["visual"]
-
-        center_candidates: list[torch.Tensor] = []
-        if show_simplified and len(simplified_mesh.vertices) > 0:
-            center_candidates.append(torch.tensor(simplified_mesh.vertices, dtype=torch.float32))
-        if show_original and len(original_mesh.vertices) > 0:
-            center_candidates.append(torch.tensor(original_mesh.vertices, dtype=torch.float32))
-        if len(center_candidates) == 0:
-            center = points.mean(dim=0, keepdim=True)
+        mesh = model.get_trimesh_q(q, mode="original")["visual"]
+        if bool(show_mesh.value) and len(mesh.vertices) > 0:
+            center = torch.tensor(mesh.vertices, dtype=torch.float32).mean(dim=0, keepdim=True)
         else:
-            center = torch.cat(center_candidates, dim=0).mean(dim=0, keepdim=True)
-
+            center = points.mean(dim=0, keepdim=True)
         points_vis = points - center
-        if len(neighbors) > 0:
-            neigh_np = np.array(neighbors, dtype=np.int64)
-            neigh_np = neigh_np[(neigh_np >= 0) & (neigh_np < n)]
-            colors[neigh_np, :] = np.array([1.00, 0.85, 0.20], dtype=np.float32)
-        colors[pidx, :] = np.array([1.00, 0.20, 0.20], dtype=np.float32)
+
+        if vis_mode == 0:
+            # Show all active components at once.
+            pal = _palette_rgb(max(1, n_comp))
+            valid = labels >= 0
+            points_draw = points_vis[torch.from_numpy(valid)]
+            colors = np.zeros((int(valid.sum()), 3), dtype=np.float32)
+            if int(valid.sum()) > 0:
+                cids = labels[valid]
+                colors = pal[cids % pal.shape[0]]
+        else:
+            # Show selected component only.
+            if n_comp <= 0:
+                points_draw = torch.zeros((0, 3), dtype=torch.float32)
+                colors = np.zeros((0, 3), dtype=np.float32)
+            else:
+                sel = labels == selected_comp
+                points_draw = points_vis[torch.from_numpy(sel)]
+                colors = np.tile(np.array([[1.0, 0.25, 0.15]], dtype=np.float32), (int(sel.sum()), 1))
 
         server.scene.add_point_cloud(
-            name="surface_graph_points",
-            points=points_vis.numpy().astype(np.float32),
+            name="contact_components",
+            points=points_draw.numpy().astype(np.float32),
             colors=colors,
             point_size=float(point_size),
             point_shape="circle",
         )
 
-        if len(neighbors) > 0:
-            neigh_idx = np.array(neighbors, dtype=np.int64)
-            neigh_idx = neigh_idx[(neigh_idx >= 0) & (neigh_idx < n)]
-            neigh_pts = points_vis[torch.as_tensor(neigh_idx, dtype=torch.long)]
-            anchor = points_vis[pidx].unsqueeze(0).repeat(neigh_pts.shape[0], 1)
-            seg = torch.stack([anchor, neigh_pts], dim=1).numpy().astype(np.float32)
-            server.scene.add_line_segments(
-                name="surface_graph_edges",
-                points=seg,
-                colors=(1.0, 0.25, 0.25),
-                line_width=2.0,
-            )
-        else:
-            server.scene.add_line_segments(
-                name="surface_graph_edges",
-                points=np.zeros((0, 2, 3), dtype=np.float32),
-                colors=(1.0, 0.25, 0.25),
-                line_width=2.0,
-            )
-
-        normal_scale = float(normal_scale_slider.value)
-        if normal_scale > 0.0:
-            end = points_vis + normals * normal_scale
-            seg = torch.stack([points_vis, end], dim=1).numpy().astype(np.float32)
-            server.scene.add_line_segments(
-                name="surface_normals",
-                points=seg,
-                colors=(0.30, 0.95, 0.95),
-                line_width=1.5,
-            )
-            query_seg = torch.stack([points_vis[pidx], end[pidx]], dim=0).unsqueeze(0).numpy().astype(np.float32)
-            server.scene.add_line_segments(
-                name="query_normal",
-                points=query_seg,
-                colors=(1.0, 0.05, 0.95),
-                line_width=3.0,
-            )
-        else:
-            server.scene.add_line_segments(
-                name="surface_normals",
-                points=np.zeros((0, 2, 3), dtype=np.float32),
-                colors=(0.0, 0.0, 0.0),
-                line_width=0.0,
-            )
-            server.scene.add_line_segments(
-                name="query_normal",
-                points=np.zeros((0, 2, 3), dtype=np.float32),
-                colors=(0.0, 0.0, 0.0),
-                line_width=0.0,
-            )
-
-        if show_simplified:
-            v = torch.tensor(simplified_mesh.vertices, dtype=torch.float32) - center
-            f = torch.tensor(simplified_mesh.faces, dtype=torch.int32)
+        if bool(show_mesh.value) and len(mesh.vertices) > 0:
+            v = torch.tensor(mesh.vertices, dtype=torch.float32) - center
+            f = torch.tensor(mesh.faces, dtype=torch.int32)
             server.scene.add_mesh_simple(
-                name="hand_mesh_simplified",
+                name="hand_mesh",
                 vertices=v.numpy(),
                 faces=f.numpy(),
-                color=(0.20, 0.78, 0.35),
+                color=(0.82, 0.82, 0.82),
                 opacity=float(hand_opacity),
             )
         else:
             server.scene.add_mesh_simple(
-                name="hand_mesh_simplified",
-                vertices=np.zeros((0, 3), dtype=np.float32),
-                faces=np.zeros((0, 3), dtype=np.int32),
-                color=(0.0, 0.0, 0.0),
-                opacity=0.0,
-            )
-
-        if show_original:
-            v = torch.tensor(original_mesh.vertices, dtype=torch.float32) - center
-            f = torch.tensor(original_mesh.faces, dtype=torch.int32)
-            server.scene.add_mesh_simple(
-                name="hand_mesh_original",
-                vertices=v.numpy(),
-                faces=f.numpy(),
-                color=(0.72, 0.72, 0.72),
-                opacity=float(0.6 * hand_opacity),
-            )
-        else:
-            server.scene.add_mesh_simple(
-                name="hand_mesh_original",
+                name="hand_mesh",
                 vertices=np.zeros((0, 3), dtype=np.float32),
                 faces=np.zeros((0, 3), dtype=np.int32),
                 color=(0.0, 0.0, 0.0),
@@ -291,30 +265,33 @@ def _visualize_surface_graph(
             )
 
         print(
-            f"[graph-vis] robot={robot_name} point={pidx} degree={len(neighbors)} mesh_mode={mesh_mode} "
-            f"normal_scale={normal_scale:.4f} "
-            f"num_points={n}"
+            f"[comp-vis] robot={rname} sample={sidx}/{len(samples)-1} "
+            f"components={n_comp} vis_mode={vis_mode} selected_component={selected_comp} "
+            f"points_draw={int(points_draw.shape[0])}"
         )
 
     @robot_slider.on_update
     def _(_: Any) -> None:
         _render()
 
-    @point_slider.on_update
+    @sample_slider.on_update
     def _(_: Any) -> None:
         _render()
 
-    @mesh_mode_slider.on_update
+    @mode_slider.on_update
     def _(_: Any) -> None:
         _render()
 
-    @normal_scale_slider.on_update
+    @component_slider.on_update
+    def _(_: Any) -> None:
+        _render()
+
+    @show_mesh.on_update
     def _(_: Any) -> None:
         _render()
 
     _render()
-    print(f"Graph viewer URL: http://{host}:{port}")
-    print("Use sliders: robot_index and point_index.")
+    print(f"Contact component viewer URL: http://{host}:{port}")
     while True:
         time.sleep(1.0)
 
@@ -355,8 +332,7 @@ def main() -> None:
         },
         "robots": {},
     }
-    vis_models: dict[str, Any] = {}
-
+    vis_payload: dict[str, dict[str, Any]] = {}
     for robot_name in args.robot_names:
         samples = by_robot.get(robot_name, [])
         if len(samples) == 0:
@@ -380,11 +356,11 @@ def main() -> None:
             device=torch.device("cpu"),
             num_points=int(num_surface_points),
         )
-        vis_models[robot_name] = model
         model_template_hash = model.get_surface_template_hash()
 
         real_template_hashes = set()
         real_masks_list = []
+        vis_samples: list[dict[str, Any]] = []
         for s in samples:
             m = torch.as_tensor(s["hand_contact_mask"]).bool().view(-1)
             if int(m.numel()) != int(num_surface_points):
@@ -394,6 +370,28 @@ def main() -> None:
             real_masks_list.append(m)
             if s.get("surface_template_hash") is not None:
                 real_template_hashes.add(str(s["surface_template_hash"]))
+            if bool(args.vis_components):
+                if "hand_surface_points" in s:
+                    pts = torch.as_tensor(s["hand_surface_points"]).float().view(-1, 3)
+                else:
+                    q_tmp = torch.as_tensor(s["q"]).float().view(-1)
+                    q_tmp = q_tmp[: model.dof]
+                    pts, _ = model.get_surface_points_normals(q_tmp)
+                    pts = pts.detach().cpu().float()
+                q_vis = torch.as_tensor(s["q"]).float().view(-1)
+                if int(q_vis.numel()) > int(model.dof):
+                    q_vis = q_vis[: model.dof]
+                if int(q_vis.numel()) != int(model.dof):
+                    raise ValueError(
+                        f"{robot_name}: q dim mismatch in sample (got {q_vis.numel()}, expected {model.dof})"
+                    )
+                vis_samples.append(
+                    {
+                        "q": q_vis.detach().cpu(),
+                        "mask": m.detach().cpu(),
+                        "points": pts.detach().cpu(),
+                    }
+                )
         real_masks_t = torch.stack(real_masks_list, dim=0).bool()
 
         if len(real_template_hashes) > 1:
@@ -428,15 +426,31 @@ def main() -> None:
             f"component_range={[comp_lo, comp_hi]} template_hash={model_template_hash[:12]}"
         )
 
+        if bool(args.vis_components):
+            comp_samples: list[dict[str, Any]] = []
+            neighbors = model.surface_graph_neighbors
+            for s_vis in vis_samples:
+                labels, n_comp = _mask_component_labels(s_vis["mask"], neighbors)
+                comp_samples.append(
+                    {
+                        "q": s_vis["q"],
+                        "points": s_vis["points"],
+                        "mask": s_vis["mask"],
+                        "component_labels": labels,
+                        "num_components": int(n_comp),
+                    }
+                )
+            vis_payload[robot_name] = {"model": model, "samples": comp_samples}
+
     output_yaml = os.path.abspath(args.output_yaml)
     os.makedirs(os.path.dirname(output_yaml), exist_ok=True)
     with open(output_yaml, "w", encoding="utf-8") as f:
         yaml.safe_dump(out, f, sort_keys=False)
     print(f"[saved] {output_yaml}")
 
-    if bool(args.vis_graph):
-        _visualize_surface_graph(
-            models=vis_models,
+    if bool(args.vis_components):
+        _visualize_contact_components(
+            vis_payload=vis_payload,
             host=str(args.vis_host),
             port=int(args.vis_port),
             point_size=float(args.vis_point_size),

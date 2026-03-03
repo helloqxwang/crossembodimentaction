@@ -18,6 +18,7 @@ from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation
 from scipy.sparse import coo_matrix
 from scipy.sparse.csgraph import dijkstra
+from scipy import ndimage as ndi
 
 from pytorch3d.ops import sample_farthest_points
 
@@ -1126,6 +1127,8 @@ class RobotModel:
         self.surface_template_link_indices = torch.zeros((0,), dtype=torch.long, device=self.device)
         self.surface_template_points_canonical_world = torch.zeros((0, 3), dtype=torch.float32, device=self.device)
         self.surface_template_normals_canonical_world = torch.zeros((0, 3), dtype=torch.float32, device=self.device)
+        self.surface_graph_points_canonical_world = torch.zeros((0, 3), dtype=torch.float32, device=self.device)
+        self.surface_graph_normals_canonical_world = torch.zeros((0, 3), dtype=torch.float32, device=self.device)
         self.surface_union_mesh_canonical: Optional[trimesh.Trimesh] = None
         self.surface_graph_neighbors_strict: List[List[int]] = []
         self.surface_graph_neighbors: List[List[int]] = []
@@ -1211,37 +1214,102 @@ class RobotModel:
 
     @staticmethod
     def _surface_proxy_pitch_from_scale(scale: float) -> float:
-        # Use a finer grid to preserve finger gaps and palm geometry.
-        return float(np.clip(scale / 500.0, 0.0002, 0.0008))
+        # Tuned to preserve ShadowHand finger gaps while still creating stable wrappers.
+        return float(np.clip(scale / 260.0, 0.0003, 0.0010))
 
     @staticmethod
-    def _to_watertight_proxy_mesh(
-        mesh: trimesh.Trimesh,
+    def _wrapper_closing_structure() -> np.ndarray:
+        # Conservative 6-neighborhood closing kernel (less aggressive than full 3x3x3 cube).
+        st = np.zeros((3, 3, 3), dtype=bool)
+        st[1, 1, 1] = True
+        st[0, 1, 1] = True
+        st[2, 1, 1] = True
+        st[1, 0, 1] = True
+        st[1, 2, 1] = True
+        st[1, 1, 0] = True
+        st[1, 1, 2] = True
+        return st
+
+    def _build_voxel_wrapper_mesh(
+        self,
+        meshes_world: List[trimesh.Trimesh],
         pitch: float,
     ) -> trimesh.Trimesh:
-        vg = mesh.voxelized(pitch=float(pitch))
+        occ_points = []
+        for mesh in meshes_world:
+            if mesh is None or len(mesh.faces) == 0 or len(mesh.vertices) == 0:
+                continue
+            try:
+                vg = mesh.voxelized(pitch=float(pitch))
+                pts = np.asarray(vg.points, dtype=np.float64)
+            except Exception:
+                pts = np.zeros((0, 3), dtype=np.float64)
+            if pts.shape[0] > 0:
+                occ_points.append(pts)
+
+        if len(occ_points) == 0:
+            raise RuntimeError(f"Failed to voxelize canonical meshes for robot: {self.robot_name}")
+
+        all_pts = np.concatenate(occ_points, axis=0)
+        origin = all_pts.min(axis=0) - 2.0 * float(pitch)
+        idx = np.floor((all_pts - origin[None, :]) / float(pitch) + 1e-6).astype(np.int64)
+        idx = np.unique(idx, axis=0)
+        if idx.shape[0] == 0:
+            raise RuntimeError(f"Empty occupancy indices for robot: {self.robot_name}")
+
+        shape = idx.max(axis=0) + 3
+        occ = np.zeros(tuple(int(x) for x in shape.tolist()), dtype=bool)
+        occ[idx[:, 0], idx[:, 1], idx[:, 2]] = True
+
+        # Morphological closing to remove tiny cracks/holes in the wrapper.
+        structure = self._wrapper_closing_structure()
+        occ_closed = ndi.binary_closing(occ, structure=structure, iterations=1)
+
+        # Guard against over-closing that could merge nearby fingers.
+        occ_count = int(occ.sum())
+        added = int(np.logical_and(occ_closed, np.logical_not(occ)).sum())
+        add_ratio = float(added) / max(1, occ_count)
+        if add_ratio <= 0.06:
+            occ = occ_closed
+
+        # Fill interior to ensure extracted surface is the outer envelope.
         try:
-            vg = vg.fill()
+            occ = ndi.binary_fill_holes(occ)
         except Exception:
             pass
-        proxy = _as_mesh(vg.marching_cubes)
-        if proxy is None or len(proxy.faces) == 0:
-            raise RuntimeError("Failed to create watertight proxy mesh from voxelization.")
-        # In trimesh 4.x, marching_cubes can be returned in voxel index coordinates.
-        # Detect this and map back to world using voxel transform.
-        mesh_diag = float(np.linalg.norm(np.asarray(mesh.bounds[1] - mesh.bounds[0], dtype=np.float64)))
-        proxy_diag = float(np.linalg.norm(np.asarray(proxy.bounds[1] - proxy.bounds[0], dtype=np.float64)))
-        if proxy_diag > 4.0 * max(mesh_diag, 1e-6):
-            proxy = proxy.copy()
-            proxy.apply_transform(vg.transform)
-        proxy = trimesh.Trimesh(
-            vertices=np.asarray(proxy.vertices, dtype=np.float64),
-            faces=np.asarray(proxy.faces, dtype=np.int64),
+
+        idx_final = np.argwhere(occ)
+        if idx_final.shape[0] == 0:
+            raise RuntimeError(f"Wrapper occupancy became empty for robot: {self.robot_name}")
+
+        transform = np.eye(4, dtype=np.float64)
+        transform[0, 0] = float(pitch)
+        transform[1, 1] = float(pitch)
+        transform[2, 2] = float(pitch)
+        transform[:3, 3] = origin
+
+        enc = trimesh.voxel.encoding.SparseBinaryEncoding(idx_final.astype(np.int64))
+        vg_union = trimesh.voxel.VoxelGrid(encoding=enc, transform=transform)
+        mesh_union = _as_mesh(vg_union.marching_cubes)
+        if mesh_union is None or len(mesh_union.faces) == 0:
+            raise RuntimeError(f"Failed to build wrapper marching-cubes mesh for robot: {self.robot_name}")
+
+        scale = self._robot_scale(meshes_world)
+        mesh_diag = float(np.linalg.norm(np.asarray(mesh_union.bounds[1] - mesh_union.bounds[0], dtype=np.float64)))
+        if mesh_diag > 4.0 * max(scale, 1e-6):
+            mesh_union = mesh_union.copy()
+            mesh_union.apply_transform(vg_union.transform)
+
+        mesh_union = trimesh.Trimesh(
+            vertices=np.asarray(mesh_union.vertices, dtype=np.float64),
+            faces=np.asarray(mesh_union.faces, dtype=np.int64),
             process=True,
         )
         if hasattr(trimesh.repair, "fix_normals"):
-            trimesh.repair.fix_normals(proxy)
-        return proxy
+            trimesh.repair.fix_normals(mesh_union)
+        if len(mesh_union.faces) == 0:
+            raise RuntimeError(f"Wrapper mesh is empty for robot: {self.robot_name}")
+        return mesh_union
 
     @staticmethod
     def _orient_watertight_components_outward(mesh: trimesh.Trimesh) -> trimesh.Trimesh:
@@ -1278,40 +1346,11 @@ class RobotModel:
             raise RuntimeError("Cannot build union mesh from empty mesh list.")
 
         scale = self._robot_scale(meshes_world)
-        proxy_pitch = float(self._surface_proxy_pitch_from_scale(scale) if pitch is None else pitch)
-
-        proxy_meshes: List[trimesh.Trimesh] = []
-        for mesh in meshes_world:
-            if mesh is None or len(mesh.faces) == 0 or len(mesh.vertices) == 0:
-                continue
-            try:
-                if bool(mesh.is_volume) and bool(mesh.is_watertight):
-                    proxy = mesh.copy()
-                else:
-                    proxy = self._to_watertight_proxy_mesh(mesh=mesh, pitch=proxy_pitch)
-            except Exception:
-                continue
-            if proxy is not None and len(proxy.faces) > 0:
-                proxy_meshes.append(proxy)
-
-        if len(proxy_meshes) == 0:
-            raise RuntimeError(f"Failed to create proxy meshes for robot: {self.robot_name}")
-
-        if len(proxy_meshes) == 1:
-            mesh_union = proxy_meshes[0]
-        else:
-            mesh_union = _as_mesh(trimesh.boolean.union(proxy_meshes, engine="manifold"))
-        if mesh_union is None or len(mesh_union.faces) == 0:
-            raise RuntimeError(f"Failed to build boolean-union mesh for robot: {self.robot_name}")
-        mesh_union = trimesh.Trimesh(
-            vertices=np.asarray(mesh_union.vertices, dtype=np.float64),
-            faces=np.asarray(mesh_union.faces, dtype=np.int64),
-            process=True,
-        )
-        # Ensure final simplified mesh is a clean outer shell.
-        if (not bool(mesh_union.is_watertight)) or (not bool(mesh_union.is_volume)):
-            mesh_union = self._to_watertight_proxy_mesh(mesh=mesh_union, pitch=proxy_pitch)
+        wrapper_pitch = float(self._surface_proxy_pitch_from_scale(scale) if pitch is None else pitch)
+        mesh_union = self._build_voxel_wrapper_mesh(meshes_world=meshes_world, pitch=wrapper_pitch)
         mesh_union = self._orient_watertight_components_outward(mesh_union)
+        if len(mesh_union.faces) == 0:
+            raise RuntimeError(f"Final union mesh is empty for robot: {self.robot_name}")
         return mesh_union
 
     def _sample_surface_points_normals_from_mesh(
@@ -1442,21 +1481,236 @@ class RobotModel:
             raise RuntimeError(f"Failed to build canonical meshes for robot: {self.robot_name}")
         return link_names, link_meshes_world
 
+    @staticmethod
+    def _build_concatenated_mesh(meshes: List[trimesh.Trimesh]) -> trimesh.Trimesh:
+        if len(meshes) == 0:
+            return trimesh.Trimesh(vertices=np.zeros((0, 3)), faces=np.zeros((0, 3), dtype=np.int64))
+        out = _as_mesh(trimesh.util.concatenate(meshes))
+        if out is None:
+            return trimesh.Trimesh(vertices=np.zeros((0, 3)), faces=np.zeros((0, 3), dtype=np.int64))
+        return trimesh.Trimesh(
+            vertices=np.asarray(out.vertices, dtype=np.float64),
+            faces=np.asarray(out.faces, dtype=np.int64),
+            process=True,
+        )
+
+    @staticmethod
+    def _raycast_project_points_to_mesh(
+        mesh_world: trimesh.Trimesh,
+        query_points_world: np.ndarray,
+        query_normals_world: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        n = int(query_points_world.shape[0])
+        if n == 0:
+            return np.zeros((0, 3), dtype=np.float64), np.zeros((0, 3), dtype=np.float64)
+
+        q = np.asarray(query_points_world, dtype=np.float64)
+        nrm = np.asarray(query_normals_world, dtype=np.float64)
+        nrm_norm = np.linalg.norm(nrm, axis=1, keepdims=True)
+        bad = nrm_norm.reshape(-1) < 1e-8
+        if bool(np.any(bad)):
+            nrm[bad] = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+            nrm_norm = np.linalg.norm(nrm, axis=1, keepdims=True)
+        nrm = nrm / np.clip(nrm_norm, 1e-8, None)
+
+        diag = float(np.linalg.norm(np.asarray(mesh_world.bounds[1] - mesh_world.bounds[0], dtype=np.float64)))
+        eps = max(1e-5, 1e-4 * max(diag, 1e-6))
+
+        origins_pos = q + eps * nrm
+        dirs_pos = -nrm
+        origins_neg = q - eps * nrm
+        dirs_neg = nrm
+        origins = np.concatenate([origins_pos, origins_neg], axis=0)
+        dirs = np.concatenate([dirs_pos, dirs_neg], axis=0)
+
+        best_pts = np.zeros((n, 3), dtype=np.float64)
+        best_nrms = np.zeros((n, 3), dtype=np.float64)
+        best_dist = np.full((n,), np.inf, dtype=np.float64)
+        hit = np.zeros((n,), dtype=bool)
+
+        try:
+            loc, ray_idx, tri_idx = mesh_world.ray.intersects_location(
+                origins,
+                dirs,
+                multiple_hits=False,
+            )
+            loc = np.asarray(loc, dtype=np.float64)
+            ray_idx = np.asarray(ray_idx, dtype=np.int64).reshape(-1)
+            tri_idx = np.asarray(tri_idx, dtype=np.int64).reshape(-1)
+            face_normals = np.asarray(mesh_world.face_normals, dtype=np.float64)
+            for k in range(int(ray_idx.shape[0])):
+                rid = int(ray_idx[k])
+                sid = rid if rid < n else (rid - n)
+                if sid < 0 or sid >= n:
+                    continue
+                p_hit = loc[k]
+                dist = float(np.linalg.norm(p_hit - origins[rid]))
+                if dist >= best_dist[sid]:
+                    continue
+                best_dist[sid] = dist
+                best_pts[sid] = p_hit
+                tid = int(tri_idx[k])
+                if tid >= 0 and tid < face_normals.shape[0]:
+                    best_nrms[sid] = face_normals[tid]
+                hit[sid] = True
+        except Exception:
+            pass
+
+        missing = ~hit
+        if bool(np.any(missing)):
+            q_miss = q[missing]
+            try:
+                cp, _, tri = trimesh.proximity.closest_point(mesh_world, q_miss)
+                cp = np.asarray(cp, dtype=np.float64)
+                tri = np.asarray(tri, dtype=np.int64).reshape(-1)
+                best_pts[missing] = cp
+                face_normals = np.asarray(mesh_world.face_normals, dtype=np.float64)
+                miss_normals = np.zeros((cp.shape[0], 3), dtype=np.float64)
+                valid = (tri >= 0) & (tri < face_normals.shape[0])
+                if bool(np.any(valid)):
+                    miss_normals[valid] = face_normals[tri[valid]]
+                if bool(np.any(~valid)):
+                    miss_normals[~valid] = nrm[missing][~valid]
+                best_nrms[missing] = miss_normals
+            except Exception:
+                best_pts[missing] = q_miss
+                best_nrms[missing] = nrm[missing]
+
+        dots = np.sum(best_nrms * nrm, axis=1)
+        flip = dots < 0.0
+        if bool(np.any(flip)):
+            best_nrms[flip] *= -1.0
+        best_nrm_norm = np.linalg.norm(best_nrms, axis=1, keepdims=True)
+        badn = best_nrm_norm.reshape(-1) < 1e-8
+        if bool(np.any(badn)):
+            best_nrms[badn] = nrm[badn]
+            best_nrm_norm = np.linalg.norm(best_nrms, axis=1, keepdims=True)
+        best_nrms = best_nrms / np.clip(best_nrm_norm, 1e-8, None)
+        return best_pts, best_nrms
+
+    @staticmethod
+    def _wrapper_outward_clearance_keep_mask(
+        mesh_world: trimesh.Trimesh,
+        points_world: torch.Tensor,
+        normals_world: torch.Tensor,
+        min_clearance: float,
+    ) -> torch.Tensor:
+        n = int(points_world.shape[0])
+        if n == 0:
+            return torch.zeros((0,), dtype=torch.bool, device=points_world.device)
+
+        pts = points_world.detach().cpu().numpy().astype(np.float64)
+        nrms = normals_world.detach().cpu().numpy().astype(np.float64)
+        nrms_norm = np.linalg.norm(nrms, axis=1, keepdims=True)
+        bad = nrms_norm.reshape(-1) < 1e-8
+        if bool(np.any(bad)):
+            nrms[bad] = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+            nrms_norm = np.linalg.norm(nrms, axis=1, keepdims=True)
+        nrms = nrms / np.clip(nrms_norm, 1e-8, None)
+
+        diag = float(np.linalg.norm(np.asarray(mesh_world.bounds[1] - mesh_world.bounds[0], dtype=np.float64)))
+        eps = max(1e-5, 1e-4 * max(diag, 1e-6))
+        origins = pts + eps * nrms
+        dirs = nrms
+
+        best = np.full((n,), np.inf, dtype=np.float64)
+        try:
+            loc, ray_idx, _ = mesh_world.ray.intersects_location(
+                origins,
+                dirs,
+                multiple_hits=False,
+            )
+            loc = np.asarray(loc, dtype=np.float64)
+            ray_idx = np.asarray(ray_idx, dtype=np.int64).reshape(-1)
+            for k in range(int(ray_idx.shape[0])):
+                rid = int(ray_idx[k])
+                if rid < 0 or rid >= n:
+                    continue
+                d = float(np.linalg.norm(loc[k] - origins[rid]))
+                if d < best[rid]:
+                    best[rid] = d
+        except Exception:
+            # Keep all points if ray backend is unavailable.
+            return torch.ones((n,), dtype=torch.bool, device=points_world.device)
+
+        keep = (~np.isfinite(best)) | (best >= float(min_clearance))
+        return torch.tensor(keep, dtype=torch.bool, device=points_world.device)
+
     def _build_surface_template(self, num_points: int) -> None:
         if int(num_points) <= 0:
             raise ValueError("num_points must be positive.")
 
         link_names, link_meshes_world = self._get_canonical_link_meshes_world()
+        robot_scale = self._robot_scale(list(link_meshes_world.values()))
+        wrapper_pitch = float(self._surface_proxy_pitch_from_scale(robot_scale))
 
         union_mesh = self._build_boolean_union_mesh(list(link_meshes_world.values()))
-        points_world, normals_world = self._sample_surface_points_normals_from_mesh(
+        sample_candidates = int(max(int(num_points) * 6, int(num_points)))
+        simplified_points_world, simplified_normals_world = self._sample_surface_points_normals_from_mesh(
             mesh=union_mesh,
-            num_points=int(num_points),
-            oversample_ratio=12,
+            num_points=sample_candidates,
+            oversample_ratio=2,
         )
+        keep_mask = self._wrapper_outward_clearance_keep_mask(
+            mesh_world=union_mesh,
+            points_world=simplified_points_world,
+            normals_world=simplified_normals_world,
+            min_clearance=float(max(4.0 * wrapper_pitch, 2.5e-3)),
+        )
+        if int(keep_mask.sum().item()) >= int(num_points):
+            simplified_points_world = simplified_points_world[keep_mask]
+            simplified_normals_world = simplified_normals_world[keep_mask]
+
+        if int(simplified_points_world.shape[0]) > int(num_points):
+            _, keep = farthest_point_sampling(simplified_points_world, int(num_points))
+            keep = keep.long()
+            simplified_points_world = simplified_points_world[keep]
+            simplified_normals_world = simplified_normals_world[keep]
+        elif int(simplified_points_world.shape[0]) < int(num_points):
+            extra_n = int(num_points - simplified_points_world.shape[0])
+            if int(simplified_points_world.shape[0]) == 0:
+                raise RuntimeError(f"Outer-envelope filtering removed all points for robot: {self.robot_name}")
+            extra_idx = torch.randint(0, int(simplified_points_world.shape[0]), (extra_n,), device=self.device)
+            simplified_points_world = torch.cat([simplified_points_world, simplified_points_world[extra_idx]], dim=0)
+            simplified_normals_world = torch.cat([simplified_normals_world, simplified_normals_world[extra_idx]], dim=0)
+
+        self.surface_graph_points_canonical_world = simplified_points_world.clone()
+        self.surface_graph_normals_canonical_world = simplified_normals_world.clone()
+
+        original_full_mesh = self._build_concatenated_mesh(list(link_meshes_world.values()))
+        if len(original_full_mesh.faces) > 0:
+            proj_pts_np, proj_nrms_np = self._raycast_project_points_to_mesh(
+                mesh_world=original_full_mesh,
+                query_points_world=simplified_points_world.detach().cpu().numpy().astype(np.float64),
+                query_normals_world=simplified_normals_world.detach().cpu().numpy().astype(np.float64),
+            )
+            proj_pts = torch.tensor(proj_pts_np, dtype=torch.float32, device=self.device)
+            proj_nrms = torch.tensor(proj_nrms_np, dtype=torch.float32, device=self.device)
+
+            # Keep projection only when it stays locally consistent with the
+            # outer-envelope sample. This avoids snapping to inner original-link faces.
+            proj_shift = torch.norm(proj_pts - simplified_points_world, dim=1)
+            max_proj_shift = float(max(4.0 * wrapper_pitch, 2e-3))
+            nrm_dot = torch.sum(
+                proj_nrms * simplified_normals_world,
+                dim=1,
+            )
+            use_proj = (proj_shift <= max_proj_shift) & (nrm_dot >= 0.2)
+
+            template_points_world = torch.where(use_proj.unsqueeze(1), proj_pts, simplified_points_world)
+            template_normals_world = torch.where(use_proj.unsqueeze(1), proj_nrms, simplified_normals_world)
+            template_normals_world = template_normals_world / torch.norm(
+                template_normals_world,
+                dim=1,
+                keepdim=True,
+            ).clamp_min(1e-8)
+        else:
+            template_points_world = simplified_points_world
+            template_normals_world = simplified_normals_world
+
         points_local, normals_local, link_idx = self._assign_union_points_to_links(
-            points_world=points_world,
-            normals_world=normals_world,
+            points_world=template_points_world,
+            normals_world=template_normals_world,
             link_meshes_world=link_meshes_world,
             link_names=link_names,
         )
@@ -1470,14 +1724,15 @@ class RobotModel:
         self.surface_template_points_local = points_local
         self.surface_template_normals_local = normals_local
         self.surface_template_link_indices = link_idx
-        self.surface_template_points_canonical_world = points_world
-        self.surface_template_normals_canonical_world = normals_world
+        self.surface_template_points_canonical_world = template_points_world
+        self.surface_template_normals_canonical_world = template_normals_world
         self.surface_union_mesh_canonical = union_mesh
 
     @staticmethod
     def _build_strict_surface_graph_from_union_mesh(
         union_mesh: trimesh.Trimesh,
         sample_points_world: np.ndarray,
+        sample_normals_world: np.ndarray,
     ) -> List[List[int]]:
         n = int(sample_points_world.shape[0])
         strict_sets = [set() for _ in range(n)]
@@ -1521,27 +1776,131 @@ class RobotModel:
             return [[] for _ in range(n)]
         nn_med = float(np.median(finite_nn))
         nn_q90 = float(np.quantile(finite_nn, 0.90))
-        geodesic_radius = max(1.55 * nn_med, 1.20 * nn_q90)
-        geodesic_radius = max(geodesic_radius, float(np.median(w) * 3.0))
+        geodesic_radius = max(2.60 * nn_med, 2.20 * nn_q90)
+        geodesic_radius = max(geodesic_radius, float(np.median(w) * 6.0))
+        geodesic_limit = float(1.35 * geodesic_radius)
+        euclid_radius = max(1.90 * nn_q90, 2.20 * nn_med)
+        same_anchor_euclid_radius = max(1.25 * nn_q90, 1.50 * nn_med)
 
         # Geodesic distances between sampled points through mesh edges.
         geo_to_vertices = dijkstra(
             csgraph=mesh_graph,
             directed=False,
             indices=sample_vidx,
-            limit=float(geodesic_radius),
+            limit=geodesic_limit,
         )
         geo_sample = np.asarray(geo_to_vertices[:, sample_vidx], dtype=np.float64)  # (N, N)
 
-        max_neighbors = 12
+        normals = np.asarray(sample_normals_world, dtype=np.float64)
+        normal_norm = np.linalg.norm(normals, axis=1, keepdims=True)
+        valid_normal = normal_norm.reshape(-1) > 1e-8
+        normals[valid_normal] = normals[valid_normal] / normal_norm[valid_normal]
+        normals[~valid_normal] = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+
+        max_neighbors = 24
+        min_neighbors = 8
+        n_angle_bins = 8
+
+        def _tangent_basis(nrm: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+            ref = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+            if abs(float(np.dot(ref, nrm))) > 0.85:
+                ref = np.array([0.0, 1.0, 0.0], dtype=np.float64)
+            t1 = np.cross(nrm, ref)
+            t1_norm = float(np.linalg.norm(t1))
+            if t1_norm < 1e-8:
+                t1 = np.array([0.0, 0.0, 1.0], dtype=np.float64)
+                t1_norm = float(np.linalg.norm(t1))
+            t1 = t1 / max(t1_norm, 1e-8)
+            t2 = np.cross(nrm, t1)
+            t2 = t2 / max(float(np.linalg.norm(t2)), 1e-8)
+            return t1, t2
+
         for i in range(n):
             row = geo_sample[i]
-            valid = np.isfinite(row) & (row > 1e-12) & (row <= geodesic_radius)
-            cand = np.where(valid)[0]
+            valid_geo = np.isfinite(row) & (row <= geodesic_radius)
+            valid_geo[i] = False
+            cand_geo = np.where(valid_geo)[0]
+            if cand_geo.size == 0:
+                continue
+
+            # Keep same-anchor candidates only when Euclidean-near; this recovers local
+            # neighborhoods when multiple samples share one anchor mesh vertex.
+            same_anchor = cand_geo[row[cand_geo] <= 1e-12]
+            if same_anchor.size > 0:
+                d_same = np.linalg.norm(sample_points_world[same_anchor] - sample_points_world[i][None, :], axis=1)
+                same_anchor = same_anchor[d_same <= same_anchor_euclid_radius]
+
+            # Local Euclidean pre-filter, then geodesic-check to avoid cross-finger edges.
+            local = np.asarray(point_tree.query_ball_point(sample_points_world[i], r=float(euclid_radius)), dtype=np.int64)
+            if local.ndim == 0:
+                local = local.reshape(1)
+            local = local[(local >= 0) & (local < n) & (local != i)]
+            local = local[np.isfinite(row[local]) & (row[local] <= geodesic_radius)]
+
+            cand = np.unique(np.concatenate([cand_geo, same_anchor, local], axis=0))
             if cand.size == 0:
                 continue
-            order = cand[np.argsort(row[cand])]
-            keep = order[:max_neighbors]
+
+            geo = row[cand]
+            eu = np.linalg.norm(sample_points_world[cand] - sample_points_world[i][None, :], axis=1)
+            order = np.lexsort((eu, geo))
+            cand = cand[order]
+            geo = geo[order]
+
+            # Prefer directional coverage around each point (tangent-space angular bins).
+            keep_list: List[int] = []
+            used = set()
+            t1, t2 = _tangent_basis(normals[i])
+            best_by_bin: Dict[int, Tuple[float, int]] = {}
+            for c_idx, j in enumerate(cand.tolist()):
+                v = sample_points_world[j] - sample_points_world[i]
+                v_tan = v - normals[i] * float(np.dot(v, normals[i]))
+                v_norm = float(np.linalg.norm(v_tan))
+                if v_norm < 1e-10:
+                    continue
+                x = float(np.dot(v_tan, t1))
+                y = float(np.dot(v_tan, t2))
+                ang = math.atan2(y, x)
+                b = int(math.floor((ang + math.pi) / (2.0 * math.pi / float(n_angle_bins))))
+                b = max(0, min(n_angle_bins - 1, b))
+                g = float(geo[c_idx])
+                prev = best_by_bin.get(b, None)
+                if (prev is None) or (g < prev[0]):
+                    best_by_bin[b] = (g, int(j))
+
+            for _, (_, j) in sorted(best_by_bin.items(), key=lambda kv: kv[1][0]):
+                if j in used:
+                    continue
+                keep_list.append(int(j))
+                used.add(int(j))
+                if len(keep_list) >= max_neighbors:
+                    break
+
+            for j in cand.tolist():
+                if len(keep_list) >= max_neighbors:
+                    break
+                if int(j) in used:
+                    continue
+                keep_list.append(int(j))
+                used.add(int(j))
+
+            if len(keep_list) < min_neighbors:
+                cand_all = np.where(np.isfinite(row) & (np.arange(n) != i))[0]
+                if cand_all.size > 0:
+                    geo_all = row[cand_all]
+                    eu_all = np.linalg.norm(sample_points_world[cand_all] - sample_points_world[i][None, :], axis=1)
+                    order_all = np.lexsort((eu_all, geo_all))
+                    for j in cand_all[order_all].tolist():
+                        if int(j) in used:
+                            continue
+                        if not np.isfinite(row[int(j)]):
+                            continue
+                        keep_list.append(int(j))
+                        used.add(int(j))
+                        if len(keep_list) >= min_neighbors:
+                            break
+
+            keep = np.asarray(keep_list[:max_neighbors], dtype=np.int64)
             for j in keep.tolist():
                 if i == j:
                     continue
@@ -1565,13 +1924,13 @@ class RobotModel:
         return [sorted(s) for s in strict_sets]
 
     def _build_surface_connectivity_graph(self) -> None:
-        n_total = int(self.surface_template_points_canonical_world.shape[0])
+        n_total = int(self.surface_graph_points_canonical_world.shape[0])
         self.surface_graph_neighbors_strict = [[] for _ in range(n_total)]
         self.surface_graph_neighbors = [[] for _ in range(n_total)]
         if n_total <= 1:
             return
 
-        points_np = self.surface_template_points_canonical_world.detach().cpu().numpy().astype(np.float64)
+        points_np = self.surface_graph_points_canonical_world.detach().cpu().numpy().astype(np.float64)
 
         if self.surface_union_mesh_canonical is None:
             _, link_meshes_world = self._get_canonical_link_meshes_world()
@@ -1582,6 +1941,7 @@ class RobotModel:
         strict = self._build_strict_surface_graph_from_union_mesh(
             union_mesh=mesh_union,
             sample_points_world=points_np,
+            sample_normals_world=self.surface_graph_normals_canonical_world.detach().cpu().numpy().astype(np.float64),
         )
 
         self.surface_graph_neighbors_strict = strict

@@ -42,7 +42,7 @@ Sliders:
   - `1`: point cloud + hand mesh
   - `2`: point cloud + hand mesh + object mesh
 
-## 3) Infer Sampler Hyperparameters From Real Masks
+## 3) Infer Sampler Hyperparameters From Real Masks (YAML only)
 
 ```bash
 cd /home/qianxu/Project/crossembodimentaction
@@ -53,22 +53,22 @@ python3 contact_gen/infer_contact_sampler_hparams.py \
 
 This step is the only place that uses real masks for fitting hyperparameters.
 
-Optional graph visualization (surface points + selected-point neighbors):
+## 4) Visualize Surface Connectivity Graph
 
 ```bash
-python3 contact_gen/infer_contact_sampler_hparams.py \
-  --real-masks-path /home/qianxu/Project/crossembodimentaction/contact_gen/contact_points_validate.pt \
-  --output-yaml /home/qianxu/Project/crossembodimentaction/contact_gen/contact_sampler_hparams.yaml \
-  --vis-graph --vis-port 8092
+cd /home/qianxu/Project/crossembodimentaction
+python3 contact_gen/visualize_surface_graph.py \
+  --num-surface-points 512 \
+  --vis-port 8092
 ```
 
-## 4) Generate Random Contact Masks (Hydra, data-less runtime)
+## 5) Generate Random Contact Masks (Hydra, data-less runtime)
 
 ```bash
 cd /home/qianxu/Project/crossembodimentaction
 python3 contact_gen/generate_random_contact_masks.py \
   hparams_path=contact_gen/contact_sampler_hparams.yaml \
-  sample_count=100000 \
+  sample_count=10000 \
   output_dir=contact_gen/generated_masks
 ```
 
@@ -79,7 +79,7 @@ Notes:
 - No target contact-count (`k`) constraints or trial optimization are used.
 - Base translation joints (`base/root/world xyz` when present) are forced to zero during random sampling.
 
-## 5) Evaluate Coverage
+## 6) Evaluate Coverage
 
 ```bash
 cd /home/qianxu/Project/crossembodimentaction
@@ -89,7 +89,7 @@ python3 contact_gen/evaluate_contact_mask_coverage.py \
   --output-dir /home/qianxu/Project/crossembodimentaction/contact_gen/coverage_eval
 ```
 
-## 6) Visualize sampled masks + virtual patches
+## 7) Visualize sampled masks + virtual patches
 
 ```bash
 cd /home/qianxu/Project/crossembodimentaction

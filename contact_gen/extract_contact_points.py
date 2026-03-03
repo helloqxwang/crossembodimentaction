@@ -76,7 +76,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--num-hand-points",
         type=int,
-        default=512,
+        default=1024,
         help=(
             "Whole-hand uniform surface sample count per grasp sample. "
             "This controls final hand surface point count exactly."
