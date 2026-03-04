@@ -1,0 +1,20 @@
+{
+  "count_wasserstein": 0.7309759259223938,
+  "occupancy_js_divergence": 0.09307168424129486,
+  "coverage_iou_ge_03": 0.9939074516296387,
+  "coverage_iou_ge_05": 0.8002634644508362,
+  "coverage_iou_ge_07": 0.09270541369915009,
+  "median_best_iou": 0.5939394235610962,
+  "one_nn_separability_acc": 0.6672499775886536,
+  "real_count_mean": 92.04330444335938,
+  "sampled_count_mean": 92.57499694824219,
+  "pc2d_span_ratio_mean": 0.9105376342030037,
+  "pc2d_intersection_cover_mean": 0.8753121492383024,
+  "span_trace_ratio": 0.901432454586029,
+  "span_logdet_ratio": 0.9143304824829102,
+  "real_to_sampled_nn_p95": 2.7625303268432617,
+  "real_to_real_nn_p95": 2.151132345199585,
+  "nn_p95_ratio": 1.2842214627138389,
+  "chamfer_median": 0.005243551917374134,
+  "chamfer_p90": 0.007639760617166758
+}

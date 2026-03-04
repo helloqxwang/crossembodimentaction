@@ -1785,6 +1785,7 @@ class RobotModel:
         num_anchors: int,
         total_patch_points: int,
         generator: Optional[torch.Generator] = None,
+        anchor_indices: Optional[torch.Tensor] = None,
         anchor_shift: float = 0.002,
         max_plane_extent: float = 0.026,
         penetration_clearance: float = 0.0001,
@@ -1795,7 +1796,15 @@ class RobotModel:
             return empty, {"anchor_indices": torch.zeros((0,), dtype=torch.long), "patch_types": torch.zeros((0,), dtype=torch.long)}
 
         n_anchors = int(max(1, min(num_anchors, n_pts)))
-        anchor_indices = torch.randperm(n_pts, device=self.device, generator=generator)[:n_anchors]
+        if anchor_indices is None:
+            anchor_indices = torch.randperm(n_pts, device=self.device, generator=generator)[:n_anchors]
+        else:
+            anchor_indices = anchor_indices.to(device=self.device, dtype=torch.long).view(-1)
+            if int(anchor_indices.numel()) == 0:
+                anchor_indices = torch.randperm(n_pts, device=self.device, generator=generator)[:n_anchors]
+            else:
+                anchor_indices = anchor_indices[:n_anchors]
+        n_anchors = int(anchor_indices.numel())
         anchor_points = hand_points[anchor_indices]
         anchor_normals = hand_normals[anchor_indices]
         t1, t2 = self._random_tangent_basis(anchor_normals)
@@ -1855,23 +1864,78 @@ class RobotModel:
             patch_types.append(0)  # 0 = plane
 
         object_points = torch.cat(patch_points, dim=0)
-        # Post-process: remove patch points that penetrate into hand.
+        # Post-process: project penetrated points outwards without dropping points.
         if int(object_points.shape[0]) > 0:
             d = torch.cdist(object_points.unsqueeze(0), hand_points.unsqueeze(0)).squeeze(0)  # (K, N)
             nn = torch.argmin(d, dim=1)
             ref_p = hand_points[nn]
             ref_n = hand_normals[nn]
             signed = torch.sum((object_points - ref_p) * ref_n, dim=1)
-            keep = signed >= float(penetration_clearance)
-            if bool(keep.any()):
-                object_points = object_points[keep]
-            else:
-                # Fallback: push points out instead of returning empty patches.
-                push = (float(penetration_clearance) - signed).clamp_min(0.0)
-                object_points = object_points + push.unsqueeze(1) * ref_n
+            push = (float(penetration_clearance) - signed).clamp_min(0.0)
+            object_points = object_points + push.unsqueeze(1) * ref_n
 
         patch_types_t = torch.tensor(patch_types, dtype=torch.long, device=self.device)
         return object_points, {"anchor_indices": anchor_indices, "patch_types": patch_types_t}
+
+    def _sample_patch_anchor_indices(
+        self,
+        hand_points: torch.Tensor,
+        n_anchor: int,
+        generator: Optional[torch.Generator] = None,
+    ) -> torch.Tensor:
+        n_pts = int(hand_points.shape[0])
+        n_anchor = int(max(1, min(int(n_anchor), n_pts)))
+        mode_u = float(torch.rand(1, device=self.device, generator=generator).item())
+
+        # 1) Random anchors.
+        if mode_u < 0.35 or n_anchor <= 1:
+            return torch.randperm(n_pts, device=self.device, generator=generator)[:n_anchor]
+
+        # 2) Spread anchors (greedy farthest-point).
+        if mode_u < 0.70:
+            first = int(torch.randint(0, n_pts, (1,), device=self.device, generator=generator).item())
+            selected = [first]
+            dmin = torch.cdist(hand_points[first : first + 1], hand_points).squeeze(0)
+            while len(selected) < n_anchor:
+                nxt = int(torch.argmax(dmin).item())
+                selected.append(nxt)
+                dnew = torch.cdist(hand_points[nxt : nxt + 1], hand_points).squeeze(0)
+                dmin = torch.minimum(dmin, dnew)
+            return torch.tensor(selected, dtype=torch.long, device=self.device)
+
+        # 3) Clustered anchors via graph random-walk.
+        neighbors = self.surface_graph_neighbors
+        if len(neighbors) != n_pts:
+            return torch.randperm(n_pts, device=self.device, generator=generator)[:n_anchor]
+        seed = int(torch.randint(0, n_pts, (1,), device=self.device, generator=generator).item())
+        picked = {seed}
+        order = [seed]
+        cur = seed
+        steps = 0
+        max_steps = 10 * n_anchor + 50
+        while len(order) < n_anchor and steps < max_steps:
+            steps += 1
+            nb = neighbors[cur]
+            if len(nb) == 0:
+                cur = seed
+                continue
+            j = int(torch.randint(0, len(nb), (1,), device=self.device, generator=generator).item())
+            nxt = int(nb[j])
+            if nxt not in picked:
+                picked.add(nxt)
+                order.append(nxt)
+            cur = nxt
+            if bool(torch.rand(1, device=self.device, generator=generator).item() < 0.2):
+                cur = order[int(torch.randint(0, len(order), (1,), device=self.device, generator=generator).item())]
+        if len(order) < n_anchor:
+            extra = torch.randperm(n_pts, device=self.device, generator=generator).tolist()
+            for idx in extra:
+                if idx not in picked:
+                    picked.add(int(idx))
+                    order.append(int(idx))
+                if len(order) >= n_anchor:
+                    break
+        return torch.tensor(order[:n_anchor], dtype=torch.long, device=self.device)
 
     def set_contact_mask_sampler_state(self, state: Dict[str, torch.Tensor]) -> None:
         self.contact_mask_sampler_state = {}
@@ -1949,7 +2013,26 @@ class RobotModel:
         q = torch.zeros(self.dof, dtype=torch.float32, device=self.device)
         if finite.any():
             u = torch.rand(self.dof, device=self.device, generator=generator)
-            q[finite] = lower_t[finite] + u[finite] * (upper_t[finite] - lower_t[finite])
+            mode = float(torch.rand(1, device=self.device, generator=generator).item())
+            if mode < 0.25:
+                # Independent uniform.
+                t = u
+            elif mode < 0.55:
+                # Correlated global posture with per-joint jitter.
+                g = torch.rand(1, device=self.device, generator=generator)
+                t = 0.75 * g + 0.25 * u
+            elif mode < 0.80:
+                # Extreme-biased posture (near one side of joint range).
+                if bool(torch.randint(0, 2, (1,), device=self.device, generator=generator).item()):
+                    t = u.pow(2.5)
+                else:
+                    t = 1.0 - u.pow(2.5)
+            else:
+                # Center-heavy posture.
+                x = 2.0 * u - 1.0
+                t = 0.5 + 0.5 * x.pow(3)
+            t = t.clamp(0.0, 1.0)
+            q[finite] = lower_t[finite] + t[finite] * (upper_t[finite] - lower_t[finite])
         if (~finite).any():
             cnt = int((~finite).sum().item())
             q[~finite] = (torch.rand(cnt, device=self.device, generator=generator) * 2.0 - 1.0) * torch.pi
@@ -2003,44 +2086,49 @@ class RobotModel:
             if span == 0:
                 n_anchor = int(comp_lo)
             else:
-                # Data-less bias toward larger component count within configured range.
+                # Multi-shape component prior for broader coverage (still data-less).
+                u_mode = float(torch.rand(1, device=self.device, generator=generator).item())
                 u_comp = float(torch.rand(1, device=self.device, generator=generator).item())
-                if comp_hi <= 5:
-                    # Simpler grippers tend to have fewer disconnected components.
-                    n_anchor = int(comp_lo + round((u_comp ** 1.25) * span))
+                if u_mode < 0.33:
+                    frac = u_comp ** 2.0
+                elif u_mode < 0.66:
+                    frac = 1.0 - (u_comp ** 2.0)
                 else:
-                    n_anchor = int(comp_lo + round((u_comp ** 0.8) * span))
+                    frac = u_comp
+                if comp_hi <= 5:
+                    frac = frac ** 1.15
+                n_anchor = int(comp_lo + round(frac * span))
             # Data-less multi-regime sampler to broaden coverage without relying on real masks.
             mode_u = float(torch.rand(1, device=self.device, generator=generator).item())
-            if mode_u < 0.50:
-                shift_lo = max(0.00008, 0.0040 * hand_scale)
-                shift_hi = min(0.0032, 0.0140 * hand_scale)
-                ext_lo = max(0.0040, 0.0300 * hand_scale)
-                ext_hi = min(0.0360, 0.0900 * hand_scale)
+            if mode_u < 0.20:
+                shift_lo = max(0.00006, 0.0060 * hand_scale)
+                shift_hi = min(0.0042, 0.0180 * hand_scale)
+                ext_lo = max(0.0030, 0.0200 * hand_scale)
+                ext_hi = min(0.0240, 0.0700 * hand_scale)
                 anchor_shift_i = float(
                     torch.empty(1, device=self.device).uniform_(shift_lo, max(shift_lo + 1e-6, shift_hi), generator=generator).item()
                 )
                 max_extent_i = float(
                     torch.empty(1, device=self.device).uniform_(ext_lo, max(ext_lo + 1e-6, ext_hi), generator=generator).item()
                 )
-                patch_points_gen = int(max(int(patch_points), int(24 * n_anchor)))
+                patch_points_gen = int(max(int(patch_points), int(20 * n_anchor)))
+            elif mode_u < 0.55:
+                shift_lo = max(0.00004, 0.0030 * hand_scale)
+                shift_hi = min(0.0030, 0.0120 * hand_scale)
+                ext_lo = max(0.0060, 0.0400 * hand_scale)
+                ext_hi = min(0.0340, 0.1100 * hand_scale)
+                anchor_shift_i = float(
+                    torch.empty(1, device=self.device).uniform_(shift_lo, max(shift_lo + 1e-6, shift_hi), generator=generator).item()
+                )
+                max_extent_i = float(
+                    torch.empty(1, device=self.device).uniform_(ext_lo, max(ext_lo + 1e-6, ext_hi), generator=generator).item()
+                )
+                patch_points_gen = int(max(int(patch_points), int(32 * n_anchor)))
             elif mode_u < 0.85:
-                shift_lo = max(0.00006, 0.0020 * hand_scale)
-                shift_hi = min(0.0032, 0.0100 * hand_scale)
-                ext_lo = max(0.0050, 0.0500 * hand_scale)
-                ext_hi = min(0.0380, 0.1300 * hand_scale)
-                anchor_shift_i = float(
-                    torch.empty(1, device=self.device).uniform_(shift_lo, max(shift_lo + 1e-6, shift_hi), generator=generator).item()
-                )
-                max_extent_i = float(
-                    torch.empty(1, device=self.device).uniform_(ext_lo, max(ext_lo + 1e-6, ext_hi), generator=generator).item()
-                )
-                patch_points_gen = int(max(int(patch_points), int(36 * n_anchor)))
-            else:
-                shift_lo = max(0.00004, 0.0008 * hand_scale)
-                shift_hi = min(0.0020, 0.0060 * hand_scale)
-                ext_lo = max(0.0070, 0.0800 * hand_scale)
-                ext_hi = min(0.0420, 0.1800 * hand_scale)
+                shift_lo = max(0.00002, 0.0010 * hand_scale)
+                shift_hi = min(0.0020, 0.0080 * hand_scale)
+                ext_lo = max(0.0120, 0.0700 * hand_scale)
+                ext_hi = min(0.0500, 0.1800 * hand_scale)
                 anchor_shift_i = float(
                     torch.empty(1, device=self.device).uniform_(shift_lo, max(shift_lo + 1e-6, shift_hi), generator=generator).item()
                 )
@@ -2048,6 +2136,18 @@ class RobotModel:
                     torch.empty(1, device=self.device).uniform_(ext_lo, max(ext_lo + 1e-6, ext_hi), generator=generator).item()
                 )
                 patch_points_gen = int(max(int(patch_points), int(56 * n_anchor)))
+            else:
+                shift_lo = 0.0
+                shift_hi = min(0.0012, 0.0040 * hand_scale)
+                ext_lo = max(0.0180, 0.1000 * hand_scale)
+                ext_hi = min(0.0850, 0.2600 * hand_scale)
+                anchor_shift_i = float(
+                    torch.empty(1, device=self.device).uniform_(shift_lo, max(shift_lo + 1e-6, shift_hi), generator=generator).item()
+                )
+                max_extent_i = float(
+                    torch.empty(1, device=self.device).uniform_(ext_lo, max(ext_lo + 1e-6, ext_hi), generator=generator).item()
+                )
+                patch_points_gen = int(max(int(patch_points), int(80 * n_anchor)))
             # For simple/low-component manipulators, bias toward smaller and more separated patches.
             if comp_hi <= 5:
                 s_shrink = float(
@@ -2059,12 +2159,18 @@ class RobotModel:
                 max_extent_i *= s_shrink
                 anchor_shift_i *= s_shift
                 patch_points_gen = int(max(int(patch_points), int(round(0.45 * float(patch_points_gen)))))
+            anchor_indices = self._sample_patch_anchor_indices(
+                hand_points=hand_points,
+                n_anchor=n_anchor,
+                generator=generator,
+            )
             obj_pts, patch_meta = self._sample_virtual_object_patches(
                 hand_points=hand_points,
                 hand_normals=hand_normals,
                 num_anchors=n_anchor,
                 total_patch_points=patch_points_gen,
                 generator=generator,
+                anchor_indices=anchor_indices,
                 anchor_shift=anchor_shift_i,
                 max_plane_extent=max_extent_i,
                 penetration_clearance=0.00008,

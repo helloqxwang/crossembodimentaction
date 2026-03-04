@@ -1,0 +1,72 @@
+{
+  "direct_v1": {
+    "mean_cov_iou_ge_03": 0.6176271975040436,
+    "mean_cov_iou_ge_05": 0.0053641607169993225,
+    "mean_median_best_iou": 0.3264628529548645,
+    "mean_count_wasserstein": 0.7676142513751983,
+    "mean_occ_js": 0.12005597203969956
+  },
+  "direct_v2": {
+    "mean_cov_iou_ge_03": 0.5825417965650559,
+    "mean_cov_iou_ge_05": 0.008229334175121039,
+    "mean_median_best_iou": 0.3212721049785614,
+    "mean_count_wasserstein": 0.7301229357719421,
+    "mean_occ_js": 0.1255054756999016
+  },
+  "direct_v3": {
+    "mean_cov_iou_ge_03": 0.6555738747119904,
+    "mean_cov_iou_ge_05": 0.007813925656955689,
+    "mean_median_best_iou": 0.3309832692146301,
+    "mean_count_wasserstein": 0.6957799613475799,
+    "mean_occ_js": 0.11403627693653107
+  },
+  "direct_v4": {
+    "mean_cov_iou_ge_03": 0.5831186830997467,
+    "mean_cov_iou_ge_05": 0.1495687959715724,
+    "mean_median_best_iou": 0.3569768011569977,
+    "mean_count_wasserstein": 1.0273080468177795,
+    "mean_occ_js": 0.004072007909417153
+  },
+  "direct_v4_10k": {
+    "mean_cov_iou_ge_03": 0.6846001505851745,
+    "mean_cov_iou_ge_05": 0.17603427059948445,
+    "mean_median_best_iou": 0.38468179702758787,
+    "mean_count_wasserstein": 0.23337070345878602,
+    "mean_occ_js": 0.0028764470480382442
+  },
+  "direct_v5": {
+    "mean_cov_iou_ge_03": 0.541342881321907,
+    "mean_cov_iou_ge_05": 0.14640228375792502,
+    "mean_median_best_iou": 0.35178924798965455,
+    "mean_count_wasserstein": 1.0333396911621093,
+    "mean_occ_js": 0.008959089498966932
+  },
+  "patch_v1": {
+    "mean_cov_iou_ge_03": 0.8414141416549683,
+    "mean_cov_iou_ge_05": 0.16859109178185464,
+    "mean_median_best_iou": 0.3970182240009308,
+    "mean_count_wasserstein": 0.7507472693920135,
+    "mean_occ_js": 0.08245382159948349
+  },
+  "patch_v2": {
+    "mean_cov_iou_ge_03": 0.7902642726898194,
+    "mean_cov_iou_ge_05": 0.12377785225398838,
+    "mean_median_best_iou": 0.3748888075351715,
+    "mean_count_wasserstein": 0.6585501194000244,
+    "mean_occ_js": 0.10643209964036941
+  },
+  "patch_v3": {
+    "mean_cov_iou_ge_03": 0.88178551197052,
+    "mean_cov_iou_ge_05": 0.21169998040422797,
+    "mean_median_best_iou": 0.4211134612560272,
+    "mean_count_wasserstein": 0.9064781308174134,
+    "mean_occ_js": 0.06900388821959495
+  },
+  "patch_v3_10k": {
+    "mean_cov_iou_ge_03": 0.9562321186065674,
+    "mean_cov_iou_ge_05": 0.3006973884999752,
+    "mean_median_best_iou": 0.46119662523269656,
+    "mean_count_wasserstein": 0.23088445663452148,
+    "mean_occ_js": 0.06776884496212006
+  }
+}

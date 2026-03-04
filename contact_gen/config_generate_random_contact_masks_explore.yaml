@@ -1,0 +1,80 @@
+hparams_path: contact_gen/contact_sampler_hparams.yaml
+real_masks_path: contact_gen/contact_points_validate.pt
+
+robot_names:
+  - allegro
+  - barrett
+  - ezgripper
+  - robotiq_3finger
+  - shadowhand
+
+device: cpu
+seed: 42
+
+sample_count: 3000
+sample_chunk: 1000
+patch_points: 96
+save_visualization_samples: 100
+
+threshold: 0.4
+align_exp_scale: 2.0
+sigmoid_scale: 10.0
+
+component_min: -1
+component_max: -1
+check_template_hash: true
+
+sampler_family: patch_distance
+anchor_source: real_distribution  # real_distribution | uniform
+target_count_source: real         # real | none
+q_source: random                  # random | real | mixed
+q_real_mix_prob: 0.5              # used only when q_source=mixed
+anchor_temperature: 1.0
+anchor_uniform_mix: 0.0
+target_count_jitter_frac: 0.0
+
+direct_strategy: components       # components | bernoulli_smooth
+direct_compact_prob: 0.55
+direct_filament_prob: 0.25
+direct_target_count_min: 8
+direct_target_count_max: 220
+direct_noise_scale: 1.0
+direct_smooth_steps: 1
+direct_smooth_add_thr: 0.55
+direct_smooth_keep_thr: 0.35
+
+patch_anchor_shift_min: 0.0002
+patch_anchor_shift_max: 0.0030
+patch_extent_min: 0.006
+patch_extent_max: 0.050
+patch_extent_power: 1.0
+patch_shift_power: 1.0
+patch_points_per_anchor_min: 28
+patch_points_per_anchor_max: 84
+patch_penetration_clearance: 0.00008
+patch_score_noise_std: 0.0
+patch_exact_count_prob: 1.0
+patch_count_clamp_ratio: 0.3
+patch_mask_swap_prob: 0.0
+patch_mask_swap_steps: 0
+patch_mask_swap_global_jump_prob: 0.2
+
+# Optional rare "tail" mode to increase sampled-span coverage while preserving
+# default behavior on the majority of samples.
+patch_tail_mix_prob: 0.0
+patch_tail_anchor_shift_min: -1.0
+patch_tail_anchor_shift_max: -1.0
+patch_tail_extent_min: -1.0
+patch_tail_extent_max: -1.0
+patch_tail_extent_power: -1.0
+patch_tail_shift_power: -1.0
+patch_tail_points_per_anchor_min: -1
+patch_tail_points_per_anchor_max: -1
+patch_tail_penetration_clearance: -1.0
+
+output_dir: contact_gen/generated_masks_explore/default
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null

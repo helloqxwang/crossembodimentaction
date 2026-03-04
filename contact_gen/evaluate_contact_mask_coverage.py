@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import os
 import sys
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 
@@ -41,6 +42,22 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--iou-ref-max", type=int, default=20000)
     parser.add_argument("--iou-chunk", type=int, default=256)
     parser.add_argument("--pca-samples-per-set", type=int, default=2000)
+    parser.add_argument(
+        "--compute-tsne",
+        action="store_true",
+        help="Also render t-SNE scatter for real vs sampled masks.",
+    )
+    parser.add_argument(
+        "--tsne-samples-per-set",
+        type=int,
+        default=1000,
+        help="Per-set sample count for t-SNE. <=0 means use all.",
+    )
+    parser.add_argument("--tsne-perplexity", type=float, default=40.0)
+    parser.add_argument("--tsne-n-iter", type=int, default=1000)
+    parser.add_argument("--tsne-learning-rate", type=float, default=200.0)
+    parser.add_argument("--span-samples-per-set", type=int, default=2000)
+    parser.add_argument("--span-embed-dim", type=int, default=8)
     parser.add_argument("--chamfer-real", type=int, default=100)
     parser.add_argument("--chamfer-sampled", type=int, default=1000)
     parser.add_argument("--compute-chamfer", action="store_true")
@@ -97,12 +114,149 @@ def _pca_2d(x: torch.Tensor, q: int = 2) -> torch.Tensor:
     return u[:, :q] * s[:q]
 
 
+def _resolve_draw_count(total: int, requested: int) -> int:
+    if int(requested) <= 0:
+        return int(total)
+    return int(min(int(total), int(requested)))
+
+
+def _tsne_2d(
+    x: torch.Tensor,
+    seed: int,
+    perplexity: float,
+    n_iter: int,
+    learning_rate: float,
+) -> Optional[torch.Tensor]:
+    try:
+        from sklearn.manifold import TSNE  # type: ignore
+    except Exception as e:
+        raise RuntimeError(
+            "t-SNE requested but scikit-learn is not available in the current environment."
+        ) from e
+
+    x_np = x.detach().cpu().numpy()
+    n = int(x_np.shape[0])
+    if n < 6:
+        return None
+    perp_max = max(5.0, float((n - 1) // 3))
+    perp = float(max(2.0, min(float(perplexity), perp_max)))
+
+    sig = inspect.signature(TSNE.__init__)
+    kwargs = {
+        "n_components": 2,
+        "perplexity": perp,
+        "learning_rate": float(learning_rate),
+        "init": "pca",
+        "random_state": int(seed),
+    }
+    if "max_iter" in sig.parameters:
+        kwargs["max_iter"] = int(max(250, int(n_iter)))
+    else:
+        kwargs["n_iter"] = int(max(250, int(n_iter)))
+    if "n_jobs" in sig.parameters:
+        kwargs["n_jobs"] = -1
+
+    emb = TSNE(**kwargs).fit_transform(x_np)
+    return torch.from_numpy(emb).float()
+
+
 def _one_nn_accuracy(emb: torch.Tensor, labels: torch.Tensor) -> float:
     d = torch.cdist(emb, emb, p=2)
     d.fill_diagonal_(1e9)
     nn = d.argmin(dim=1)
     pred = labels[nn]
     return float((pred == labels).float().mean().item())
+
+
+def _covariance(x: torch.Tensor) -> torch.Tensor:
+    if x.ndim != 2:
+        raise ValueError(f"Expected 2D tensor, got {tuple(x.shape)}")
+    xc = x - x.mean(dim=0, keepdim=True)
+    den = max(1, int(x.shape[0]) - 1)
+    return (xc.T @ xc) / float(den)
+
+
+def _span_distribution_metrics(
+    real_masks: torch.Tensor,
+    sampled_masks: torch.Tensor,
+    samples_per_set: int,
+    embed_dim: int,
+    seed: int,
+) -> Dict[str, float]:
+    g = torch.Generator().manual_seed(int(seed) + 123)
+    nr = min(int(samples_per_set), int(real_masks.shape[0]))
+    ns = min(int(samples_per_set), int(sampled_masks.shape[0]))
+    ir = torch.randperm(int(real_masks.shape[0]), generator=g)[:nr]
+    is_ = torch.randperm(int(sampled_masks.shape[0]), generator=g)[:ns]
+    xr = real_masks[ir].float()
+    xs = sampled_masks[is_].float()
+
+    mu = xr.mean(dim=0, keepdim=True)
+    xr0 = xr - mu
+    xs0 = xs - mu
+    q = int(max(2, min(int(embed_dim), int(xr0.shape[0]) - 1, int(xr0.shape[1]) - 1)))
+    if q < 2:
+        return {
+            "pc2d_span_ratio_mean": 0.0,
+            "pc2d_intersection_cover_mean": 0.0,
+            "span_trace_ratio": 0.0,
+            "span_logdet_ratio": 0.0,
+            "real_to_sampled_nn_p95": 0.0,
+            "real_to_real_nn_p95": 0.0,
+            "nn_p95_ratio": 0.0,
+        }
+
+    _, _, v = torch.pca_lowrank(xr0, q=q)
+    emb_r = xr0 @ v[:, :q]
+    emb_s = xs0 @ v[:, :q]
+
+    eps = 1e-6
+    cov_r = _covariance(emb_r) + eps * torch.eye(q)
+    cov_s = _covariance(emb_s) + eps * torch.eye(q)
+    tr_ratio = float((torch.trace(cov_s) / torch.trace(cov_r).clamp_min(eps)).item())
+    sign_r, ldr = torch.linalg.slogdet(cov_r)
+    sign_s, lds = torch.linalg.slogdet(cov_s)
+    if float(sign_r.item()) > 0.0 and float(sign_s.item()) > 0.0:
+        ld_ratio = float(torch.exp((lds - ldr) / float(q)).item())
+    else:
+        ld_ratio = 0.0
+
+    d_rs = torch.cdist(emb_r, emb_s, p=2).min(dim=1).values
+    d_rr = torch.cdist(emb_r, emb_r, p=2)
+    d_rr.fill_diagonal_(1e9)
+    d_rr = d_rr.min(dim=1).values
+    p95_rs = float(torch.quantile(d_rs, q=0.95).item())
+    p95_rr = float(torch.quantile(d_rr, q=0.95).item())
+    nn_ratio = float(p95_rs / max(1e-8, p95_rr))
+
+    def _span_cover_1d(a: torch.Tensor, b: torch.Tensor) -> Tuple[float, float]:
+        a_lo = float(torch.quantile(a, q=0.01).item())
+        a_hi = float(torch.quantile(a, q=0.99).item())
+        b_lo = float(torch.quantile(b, q=0.01).item())
+        b_hi = float(torch.quantile(b, q=0.99).item())
+        a_span = max(1e-8, a_hi - a_lo)
+        b_span = max(0.0, b_hi - b_lo)
+        span_ratio = float(b_span / a_span)
+        inter = max(0.0, min(a_hi, b_hi) - max(a_lo, b_lo))
+        cover = float(inter / a_span)
+        return span_ratio, cover
+
+    span_ratios = []
+    covers = []
+    for j in range(min(2, q)):
+        sr, cv = _span_cover_1d(emb_r[:, j], emb_s[:, j])
+        span_ratios.append(sr)
+        covers.append(cv)
+
+    return {
+        "pc2d_span_ratio_mean": float(sum(span_ratios) / max(1, len(span_ratios))),
+        "pc2d_intersection_cover_mean": float(sum(covers) / max(1, len(covers))),
+        "span_trace_ratio": tr_ratio,
+        "span_logdet_ratio": ld_ratio,
+        "real_to_sampled_nn_p95": p95_rs,
+        "real_to_real_nn_p95": p95_rr,
+        "nn_p95_ratio": nn_ratio,
+    }
 
 
 def _mask_to_points(mask: torch.Tensor, template_points: torch.Tensor) -> torch.Tensor:
@@ -124,6 +278,11 @@ def _draw_figures(
     template_points: torch.Tensor,
     out_dir: str,
     pca_samples_per_set: int,
+    compute_tsne: bool,
+    tsne_samples_per_set: int,
+    tsne_perplexity: float,
+    tsne_n_iter: int,
+    tsne_learning_rate: float,
     seed: int,
 ) -> None:
     import matplotlib.pyplot as plt
@@ -169,8 +328,8 @@ def _draw_figures(
     plt.close()
 
     g = torch.Generator().manual_seed(seed)
-    nr = min(int(pca_samples_per_set), real_masks.shape[0])
-    ns = min(int(pca_samples_per_set), sampled_masks.shape[0])
+    nr = _resolve_draw_count(real_masks.shape[0], int(pca_samples_per_set))
+    ns = _resolve_draw_count(sampled_masks.shape[0], int(pca_samples_per_set))
     ir = torch.randperm(real_masks.shape[0], generator=g)[:nr]
     is_ = torch.randperm(sampled_masks.shape[0], generator=g)[:ns]
     xr = real_masks[ir].float()
@@ -181,8 +340,8 @@ def _draw_figures(
     y_np = y.numpy()
 
     plt.figure(figsize=(6, 5))
-    plt.scatter(emb[y_np == 0, 0], emb[y_np == 0, 1], s=8, alpha=0.5, label="real")
-    plt.scatter(emb[y_np == 1, 0], emb[y_np == 1, 1], s=8, alpha=0.5, label="sampled")
+    plt.scatter(emb[y_np == 0, 0], emb[y_np == 0, 1], s=8, alpha=0.5, label=f"real (n={nr})")
+    plt.scatter(emb[y_np == 1, 0], emb[y_np == 1, 1], s=8, alpha=0.5, label=f"sampled (n={ns})")
     plt.xlabel("PC1")
     plt.ylabel("PC2")
     plt.title(f"{robot_name}: mask PCA")
@@ -190,6 +349,50 @@ def _draw_figures(
     plt.tight_layout()
     plt.savefig(os.path.join(out_dir, f"{robot_name}_pca.png"), dpi=180)
     plt.close()
+
+    if bool(compute_tsne):
+        nr_t = _resolve_draw_count(real_masks.shape[0], int(tsne_samples_per_set))
+        ns_t = _resolve_draw_count(sampled_masks.shape[0], int(tsne_samples_per_set))
+        ir_t = torch.randperm(real_masks.shape[0], generator=g)[:nr_t]
+        is_t = torch.randperm(sampled_masks.shape[0], generator=g)[:ns_t]
+        xt = torch.cat([real_masks[ir_t].float(), sampled_masks[is_t].float()], dim=0)
+        yt = torch.cat([torch.zeros(nr_t), torch.ones(ns_t)], dim=0)
+        emb_t = _tsne_2d(
+            x=xt,
+            seed=int(seed),
+            perplexity=float(tsne_perplexity),
+            n_iter=int(tsne_n_iter),
+            learning_rate=float(tsne_learning_rate),
+        )
+        if emb_t is not None:
+            emb_t_np = emb_t.numpy()
+            yt_np = yt.numpy()
+            plt.figure(figsize=(6, 5))
+            plt.scatter(
+                emb_t_np[yt_np == 0, 0],
+                emb_t_np[yt_np == 0, 1],
+                s=8,
+                alpha=0.5,
+                label=f"real (n={nr_t})",
+            )
+            plt.scatter(
+                emb_t_np[yt_np == 1, 0],
+                emb_t_np[yt_np == 1, 1],
+                s=8,
+                alpha=0.5,
+                label=f"sampled (n={ns_t})",
+            )
+            plt.xlabel("tSNE-1")
+            plt.ylabel("tSNE-2")
+            plt.title(f"{robot_name}: mask t-SNE")
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(os.path.join(out_dir, f"{robot_name}_tsne.png"), dpi=180)
+            plt.close()
+        else:
+            print(
+                f"[{robot_name}] skip t-SNE: too few points."
+            )
 
 
 def main() -> None:
@@ -270,14 +473,21 @@ def main() -> None:
         med_iou = float(max_iou.median().item())
 
         g = torch.Generator().manual_seed(int(args.seed))
-        nr = min(int(args.pca_samples_per_set), real_masks.shape[0])
-        ns = min(int(args.pca_samples_per_set), sampled_masks.shape[0])
+        nr = _resolve_draw_count(real_masks.shape[0], int(args.pca_samples_per_set))
+        ns = _resolve_draw_count(sampled_masks.shape[0], int(args.pca_samples_per_set))
         ir = torch.randperm(real_masks.shape[0], generator=g)[:nr]
         is_ = torch.randperm(sampled_masks.shape[0], generator=g)[:ns]
         x = torch.cat([real_masks[ir].float(), sampled_masks[is_].float()], dim=0)
         labels = torch.cat([torch.zeros(nr), torch.ones(ns)], dim=0)
         emb = _pca_2d(x, q=2)
         one_nn_acc = _one_nn_accuracy(emb, labels)
+        span_metrics = _span_distribution_metrics(
+            real_masks=real_masks,
+            sampled_masks=sampled_masks,
+            samples_per_set=int(args.span_samples_per_set),
+            embed_dim=int(args.span_embed_dim),
+            seed=int(args.seed),
+        )
 
         chamfer_median = None
         chamfer_p90 = None
@@ -311,6 +521,7 @@ def main() -> None:
             "real_count_mean": float(real_counts.float().mean().item()),
             "sampled_count_mean": float(sampled_counts.float().mean().item()),
         }
+        robot_metrics.update(span_metrics)
         if chamfer_median is not None and chamfer_p90 is not None:
             robot_metrics["chamfer_median"] = chamfer_median
             robot_metrics["chamfer_p90"] = chamfer_p90
@@ -326,6 +537,11 @@ def main() -> None:
             template_points=template_points,
             out_dir=out_robot,
             pca_samples_per_set=int(args.pca_samples_per_set),
+            compute_tsne=bool(args.compute_tsne),
+            tsne_samples_per_set=int(args.tsne_samples_per_set),
+            tsne_perplexity=float(args.tsne_perplexity),
+            tsne_n_iter=int(args.tsne_n_iter),
+            tsne_learning_rate=float(args.tsne_learning_rate),
             seed=int(args.seed),
         )
         all_metrics[robot_name] = robot_metrics

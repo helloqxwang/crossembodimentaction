@@ -1,0 +1,67 @@
+{
+  "allegro": {
+    "count_wasserstein": 0.552643358707428,
+    "occupancy_js_divergence": 0.09930700063705444,
+    "coverage_iou_ge_03": 0.6402742862701416,
+    "coverage_iou_ge_05": 0.0020781380590051413,
+    "coverage_iou_ge_07": 0.0,
+    "median_best_iou": 0.3203883469104767,
+    "one_nn_separability_acc": 0.6234999895095825,
+    "real_count_mean": 57.39692306518555,
+    "sampled_count_mean": 56.86949920654297,
+    "chamfer_median": 0.017038533464074135,
+    "chamfer_p90": 0.023096797987818718
+  },
+  "barrett": {
+    "count_wasserstein": 0.5054311156272888,
+    "occupancy_js_divergence": 0.09270579367876053,
+    "coverage_iou_ge_03": 0.8127393126487732,
+    "coverage_iou_ge_05": 0.00982895027846098,
+    "coverage_iou_ge_07": 0.0,
+    "median_best_iou": 0.3571428656578064,
+    "one_nn_separability_acc": 0.6227499842643738,
+    "real_count_mean": 59.96055603027344,
+    "sampled_count_mean": 60.055999755859375,
+    "chamfer_median": 0.014020468108355999,
+    "chamfer_p90": 0.018201632425189018
+  },
+  "ezgripper": {
+    "count_wasserstein": 0.823535680770874,
+    "occupancy_js_divergence": 0.15903238952159882,
+    "coverage_iou_ge_03": 0.9841923117637634,
+    "coverage_iou_ge_05": 0.5595257878303528,
+    "coverage_iou_ge_07": 0.0006586530362255871,
+    "median_best_iou": 0.5106382966041565,
+    "one_nn_separability_acc": 0.7170000076293945,
+    "real_count_mean": 92.04330444335938,
+    "sampled_count_mean": 92.44950103759766,
+    "chamfer_median": 0.0065854014828801155,
+    "chamfer_p90": 0.009250377304852009
+  },
+  "robotiq_3finger": {
+    "count_wasserstein": 0.3573887348175049,
+    "occupancy_js_divergence": 0.10161525011062622,
+    "coverage_iou_ge_03": 0.7893518805503845,
+    "coverage_iou_ge_05": 0.04282407462596893,
+    "coverage_iou_ge_07": 0.0,
+    "median_best_iou": 0.3529411852359772,
+    "one_nn_separability_acc": 0.6256983280181885,
+    "real_count_mean": 22.057870864868164,
+    "sampled_count_mean": 22.40399932861328,
+    "chamfer_median": 0.01630372740328312,
+    "chamfer_p90": 0.022224318236112595
+  },
+  "shadowhand": {
+    "count_wasserstein": 1.0537517070770264,
+    "occupancy_js_divergence": 0.07950006425380707,
+    "coverage_iou_ge_03": 0.7247635722160339,
+    "coverage_iou_ge_05": 0.004632310476154089,
+    "coverage_iou_ge_07": 0.0,
+    "median_best_iou": 0.3333333432674408,
+    "one_nn_separability_acc": 0.562749981880188,
+    "real_count_mean": 73.73422241210938,
+    "sampled_count_mean": 74.52149963378906,
+    "chamfer_median": 0.012219958007335663,
+    "chamfer_p90": 0.016350701451301575
+  }
+}

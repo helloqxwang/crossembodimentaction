@@ -1,0 +1,13 @@
+{
+  "count_wasserstein": 1.1466482877731323,
+  "occupancy_js_divergence": 0.011416688561439514,
+  "coverage_iou_ge_03": 0.9697019457817078,
+  "coverage_iou_ge_05": 0.7115099430084229,
+  "coverage_iou_ge_07": 0.2820681631565094,
+  "median_best_iou": 0.6000000238418579,
+  "one_nn_separability_acc": 0.6393333077430725,
+  "real_count_mean": 92.04330444335938,
+  "sampled_count_mean": 93.13300323486328,
+  "chamfer_median": 0.0053513627499341965,
+  "chamfer_p90": 0.013274094089865685
+}

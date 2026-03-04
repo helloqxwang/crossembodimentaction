@@ -1,0 +1,392 @@
+[
+  {
+    "experiment": "patch_v3_default_10k",
+    "mean_blended_score": 0.867866829208889,
+    "mean_iou_score": 1.6668740117549894,
+    "mean_span_score": 0.6306837636482722,
+    "mean_ood_factor": 0.6871669081545414,
+    "robot_scores": {
+      "allegro": {
+        "iou_score": 1.1619481176137925,
+        "span_score": 0.5213507343962845,
+        "ood_factor": 0.6178600134199305,
+        "blended_score": 0.5596014764255041
+      },
+      "barrett": {
+        "iou_score": 1.381867918372154,
+        "span_score": 0.6402388213151613,
+        "ood_factor": 0.6482608434151456,
+        "blended_score": 0.7035032206685126
+      },
+      "ezgripper": {
+        "iou_score": 2.7058981239795683,
+        "span_score": 0.8314252592693122,
+        "ood_factor": 0.6646243118866315,
+        "blended_score": 1.300077583541961
+      },
+      "robotiq_3finger": {
+        "iou_score": 1.829583340883255,
+        "span_score": 0.5886548518524597,
+        "ood_factor": 0.849408705870157,
+        "blended_score": 1.132441833083221
+      },
+      "shadowhand": {
+        "iou_score": 1.255072557926178,
+        "span_score": 0.571749151408143,
+        "ood_factor": 0.6556806661808422,
+        "blended_score": 0.6437100323252469
+      }
+    }
+  },
+  {
+    "experiment": "patch_v3_mix_default_qreal_10k",
+    "mean_blended_score": 0.8676793114023982,
+    "mean_iou_score": 1.6579253447055815,
+    "mean_span_score": 0.6341761075668124,
+    "mean_ood_factor": 0.6912913086600134,
+    "robot_scores": {
+      "allegro": {
+        "iou_score": 1.1559543639421461,
+        "span_score": 0.5244489629581796,
+        "ood_factor": 0.6228217184805596,
+        "blended_score": 0.562627371807314
+      },
+      "barrett": {
+        "iou_score": 1.3824295729398726,
+        "span_score": 0.6284468029048829,
+        "ood_factor": 0.6449440184365699,
+        "blended_score": 0.6970790129620716
+      },
+      "ezgripper": {
+        "iou_score": 2.699998587369919,
+        "span_score": 0.835058125107416,
+        "ood_factor": 0.6556018644736789,
+        "blended_score": 1.2810607302793373
+      },
+      "robotiq_3finger": {
+        "iou_score": 1.7987764865159988,
+        "span_score": 0.6104818493878442,
+        "ood_factor": 0.8585982889292461,
+        "blended_score": 1.1363193166159844
+      },
+      "shadowhand": {
+        "iou_score": 1.2524677127599717,
+        "span_score": 0.5724447974757395,
+        "ood_factor": 0.674490652980013,
+        "blended_score": 0.6613101253472832
+      }
+    }
+  },
+  {
+    "experiment": "patch_v3_qreal_fix_10k",
+    "mean_blended_score": 0.8673179231703836,
+    "mean_iou_score": 1.641696857511997,
+    "mean_span_score": 0.6263530987416681,
+    "mean_ood_factor": 0.6976248131873298,
+    "robot_scores": {
+      "allegro": {
+        "iou_score": 1.1511533722281455,
+        "span_score": 0.5136435205285742,
+        "ood_factor": 0.6347584979367857,
+        "blended_score": 0.5688384670965141
+      },
+      "barrett": {
+        "iou_score": 1.3658816069364548,
+        "span_score": 0.6436602087485841,
+        "ood_factor": 0.6221335973974956,
+        "blended_score": 0.6700335591136211
+      },
+      "ezgripper": {
+        "iou_score": 2.667348217964172,
+        "span_score": 0.8258893228330855,
+        "ood_factor": 0.6646314598602141,
+        "blended_score": 1.283246934563648
+      },
+      "robotiq_3finger": {
+        "iou_score": 1.7871616393327714,
+        "span_score": 0.5825992650444971,
+        "ood_factor": 0.88227274639747,
+        "blended_score": 1.1516629861221797
+      },
+      "shadowhand": {
+        "iou_score": 1.2369394510984422,
+        "span_score": 0.5659731765536,
+        "ood_factor": 0.6843277643446833,
+        "blended_score": 0.6628076689559556
+      }
+    }
+  },
+  {
+    "experiment": "patch_v3_merge50_seed42_10k",
+    "mean_blended_score": 0.85309779210359,
+    "mean_iou_score": 1.6515537750720977,
+    "mean_span_score": 0.6334185451709524,
+    "mean_ood_factor": 0.6863748580395608,
+    "robot_scores": {
+      "allegro": {
+        "iou_score": 1.1595047384500503,
+        "span_score": 0.5157394287718325,
+        "ood_factor": 0.6312846766267781,
+        "blended_score": 0.5694179037221564
+      },
+      "barrett": {
+        "iou_score": 1.3746893733739853,
+        "span_score": 0.6397902398905259,
+        "ood_factor": 0.6393087338272925,
+        "blended_score": 0.6909199488903228
+      },
+      "ezgripper": {
+        "iou_score": 2.6843322277069093,
+        "span_score": 0.8280266246198542,
+        "ood_factor": 0.6186185294648816,
+        "blended_score": 1.2012396383315842
+      },
+      "robotiq_3finger": {
+        "iou_score": 1.7868400156497954,
+        "span_score": 0.5907686283170847,
+        "ood_factor": 0.8719822602484736,
+        "blended_score": 1.1409115828507648
+      },
+      "shadowhand": {
+        "iou_score": 1.2524025201797486,
+        "span_score": 0.5927678042554654,
+        "ood_factor": 0.6706800900303778,
+        "blended_score": 0.6629998867231214
+      }
+    }
+  },
+  {
+    "experiment": "patch_v3_merge50_seed20260304_10k",
+    "mean_blended_score": 0.8461607645810334,
+    "mean_iou_score": 1.664571671485901,
+    "mean_span_score": 0.6265833296455497,
+    "mean_ood_factor": 0.6789665844474577,
+    "robot_scores": {
+      "allegro": {
+        "iou_score": 1.1615571141242982,
+        "span_score": 0.513261363863718,
+        "ood_factor": 0.6135550943887761,
+        "blended_score": 0.5535732206972991
+      },
+      "barrett": {
+        "iou_score": 1.3843906968832016,
+        "span_score": 0.6223072408620164,
+        "ood_factor": 0.645219492458599,
+        "blended_score": 0.6965514225253518
+      },
+      "ezgripper": {
+        "iou_score": 2.69703950881958,
+        "span_score": 0.824385521135455,
+        "ood_factor": 0.5992306737462534,
+        "blended_score": 1.1672881176967946
+      },
+      "robotiq_3finger": {
+        "iou_score": 1.8208333224058153,
+        "span_score": 0.5946060248790623,
+        "ood_factor": 0.8641521766682593,
+        "blended_score": 1.1496182836079714
+      },
+      "shadowhand": {
+        "iou_score": 1.2590377151966095,
+        "span_score": 0.5783564974874966,
+        "ood_factor": 0.672675484975401,
+        "blended_score": 0.6637727783777504
+      }
+    }
+  },
+  {
+    "experiment": "patch_v3_mixed_direct_10k",
+    "mean_blended_score": 0.8443298782568777,
+    "mean_iou_score": 1.638915296494961,
+    "mean_span_score": 0.6159839824632898,
+    "mean_ood_factor": 0.6795417792758579,
+    "robot_scores": {
+      "allegro": {
+        "iou_score": 1.1406574204564093,
+        "span_score": 0.5165907410403252,
+        "ood_factor": 0.6147341597635049,
+        "blended_score": 0.5477470386193789
+      },
+      "barrett": {
+        "iou_score": 1.3464251190423966,
+        "span_score": 0.6088519351907128,
+        "ood_factor": 0.6176036247843357,
+        "blended_score": 0.6493458852650555
+      },
+      "ezgripper": {
+        "iou_score": 2.674167901277542,
+        "span_score": 0.8318215978350063,
+        "ood_factor": 0.6627119419660646,
+        "blended_score": 1.283825044387594
+      },
+      "robotiq_3finger": {
+        "iou_score": 1.7958605468273166,
+        "span_score": 0.5655417953536735,
+        "ood_factor": 0.8574768541580732,
+        "blended_score": 1.1179209111499615
+      },
+      "shadowhand": {
+        "iou_score": 1.2374654948711394,
+        "span_score": 0.5571138428967313,
+        "ood_factor": 0.6451823157073109,
+        "blended_score": 0.6228105118623979
+      }
+    }
+  },
+  {
+    "experiment": "patch_v3_merge65_35_seed42_10k",
+    "mean_blended_score": 0.8395871491749005,
+    "mean_iou_score": 1.6583173480629925,
+    "mean_span_score": 0.6309708281915573,
+    "mean_ood_factor": 0.6766646563655303,
+    "robot_scores": {
+      "allegro": {
+        "iou_score": 1.160119365155697,
+        "span_score": 0.5225610646507829,
+        "ood_factor": 0.6233455302214107,
+        "blended_score": 0.5641875740429855
+      },
+      "barrett": {
+        "iou_score": 1.3770636647939682,
+        "span_score": 0.630781616001967,
+        "ood_factor": 0.6443443786395956,
+        "blended_score": 0.6949581742313272
+      },
+      "ezgripper": {
+        "iou_score": 2.6925183117389677,
+        "span_score": 0.83611230144188,
+        "ood_factor": 0.5809061850182848,
+        "blended_score": 1.1327414472494781
+      },
+      "robotiq_3finger": {
+        "iou_score": 1.816006714105606,
+        "span_score": 0.5853770794471085,
+        "ood_factor": 0.879463697975975,
+        "blended_score": 1.1641943446022813
+      },
+      "shadowhand": {
+        "iou_score": 1.2458786845207213,
+        "span_score": 0.5800220794160478,
+        "ood_factor": 0.6552634899723849,
+        "blended_score": 0.6418542057484308
+      }
+    }
+  },
+  {
+    "experiment": "patch_v3_default_3k",
+    "mean_blended_score": 0.8195439612925604,
+    "mean_iou_score": 1.4705111258476973,
+    "mean_span_score": 0.6235350910890615,
+    "mean_ood_factor": 0.715343387797266,
+    "robot_scores": {
+      "allegro": {
+        "iou_score": 1.0143219605088234,
+        "span_score": 0.5351170993502238,
+        "ood_factor": 0.6315148492851412,
+        "blended_score": 0.5195093857488265
+      },
+      "barrett": {
+        "iou_score": 1.226421844959259,
+        "span_score": 0.6255963092046395,
+        "ood_factor": 0.6446347806952676,
+        "blended_score": 0.6356689620742791
+      },
+      "ezgripper": {
+        "iou_score": 2.542805236577988,
+        "span_score": 0.8300980772121387,
+        "ood_factor": 0.7238125547121084,
+        "blended_score": 1.344642776625115
+      },
+      "robotiq_3finger": {
+        "iou_score": 1.4874073952436448,
+        "span_score": 0.58062063554082,
+        "ood_factor": 0.8946341583481989,
+        "blended_score": 1.0061884993374741
+      },
+      "shadowhand": {
+        "iou_score": 1.0815991919487715,
+        "span_score": 0.5462433341374855,
+        "ood_factor": 0.6821205959456141,
+        "blended_score": 0.5917101826771067
+      }
+    }
+  },
+  {
+    "experiment": "patch_v3_qreal_fix_3k",
+    "mean_blended_score": 0.8075699831044153,
+    "mean_iou_score": 1.4615500488877298,
+    "mean_span_score": 0.629836467595704,
+    "mean_ood_factor": 0.7100033722569528,
+    "robot_scores": {
+      "allegro": {
+        "iou_score": 1.0130673550069331,
+        "span_score": 0.5243980533921976,
+        "ood_factor": 0.6353555769105652,
+        "blended_score": 0.5194664873713251
+      },
+      "barrett": {
+        "iou_score": 1.2263685822486878,
+        "span_score": 0.6332087062255928,
+        "ood_factor": 0.6572493535956603,
+        "blended_score": 0.6500883799149519
+      },
+      "ezgripper": {
+        "iou_score": 2.5422167479991913,
+        "span_score": 0.8295735602358814,
+        "ood_factor": 0.7136499578375191,
+        "blended_score": 1.3253617795282575
+      },
+      "robotiq_3finger": {
+        "iou_score": 1.4006018728017808,
+        "span_score": 0.5689927276192328,
+        "ood_factor": 0.8635741852552444,
+        "blended_score": 0.9222611451710357
+      },
+      "shadowhand": {
+        "iou_score": 1.1254956863820553,
+        "span_score": 0.5930092905056153,
+        "ood_factor": 0.6801877876857749,
+        "blended_score": 0.620672123536506
+      }
+    }
+  },
+  {
+    "experiment": "main_patch_baseline_3k",
+    "mean_blended_score": 0.33934156888059636,
+    "mean_iou_score": 0.855420486330986,
+    "mean_span_score": 0.39275647626973903,
+    "mean_ood_factor": 0.516151275745178,
+    "robot_scores": {
+      "allegro": {
+        "iou_score": 0.6211064748466015,
+        "span_score": 0.3896736312783764,
+        "ood_factor": 0.5385514299626496,
+        "blended_score": 0.2846423846501018
+      },
+      "barrett": {
+        "iou_score": 0.6489031419157981,
+        "span_score": 0.4325072597718302,
+        "ood_factor": 0.5289957649249777,
+        "blended_score": 0.2974780118394235
+      },
+      "ezgripper": {
+        "iou_score": 1.16395146548748,
+        "span_score": 0.4015619307714726,
+        "ood_factor": 0.34014540009341976,
+        "blended_score": 0.29218341959235616
+      },
+      "robotiq_3finger": {
+        "iou_score": 0.9807870715856551,
+        "span_score": 0.24150134255830014,
+        "ood_factor": 0.5819783655121256,
+        "blended_score": 0.3986975367465316
+      },
+      "shadowhand": {
+        "iou_score": 0.862354277819395,
+        "span_score": 0.49853821696871586,
+        "ood_factor": 0.5910854182327175,
+        "blended_score": 0.42370649157456874
+      }
+    }
+  }
+]
