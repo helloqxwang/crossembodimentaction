@@ -1,0 +1,115 @@
+defaults:
+  - _self_
+
+seed: 42
+
+experiment:
+  name: contact_diffusion_policy
+
+dataset:
+  robot_names:
+    - allegro
+    - barrett
+    - ezgripper
+    - robotiq_3finger
+    - shadowhand
+  hparams_path: ./contact_gen/contact_sampler_hparams.yaml
+  real_masks_path: ./contact_gen/contact_points_validate.pt
+  robot_model_device: cpu
+  check_template_hash: true
+  train_samples_per_epoch: 1000000
+  train_chunk_size: 256
+  batch_size: 256
+  val_batch_size: 128
+  num_workers: 16
+  prefetch_factor: 2
+  pin_memory: true
+  drop_last: true
+  cache_validation_samples: true
+  max_contact_points: 256
+  threshold: 0.4
+  align_exp_scale: 2.0
+  sigmoid_scale: 10.0
+  anchor_sampling_mode: point_prob
+  anchor_temperature: 1.0
+  patch_points: 96
+  patch_anchor_shift_min: 0.0002
+  patch_anchor_shift_max: 0.0030
+  patch_extent_min: 0.006
+  patch_extent_max: 0.050
+  patch_extent_power: 1.0
+  patch_shift_power: 1.0
+  patch_points_per_anchor_min: 28
+  patch_points_per_anchor_max: 84
+  patch_penetration_clearance: 0.00008
+  patch_exact_count_prob: 1.0
+  patch_count_clamp_ratio: 0.3
+
+model:
+  p_hat_encoder:
+    in_channels: 6
+    hidden_dim: 128
+    out_channels: 128
+    num_layers: 4
+  contact_encoder:
+    in_channels: 6
+    hidden_dim: 128
+    out_channels: 128
+    num_layers: 4
+  fusion_hidden_dims: [256]
+  global_cond_dim: 256
+  diffusion_step_embed_dim: 128
+  down_dims: [256, 512, 1024]
+  kernel_size: 5
+  n_groups: 8
+  condition_type: film
+  num_inference_steps: 10
+  noise_scheduler:
+    num_train_timesteps: 50
+    beta_start: 0.0001
+    beta_end: 0.02
+    beta_schedule: squaredcos_cap_v2
+    clip_sample: false
+    set_alpha_to_one: true
+    steps_offset: 0
+    prediction_type: sample
+
+training:
+  device: cuda
+  epochs: 100000
+  lr: 1.0e-4
+  betas: [0.95, 0.999]
+  eps: 1.0e-8
+  weight_decay: 1.0e-6
+  lr_scheduler: cosine
+  lr_warmup_steps: 500
+  grad_clip_norm: 1.0
+  use_amp: true
+  amp_dtype: bfloat16
+  use_ema: true
+  ema:
+    update_after_step: 0
+    inv_gamma: 1.0
+    power: 0.75
+    min_value: 0.0
+    max_value: 0.9999
+  log_every_n_steps: 10
+  val_subset_size: 2048
+  full_val_every_n_epochs: 10
+  max_train_batches: -1
+  max_val_batches: -1
+  save_every_n_epoch: 10
+  save_dir: ./checkpoints/contact_diffusion_policy
+
+wandb:
+  enabled: true
+  project: action_repr
+  entity: null
+  name: contact-diffusion-policy
+  mode: online
+
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}_contact_policy
+  job:
+    chdir: false

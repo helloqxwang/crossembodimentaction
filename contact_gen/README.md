@@ -1,33 +1,43 @@
 # contact_gen
 
-Extract and visualize manipulator contact point clouds from DRO-Grasp grasps using a GenDex-style continuous contact map.
-Hand geometry is loaded from `crossembodimentaction/robot_model/robot_model.py`.
+Clean pipeline for:
+1. extracting real hand contact masks from DRO-Grasp,
+2. fitting sampler hyperparameters,
+3. generating synthetic contact masks,
+4. evaluating distribution coverage,
+5. visualizing both real and sampled contacts.
 
-## 1) Extract contact points
+All commands below assume:
 
 ```bash
 cd /home/qianxu/Project/crossembodimentaction
+conda activate repr
+```
+
+---
+
+## 1) Extract real contact masks
+
+Script: `contact_gen/extract_contact_points.py`
+
+```bash
 python3 contact_gen/extract_contact_points.py \
   --dro-root /home/qianxu/Project/DRO-Grasp \
   --split validate \
   --threshold 0.4 \
-  --num-hand-points 2048 \
   --output-path /home/qianxu/Project/crossembodimentaction/contact_gen/contact_points_validate.pt
 ```
 
-Notes:
-- Contact values are computed **directly on hand surface points**.
-- Hand surface points are sampled uniformly on the full hand mesh with exact count `--num-hand-points`.
-- Surface templates are deterministic per robot/point-count and stored with `surface_template_hash`.
-- The contact mask is binarized by `--threshold` (default `0.4`).
-- Default method matches GenDex align-distance style:
-  - `align_exp_scale=2.0`
-  - `sigmoid_scale=10.0`
+Output:
+- `contact_points_validate.pt` (per-sample contact mask, contact points, hand points, q, etc.)
 
-## 2) Visualize with sliders
+---
+
+## 2) Visualize extracted real contacts
+
+Script: `contact_gen/visualize_contact_points.py`
 
 ```bash
-cd /home/qianxu/Project/crossembodimentaction
 python3 contact_gen/visualize_contact_points.py \
   --contact-path /home/qianxu/Project/crossembodimentaction/contact_gen/contact_points_validate.pt \
   --dro-root /home/qianxu/Project/DRO-Grasp \
@@ -35,80 +45,122 @@ python3 contact_gen/visualize_contact_points.py \
   --port 8080
 ```
 
-Sliders:
-- `sample_index`: choose grasp sample
-- `vis_mode`:
-  - `0`: point cloud only
-  - `1`: point cloud + hand mesh
-  - `2`: point cloud + hand mesh + object mesh
+Viewer sliders:
+- sample index
+- vis mode:
+  - `0`: points only
+  - `1`: points + hand mesh
+  - `2`: points + hand mesh + object mesh
 
-## 3) Infer Sampler Hyperparameters From Real Masks (YAML only)
+---
+
+## 3) Infer sampler hyperparameters
+
+Script: `contact_gen/infer_contact_sampler_hparams.py`
 
 ```bash
-cd /home/qianxu/Project/crossembodimentaction
 python3 contact_gen/infer_contact_sampler_hparams.py \
   --real-masks-path /home/qianxu/Project/crossembodimentaction/contact_gen/contact_points_validate.pt \
   --output-yaml /home/qianxu/Project/crossembodimentaction/contact_gen/contact_sampler_hparams.yaml
 ```
 
-This step is the only place that uses real masks for fitting hyperparameters.
-
-## 4) Visualize Surface Connectivity Graph
+Optional component visualization:
 
 ```bash
-cd /home/qianxu/Project/crossembodimentaction
+python3 contact_gen/infer_contact_sampler_hparams.py \
+  --real-masks-path /home/qianxu/Project/crossembodimentaction/contact_gen/contact_points_validate.pt \
+  --output-yaml /home/qianxu/Project/crossembodimentaction/contact_gen/contact_sampler_hparams.yaml \
+  --vis-components \
+  --vis-port 8094
+```
+
+Output:
+- `contact_sampler_hparams.yaml`
+
+---
+
+## 4) Visualize surface graph
+
+Script: `contact_gen/visualize_surface_graph.py`
+
+```bash
 python3 contact_gen/visualize_surface_graph.py \
-  --num-surface-points 512 \
+  --num-surface-points 1024 \
   --vis-port 8092
 ```
 
-Unified entry (same functionality in `robot_model/robot_model_vis.py`):
+---
+
+## 5) Generate synthetic contact masks (best clean sampler)
+
+Script: `contact_gen/generate_random_contact_masks.py`
+
+Method:
+- uses fitted component range from `contact_sampler_hparams.yaml`,
+- uses real mask count statistics from `contact_points_validate.pt`,
+- anchor sampling can be `point_prob` (real occupancy prior) or `uniform` (no point prior),
+- samples random robot `q`,
+- samples virtual object patches,
+- computes GenDex-style hand contact value,
+- thresholds and count-adjusts masks.
+
+Default config file:
+- `contact_gen/config_generate_random_contact_masks.yaml`
+
+Run:
 
 ```bash
-cd /home/qianxu/Project/crossembodimentaction
-python3 robot_model/robot_model_vis.py surface_graph \
-  --num-surface-points 512 \
-  --vis-port 8092
-```
-
-## 5) Generate Random Contact Masks (Hydra, data-less runtime)
-
-```bash
-cd /home/qianxu/Project/crossembodimentaction
 python3 contact_gen/generate_random_contact_masks.py \
   hparams_path=contact_gen/contact_sampler_hparams.yaml \
+  real_masks_path=contact_gen/contact_points_validate.pt \
+  anchor_sampling_mode=uniform \
   sample_count=10000 \
   output_dir=contact_gen/generated_masks
 ```
 
-Notes:
-- Random generation reads only the YAML hyperparameters.
-- Runtime sampling is data-less: random joint limits + virtual object patches.
-- Real masks are only used in step 3 to infer component range.
-- No target contact-count (`k`) constraints or trial optimization are used.
-- Base translation joints (`base/root/world xyz` when present) are forced to zero during random sampling.
+Output:
+- one file per robot: `*_random_masks.pt`
 
-## 6) Evaluate Coverage
+---
 
-```bash
-cd /home/qianxu/Project/crossembodimentaction
-python3 contact_gen/evaluate_contact_mask_coverage.py \
-  --input-dir /home/qianxu/Project/crossembodimentaction/contact_gen/generated_masks \
-  --real-masks-path /home/qianxu/Project/crossembodimentaction/contact_gen/contact_points_validate.pt \
-  --output-dir /home/qianxu/Project/crossembodimentaction/contact_gen/coverage_eval
-```
+## 6) Visualize sampled masks
 
-## 7) Visualize sampled masks + virtual patches
+Script: `contact_gen/visualize_sampled_contact_masks.py`
 
 ```bash
-cd /home/qianxu/Project/crossembodimentaction
 python3 contact_gen/visualize_sampled_contact_masks.py \
   --sampled-path /home/qianxu/Project/crossembodimentaction/contact_gen/generated_masks/allegro_random_masks.pt \
-  --host 127.0.0.1 --port 8080
+  --host 127.0.0.1 \
+  --port 8080
 ```
 
-`vis_mode` options:
+Viewer vis modes:
 - `0`: contact points only
 - `1`: contact points + hand
 - `2`: contact points + sampled object patches
 - `3`: contact points + hand + sampled object patches
+
+---
+
+## 7) Evaluate coverage (metrics + PCA + t-SNE)
+
+Script: `contact_gen/evaluate_contact_mask_coverage.py`
+
+```bash
+python3 contact_gen/evaluate_contact_mask_coverage.py \
+  --input-dir /home/qianxu/Project/crossembodimentaction/contact_gen/generated_masks \
+  --real-masks-path /home/qianxu/Project/crossembodimentaction/contact_gen/contact_points_validate.pt \
+  --output-dir /home/qianxu/Project/crossembodimentaction/contact_gen/coverage_eval \
+  --compute-tsne \
+  --pca-samples-per-set 2000 \
+  --tsne-samples-per-set 1000
+```
+
+Notes:
+- PCA and t-SNE plots sample up to `*_samples_per_set` points **per set** (real and sampled), so both colors can appear with similar point counts even when raw dataset sizes differ.
+- Use `--pca-samples-per-set -1` to draw all masks for each set.
+
+Output:
+- per-robot metrics: `coverage_eval/<robot>/metrics.json`
+- plots: count histogram, occupancy, PCA, t-SNE
+- summary: `coverage_eval/summary_metrics.json`

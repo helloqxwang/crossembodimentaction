@@ -41,7 +41,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-dir", type=str, default=os.path.join(PROJECT_ROOT, "contact_gen", "coverage_eval"))
     parser.add_argument("--iou-ref-max", type=int, default=20000)
     parser.add_argument("--iou-chunk", type=int, default=256)
-    parser.add_argument("--pca-samples-per-set", type=int, default=2000)
+    parser.add_argument("--pca-samples-per-set", type=int, default=-1)
     parser.add_argument(
         "--compute-tsne",
         action="store_true",
@@ -50,7 +50,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--tsne-samples-per-set",
         type=int,
-        default=1000,
+        default=-1,
         help="Per-set sample count for t-SNE. <=0 means use all.",
     )
     parser.add_argument("--tsne-perplexity", type=float, default=40.0)
@@ -61,6 +61,22 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--chamfer-real", type=int, default=100)
     parser.add_argument("--chamfer-sampled", type=int, default=1000)
     parser.add_argument("--compute-chamfer", action="store_true")
+    parser.add_argument(
+        "--feature-mode",
+        type=str,
+        default="mask_only",
+        choices=["mask_only", "mask_plus_pose"],
+        help=(
+            "Feature space for embedding-based metrics/plots (PCA, t-SNE, 1-NN, span). "
+            "'mask_only' ignores q/pose; 'mask_plus_pose' concatenates normalized q."
+        ),
+    )
+    parser.add_argument(
+        "--pose-feature-weight",
+        type=float,
+        default=1.0,
+        help="Scale applied to normalized pose feature when feature-mode=mask_plus_pose.",
+    )
     parser.add_argument("--seed", type=int, default=42)
     return parser
 
@@ -271,10 +287,45 @@ def _chamfer(a: torch.Tensor, b: torch.Tensor) -> float:
     return float((d.min(dim=1).values.mean() + d.min(dim=0).values.mean()).item())
 
 
+def _build_feature_matrices(
+    real_masks: torch.Tensor,
+    sampled_masks: torch.Tensor,
+    real_q: Optional[torch.Tensor],
+    sampled_q: Optional[torch.Tensor],
+    feature_mode: str,
+    pose_feature_weight: float,
+    robot_name: str,
+) -> Tuple[torch.Tensor, torch.Tensor, str]:
+    if str(feature_mode) != "mask_plus_pose":
+        return real_masks.float(), sampled_masks.float(), "mask_only"
+
+    if real_q is None or sampled_q is None:
+        print(f"[{robot_name}] feature_mode=mask_plus_pose requested, but q is missing; fallback to mask_only.")
+        return real_masks.float(), sampled_masks.float(), "mask_only"
+    if real_q.ndim != 2 or sampled_q.ndim != 2 or int(real_q.shape[1]) != int(sampled_q.shape[1]):
+        print(
+            f"[{robot_name}] feature_mode=mask_plus_pose requested, but q dim mismatch "
+            f"(real={tuple(real_q.shape)}, sampled={tuple(sampled_q.shape)}); fallback to mask_only."
+        )
+        return real_masks.float(), sampled_masks.float(), "mask_only"
+
+    mu = real_q.mean(dim=0, keepdim=True)
+    sigma = real_q.std(dim=0, keepdim=True).clamp_min(1e-6)
+    real_qn = (real_q - mu) / sigma
+    sampled_qn = (sampled_q - mu) / sigma
+    w = float(pose_feature_weight)
+    x_real = torch.cat([real_masks.float(), real_qn * w], dim=1)
+    x_sampled = torch.cat([sampled_masks.float(), sampled_qn * w], dim=1)
+    return x_real, x_sampled, "mask_plus_pose"
+
+
 def _draw_figures(
     robot_name: str,
     real_masks: torch.Tensor,
     sampled_masks: torch.Tensor,
+    real_features: torch.Tensor,
+    sampled_features: torch.Tensor,
+    feature_mode_used: str,
     template_points: torch.Tensor,
     out_dir: str,
     pca_samples_per_set: int,
@@ -332,8 +383,8 @@ def _draw_figures(
     ns = _resolve_draw_count(sampled_masks.shape[0], int(pca_samples_per_set))
     ir = torch.randperm(real_masks.shape[0], generator=g)[:nr]
     is_ = torch.randperm(sampled_masks.shape[0], generator=g)[:ns]
-    xr = real_masks[ir].float()
-    xs = sampled_masks[is_].float()
+    xr = real_features[ir].float()
+    xs = sampled_features[is_].float()
     x = torch.cat([xr, xs], dim=0)
     y = torch.cat([torch.zeros(nr), torch.ones(ns)], dim=0)
     emb = _pca_2d(x, q=2).numpy()
@@ -344,7 +395,7 @@ def _draw_figures(
     plt.scatter(emb[y_np == 1, 0], emb[y_np == 1, 1], s=8, alpha=0.5, label=f"sampled (n={ns})")
     plt.xlabel("PC1")
     plt.ylabel("PC2")
-    plt.title(f"{robot_name}: mask PCA")
+    plt.title(f"{robot_name}: PCA ({feature_mode_used})")
     plt.legend()
     plt.tight_layout()
     plt.savefig(os.path.join(out_dir, f"{robot_name}_pca.png"), dpi=180)
@@ -355,7 +406,7 @@ def _draw_figures(
         ns_t = _resolve_draw_count(sampled_masks.shape[0], int(tsne_samples_per_set))
         ir_t = torch.randperm(real_masks.shape[0], generator=g)[:nr_t]
         is_t = torch.randperm(sampled_masks.shape[0], generator=g)[:ns_t]
-        xt = torch.cat([real_masks[ir_t].float(), sampled_masks[is_t].float()], dim=0)
+        xt = torch.cat([real_features[ir_t].float(), sampled_features[is_t].float()], dim=0)
         yt = torch.cat([torch.zeros(nr_t), torch.ones(ns_t)], dim=0)
         emb_t = _tsne_2d(
             x=xt,
@@ -384,7 +435,7 @@ def _draw_figures(
             )
             plt.xlabel("tSNE-1")
             plt.ylabel("tSNE-2")
-            plt.title(f"{robot_name}: mask t-SNE")
+            plt.title(f"{robot_name}: t-SNE ({feature_mode_used})")
             plt.legend()
             plt.tight_layout()
             plt.savefig(os.path.join(out_dir, f"{robot_name}_tsne.png"), dpi=180)
@@ -414,7 +465,7 @@ def main() -> None:
                 if rn:
                     real_by_robot.setdefault(rn, []).append(s)
 
-    all_metrics: Dict[str, Dict[str, float]] = {}
+    all_metrics: Dict[str, Dict[str, object]] = {}
     for robot_name in args.robot_names:
         in_path = os.path.join(args.input_dir, f"{robot_name}_random_masks.pt")
         if not os.path.exists(in_path):
@@ -422,10 +473,24 @@ def main() -> None:
             continue
         payload = torch.load(in_path, map_location="cpu")
         sampled_masks = payload["sampled_masks"].bool()
+        sampled_q: Optional[torch.Tensor] = None
+        if "sampled_q" in payload:
+            sq = torch.as_tensor(payload["sampled_q"]).float()
+            if sq.ndim == 1:
+                sq = sq.unsqueeze(0)
+            if int(sq.shape[0]) == int(sampled_masks.shape[0]):
+                sampled_q = sq
         num_points = int(payload["meta"]["num_surface_points"])
         resolved_robot_name = str(payload["meta"]["robot_model_name"])
+        real_q: Optional[torch.Tensor] = None
         if "real_masks" in payload:
             real_masks = payload["real_masks"].bool()
+            if "real_q" in payload:
+                rq = torch.as_tensor(payload["real_q"]).float()
+                if rq.ndim == 1:
+                    rq = rq.unsqueeze(0)
+                if int(rq.shape[0]) == int(real_masks.shape[0]):
+                    real_q = rq
         else:
             if len(real_by_robot.get(robot_name, [])) == 0:
                 raise RuntimeError(
@@ -433,15 +498,23 @@ def main() -> None:
                     f"were found in --real-masks-path={real_masks_path}"
                 )
             rm_list = []
+            rq_list = []
+            all_q_available = True
             for s in real_by_robot[robot_name]:
                 m = torch.as_tensor(s["hand_contact_mask"]).bool().view(-1)
                 if int(m.numel()) == int(num_points):
                     rm_list.append(m)
+                    if "q" in s:
+                        rq_list.append(torch.as_tensor(s["q"]).float().view(-1))
+                    else:
+                        all_q_available = False
             if len(rm_list) == 0:
                 raise RuntimeError(
                     f"{robot_name}: no real masks in {real_masks_path} with num_surface_points={num_points}"
                 )
             real_masks = torch.stack(rm_list, dim=0).bool()
+            if all_q_available and len(rq_list) == len(rm_list):
+                real_q = torch.stack(rq_list, dim=0).float()
 
         model = create_robot_model(
             robot_name=resolved_robot_name,
@@ -472,18 +545,28 @@ def main() -> None:
         cov_07 = float((max_iou >= 0.7).float().mean().item())
         med_iou = float(max_iou.median().item())
 
+        real_features, sampled_features, feature_mode_used = _build_feature_matrices(
+            real_masks=real_masks,
+            sampled_masks=sampled_masks,
+            real_q=real_q,
+            sampled_q=sampled_q,
+            feature_mode=str(args.feature_mode),
+            pose_feature_weight=float(args.pose_feature_weight),
+            robot_name=robot_name,
+        )
+
         g = torch.Generator().manual_seed(int(args.seed))
-        nr = _resolve_draw_count(real_masks.shape[0], int(args.pca_samples_per_set))
-        ns = _resolve_draw_count(sampled_masks.shape[0], int(args.pca_samples_per_set))
-        ir = torch.randperm(real_masks.shape[0], generator=g)[:nr]
-        is_ = torch.randperm(sampled_masks.shape[0], generator=g)[:ns]
-        x = torch.cat([real_masks[ir].float(), sampled_masks[is_].float()], dim=0)
+        nr = _resolve_draw_count(real_features.shape[0], int(args.pca_samples_per_set))
+        ns = _resolve_draw_count(sampled_features.shape[0], int(args.pca_samples_per_set))
+        ir = torch.randperm(real_features.shape[0], generator=g)[:nr]
+        is_ = torch.randperm(sampled_features.shape[0], generator=g)[:ns]
+        x = torch.cat([real_features[ir].float(), sampled_features[is_].float()], dim=0)
         labels = torch.cat([torch.zeros(nr), torch.ones(ns)], dim=0)
         emb = _pca_2d(x, q=2)
         one_nn_acc = _one_nn_accuracy(emb, labels)
         span_metrics = _span_distribution_metrics(
-            real_masks=real_masks,
-            sampled_masks=sampled_masks,
+            real_masks=real_features,
+            sampled_masks=sampled_features,
             samples_per_set=int(args.span_samples_per_set),
             embed_dim=int(args.span_embed_dim),
             seed=int(args.seed),
@@ -510,7 +593,7 @@ def main() -> None:
             chamfer_median = float(best_t.median().item())
             chamfer_p90 = float(torch.quantile(best_t, q=0.9).item())
 
-        robot_metrics: Dict[str, float] = {
+        robot_metrics: Dict[str, object] = {
             "count_wasserstein": float(count_w),
             "occupancy_js_divergence": float(js_occ),
             "coverage_iou_ge_03": cov_03,
@@ -520,6 +603,7 @@ def main() -> None:
             "one_nn_separability_acc": float(one_nn_acc),
             "real_count_mean": float(real_counts.float().mean().item()),
             "sampled_count_mean": float(sampled_counts.float().mean().item()),
+            "feature_mode_used": feature_mode_used,
         }
         robot_metrics.update(span_metrics)
         if chamfer_median is not None and chamfer_p90 is not None:
@@ -534,6 +618,9 @@ def main() -> None:
             robot_name=robot_name,
             real_masks=real_masks,
             sampled_masks=sampled_masks,
+            real_features=real_features,
+            sampled_features=sampled_features,
+            feature_mode_used=feature_mode_used,
             template_points=template_points,
             out_dir=out_robot,
             pca_samples_per_set=int(args.pca_samples_per_set),

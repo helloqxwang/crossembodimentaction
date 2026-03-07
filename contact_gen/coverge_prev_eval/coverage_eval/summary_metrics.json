@@ -1,0 +1,57 @@
+{
+  "allegro": {
+    "count_wasserstein": 10.006081581115723,
+    "occupancy_js_divergence": 0.32385027408599854,
+    "coverage_iou_ge_03": 0.6149210333824158,
+    "coverage_iou_ge_05": 0.009351621381938457,
+    "coverage_iou_ge_07": 0.0,
+    "median_best_iou": 0.31578946113586426,
+    "one_nn_separability_acc": 0.8069999814033508,
+    "real_count_mean": 57.39692306518555,
+    "sampled_count_mean": 63.983001708984375
+  },
+  "barrett": {
+    "count_wasserstein": 10.980252265930176,
+    "occupancy_js_divergence": 0.361923485994339,
+    "coverage_iou_ge_03": 0.6688792705535889,
+    "coverage_iou_ge_05": 0.01646668277680874,
+    "coverage_iou_ge_07": 0.0,
+    "median_best_iou": 0.32894736528396606,
+    "one_nn_separability_acc": 0.9272500276565552,
+    "real_count_mean": 59.96055603027344,
+    "sampled_count_mean": 68.85690307617188
+  },
+  "ezgripper": {
+    "count_wasserstein": 26.34037208557129,
+    "occupancy_js_divergence": 0.4458267092704773,
+    "coverage_iou_ge_03": 0.9840276837348938,
+    "coverage_iou_ge_05": 0.1845875233411789,
+    "coverage_iou_ge_07": 0.0008233163389377296,
+    "median_best_iou": 0.44155845046043396,
+    "one_nn_separability_acc": 0.9495000243186951,
+    "real_count_mean": 92.04330444335938,
+    "sampled_count_mean": 74.92960357666016
+  },
+  "robotiq_3finger": {
+    "count_wasserstein": 3.418036699295044,
+    "occupancy_js_divergence": 0.4068262279033661,
+    "coverage_iou_ge_03": 0.8344907164573669,
+    "coverage_iou_ge_05": 0.1215277761220932,
+    "coverage_iou_ge_07": 0.004629629664123058,
+    "median_best_iou": 0.375,
+    "one_nn_separability_acc": 0.8592877388000488,
+    "real_count_mean": 22.057870864868164,
+    "sampled_count_mean": 18.923999786376953
+  },
+  "shadowhand": {
+    "count_wasserstein": 18.406539916992188,
+    "occupancy_js_divergence": 0.2978140711784363,
+    "coverage_iou_ge_03": 0.7625941038131714,
+    "coverage_iou_ge_05": 0.007141478359699249,
+    "coverage_iou_ge_07": 0.0,
+    "median_best_iou": 0.34306567907333374,
+    "one_nn_separability_acc": 0.8502500057220459,
+    "real_count_mean": 73.73422241210938,
+    "sampled_count_mean": 89.654296875
+  }
+}

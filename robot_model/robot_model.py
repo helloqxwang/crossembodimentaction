@@ -1088,6 +1088,7 @@ class RobotModel:
         self.pk_chain = chain
         self.dof = len(self.pk_chain.get_joint_parameter_names())
         self.joint_orders = [joint.name for joint in self.pk_chain.get_joints()]
+        self.base_pose_indices = self._infer_base_pose_indices()
         self.base_translation_indices = self._infer_base_translation_indices()
         # NOTE: num_points now means whole-hand surface point count.
         self.link_num_points = int(num_points)
@@ -1097,6 +1098,7 @@ class RobotModel:
         self.meshes_original = {k: v.copy() for k, v in meshes.items()}
         self.vertices_original = self._sample_points_from_meshes(self.meshes_original)
         mesh_link_names = list(self.meshes_original.keys())
+        self.mesh_link_names = list(mesh_link_names)
         if self.robot_path.suffix.lower() == ".urdf":
             self.link_parent_map, self.link_children_map = _build_link_tree_from_urdf(self.robot_path, mesh_link_names)
         elif self.robot_path.suffix.lower() == ".xml":
@@ -1140,6 +1142,7 @@ class RobotModel:
         self.surface_artifact_built: bool = False
         with _temporary_global_seed(self.surface_template_seed):
             self._load_or_build_surface_assets(num_points=self.surface_num_points)
+        self.joint_descendant_link_mask = self._build_joint_descendant_link_mask()
 
     def _allocate_points_over_meshes(
         self,
@@ -1562,6 +1565,58 @@ class RobotModel:
     def get_joint_orders(self) -> List[str]:
         return list(self.joint_orders)
 
+    def _infer_base_pose_indices(self) -> List[int]:
+        idx: List[int] = []
+        for i, name in enumerate(self.joint_orders):
+            n = name.lower().replace("-", "_").replace(" ", "")
+            has_base_token = any(t in n for t in ("root", "base", "world", "global", "floating", "trans", "virtual"))
+            if not has_base_token:
+                continue
+            if any(
+                t in n
+                for t in (
+                    "roll",
+                    "pitch",
+                    "yaw",
+                    "rot",
+                    "_rx",
+                    "_ry",
+                    "_rz",
+                    "_x",
+                    "_y",
+                    "_z",
+                    "x",
+                    "y",
+                    "z",
+                )
+            ):
+                idx.append(i)
+        return sorted(set(idx))
+
+    def _build_joint_descendant_link_mask(self) -> torch.Tensor:
+        link_to_idx = {name: i for i, name in enumerate(self.mesh_link_names)}
+        joint_to_links: Dict[str, List[str]] = {}
+        for joint, child_links in self.pk_chain.get_joints_and_child_links():
+            joint_name = str(joint.name)
+            descendants: List[str] = []
+            for link in child_links:
+                link_name = getattr(link, "name", None)
+                if link_name in link_to_idx:
+                    descendants.append(str(link_name))
+            joint_to_links[joint_name] = descendants
+
+        mask = torch.zeros(
+            (self.dof, len(self.mesh_link_names)),
+            dtype=torch.bool,
+            device=self.device,
+        )
+        for joint_idx, joint_name in enumerate(self.joint_orders):
+            for link_name in joint_to_links.get(joint_name, []):
+                mask[joint_idx, link_to_idx[link_name]] = True
+        if len(self.base_pose_indices) > 0 and len(self.mesh_link_names) > 0:
+            mask[self.base_pose_indices] = True
+        return mask
+
     def _infer_base_translation_indices(self) -> List[int]:
         idx: List[int] = []
         direct = {
@@ -1676,7 +1731,7 @@ class RobotModel:
         points = torch.zeros((n_total, 3), dtype=torch.float32, device=self.device)
         normals = torch.zeros((n_total, 3), dtype=torch.float32, device=self.device)
         link_idx = self.surface_template_link_indices
-        link_names = list(self.meshes_original.keys())
+        link_names = self.mesh_link_names
 
         for link_i, link_name in enumerate(link_names):
             mask = link_idx == int(link_i)
@@ -1701,6 +1756,74 @@ class RobotModel:
             normals[mask] = nrms_world
 
         return points, normals
+
+    def sample_random_q(
+        self,
+        batch_size: int = 1,
+        generator: Optional[torch.Generator] = None,
+    ) -> torch.Tensor:
+        if int(batch_size) <= 0:
+            raise ValueError("batch_size must be positive")
+        if int(batch_size) == 1:
+            return self._sample_q_for_contact(generator=generator)
+        return torch.stack(
+            [self._sample_q_for_contact(generator=generator) for _ in range(int(batch_size))],
+            dim=0,
+        )
+
+    def mix_q_by_contact_mask(
+        self,
+        q1: torch.Tensor,
+        q2: torch.Tensor,
+        mask: torch.Tensor,
+    ) -> torch.Tensor:
+        squeeze = False
+        if q1.ndim == 1:
+            q1 = q1.unsqueeze(0)
+            squeeze = True
+        if q2.ndim == 1:
+            q2 = q2.unsqueeze(0)
+        if mask.ndim == 1:
+            mask = mask.unsqueeze(0)
+
+        if q1.shape != q2.shape:
+            raise ValueError(f"q1 and q2 must have the same shape, got {tuple(q1.shape)} vs {tuple(q2.shape)}")
+        if q1.ndim != 2:
+            raise ValueError(f"Expected q tensors with shape (B, dof), got {tuple(q1.shape)}")
+        if q1.shape[-1] != self.dof:
+            raise ValueError(f"Expected q last dim {self.dof}, got {q1.shape[-1]}")
+        if mask.ndim != 2 or int(mask.shape[0]) != int(q1.shape[0]):
+            raise ValueError(
+                f"mask must have shape (B, {self.surface_num_points}), got {tuple(mask.shape)} for batch {q1.shape[0]}"
+            )
+        if int(mask.shape[-1]) != int(self.surface_num_points):
+            raise ValueError(
+                f"mask last dim must match surface_num_points={self.surface_num_points}, got {mask.shape[-1]}"
+            )
+
+        q1 = q1.to(self.device)
+        q2 = q2.to(self.device)
+        mask = mask.to(self.device).bool()
+
+        active_links = torch.zeros(
+            (mask.shape[0], len(self.mesh_link_names)),
+            dtype=torch.bool,
+            device=self.device,
+        )
+        link_idx = self.surface_template_link_indices.to(self.device)
+        for link_i in range(len(self.mesh_link_names)):
+            surface_mask = link_idx == int(link_i)
+            if bool(surface_mask.any()):
+                active_links[:, link_i] = mask[:, surface_mask].any(dim=1)
+
+        joint_active = (
+            active_links.unsqueeze(1)
+            & self.joint_descendant_link_mask.unsqueeze(0)
+        ).any(dim=-1)
+        mixed = torch.where(joint_active, q2, q1)
+        if squeeze:
+            return mixed.squeeze(0)
+        return mixed
 
     @staticmethod
     def _compute_gendex_contact_value_source_target(
