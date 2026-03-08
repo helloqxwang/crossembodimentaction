@@ -8,19 +8,19 @@ robot_names:
   - robotiq_3finger
   - shadowhand
 
-device: cpu
+device: cuda
 seed: 42
 
 threshold: 0.4
 align_exp_scale: 2.0
 sigmoid_scale: 10.0
+component_sampling_mode: distribution
 
-sample_count: 10000
+sample_count: 100000
 # `per_robot`: each robot gets `sample_count` samples.
 # `total`: `sample_count` is split across all robots.
 sample_count_mode: per_robot
-sample_chunk: 1000
-patch_points: 96
+sample_chunk: 1024
 save_visualization_samples: 200
 
 # Use component range inferred in hparams yaml when value is -1.
@@ -41,13 +41,10 @@ patch_extent_min: 0.006
 patch_extent_max: 0.050
 patch_extent_power: 1.0
 patch_shift_power: 1.0
+patch_normal_jitter_max_deg: 10.0
 patch_points_per_anchor_min: 28
 patch_points_per_anchor_max: 84
 patch_penetration_clearance: 0.00008
-
-# Mask count adjustment.
-patch_exact_count_prob: 1.0
-patch_count_clamp_ratio: 0.3
 
 output_dir: contact_gen/generated_masks
 

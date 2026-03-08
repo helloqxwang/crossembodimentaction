@@ -410,6 +410,18 @@ def main() -> None:
         comp_range = sampler_state.get("component_range", torch.tensor([1, 4], dtype=torch.long))
         comp_lo = int(comp_range[0].item())
         comp_hi = int(comp_range[1].item())
+        component_count_values = sampler_state.get(
+            "component_count_values",
+            torch.arange(comp_lo, comp_hi + 1, dtype=torch.long),
+        )
+        component_count_distribution = sampler_state.get(
+            "component_count_distribution",
+            torch.ones((int(component_count_values.numel()),), dtype=torch.float32),
+        ).float()
+        component_count_distribution = component_count_distribution / component_count_distribution.sum().clamp_min(1e-8)
+        count_range = sampler_state.get("contact_count_range", torch.tensor([1, num_surface_points], dtype=torch.long))
+        count_lo = int(count_range[0].item())
+        count_hi = int(count_range[1].item())
 
         counts = real_masks_t.sum(dim=1).float()
         out["robots"][robot_name] = {
@@ -417,13 +429,21 @@ def main() -> None:
             "num_surface_points": int(num_surface_points),
             "surface_template_hash": model_template_hash,
             "component_range": [int(comp_lo), int(comp_hi)],
+            "component_count_values": [int(x) for x in component_count_values.view(-1).tolist()],
+            "component_count_distribution": [
+                float(x) for x in component_count_distribution.view(-1).tolist()
+            ],
+            "contact_count_range": [int(count_lo), int(count_hi)],
             "num_real_samples": int(real_masks_t.shape[0]),
             "real_count_mean": float(counts.mean().item()),
             "real_count_std": float(counts.std(unbiased=False).item()),
         }
         print(
             f"[{robot_name}] model={resolved_robot_name} n_real={real_masks_t.shape[0]} "
-            f"component_range={[comp_lo, comp_hi]} template_hash={model_template_hash[:12]}"
+            f"component_range={[comp_lo, comp_hi]} "
+            f"component_count_distribution={component_count_distribution.view(-1).tolist()} "
+            f"contact_count_range={[count_lo, count_hi]} "
+            f"template_hash={model_template_hash[:12]}"
         )
 
         if bool(args.vis_components):

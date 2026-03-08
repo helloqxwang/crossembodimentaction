@@ -4,7 +4,7 @@ import hashlib
 import os
 import sys
 from datetime import datetime
-from typing import Any
+from typing import Any, Dict
 
 import hydra
 import torch
@@ -15,26 +15,25 @@ from tqdm import tqdm
 
 THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(THIS_DIR)
+sys.path.append(PROJECT_ROOT)
+
+from data_process.contact_policy_dataset import (  # noqa: E402
+    _BaseContactPolicyDataset,
+    _format_contact_count_interval_summary,
+    _init_contact_count_interval_stats,
+    _merge_contact_count_interval_stats,
+)
 
 
 def _abs_path(path: str) -> str:
     if os.path.isabs(path):
         return path
-    base = hydra.utils.get_original_cwd()
-    return os.path.abspath(os.path.join(base, path))
+    return os.path.abspath(os.path.join(PROJECT_ROOT, path))
 
 
 def _stable_seed_from_name(name: str) -> int:
     h = hashlib.sha1(name.encode("utf-8")).digest()
     return int.from_bytes(h[:8], byteorder="little", signed=False) % (2**31 - 1)
-
-
-def _to_int_list(x: Any) -> list[int]:
-    if x is None:
-        return []
-    if isinstance(x, list):
-        return [int(v) for v in x]
-    return [int(x)]
 
 
 def _compute_sample_count_map(robot_names: list[str], sample_count: int, mode: str) -> dict[str, int]:
@@ -50,93 +49,110 @@ def _compute_sample_count_map(robot_names: list[str], sample_count: int, mode: s
     raise ValueError(f"Invalid sample_count_mode: {mode}. Expected 'per_robot' or 'total'.")
 
 
-def _load_real_masks_by_robot(
-    real_masks_path: str,
-    num_points_by_robot: dict[str, int],
-) -> dict[str, torch.Tensor]:
-    payload = torch.load(real_masks_path, map_location="cpu")
-    if not isinstance(payload, dict) or "samples" not in payload:
-        raise ValueError(f"Invalid real mask payload: {real_masks_path}")
-    out: dict[str, list[torch.Tensor]] = {}
-    for s in list(payload["samples"]):
-        rn = str(s.get("robot_name", ""))
-        if rn not in num_points_by_robot:
-            continue
-        m = torch.as_tensor(s["hand_contact_mask"]).bool().view(-1)
-        if int(m.numel()) != int(num_points_by_robot[rn]):
-            continue
-        out.setdefault(rn, []).append(m)
-    stacked: dict[str, torch.Tensor] = {}
-    for rn, arr in out.items():
-        if len(arr) > 0:
-            stacked[rn] = torch.stack(arr, dim=0).bool()
-    return stacked
+class _RandomMaskSampler(_BaseContactPolicyDataset):
+    def resolve_component_range(
+        self,
+        robot_name: str,
+        component_min: int,
+        component_max: int,
+    ) -> tuple[tuple[int, int], tuple[int, int]]:
+        spec = self.robot_specs[robot_name]
+        comp_lo_fit, comp_hi_fit = spec["component_range"]
+        max_anchors = int(spec["max_anchors"])
+        comp_lo = comp_lo_fit if int(component_min) <= 0 else int(component_min)
+        comp_hi = comp_hi_fit if int(component_max) <= 0 else int(component_max)
+        comp_lo = max(1, min(comp_lo, max_anchors))
+        comp_hi = max(comp_lo, min(comp_hi, max_anchors))
+        return (int(comp_lo_fit), int(comp_hi_fit)), (int(comp_lo), int(comp_hi))
 
+    def _select_visual_patch_points(
+        self,
+        object_points: torch.Tensor,
+        object_valid_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_size = int(object_points.shape[0])
+        flat_points = object_points.reshape(batch_size, -1, 3)
+        flat_valid_mask = object_valid_mask.reshape(batch_size, -1)
+        vis_points = flat_points.masked_fill(~flat_valid_mask.unsqueeze(-1), 0.0)
+        vis_mask = flat_valid_mask
+        vis_points = vis_points.masked_fill(~vis_mask.unsqueeze(-1), 0.0)
+        return vis_points, vis_mask
 
-def _extract_real_count_values(real_masks: torch.Tensor) -> torch.Tensor:
-    masks = real_masks.detach().bool().cpu()
-    return masks.sum(dim=1).long()
+    @torch.no_grad()
+    def generate_batch(
+        self,
+        *,
+        robot_name: str,
+        batch_size: int,
+        generator: torch.Generator,
+        component_min: int,
+        component_max: int,
+    ) -> Dict[str, Any]:
+        base_spec = self.robot_specs[robot_name]
+        _, component_range = self.resolve_component_range(
+            robot_name=robot_name,
+            component_min=component_min,
+            component_max=component_max,
+        )
+        spec = dict(base_spec)
+        spec["component_range"] = component_range
+        model = spec["model"]
 
-
-def _build_point_prob_from_real_masks(real_masks: torch.Tensor) -> torch.Tensor:
-    masks = real_masks.detach().bool().cpu()
-    point_prob = masks.float().mean(dim=0).clamp_min(1e-8)
-    return point_prob / point_prob.sum().clamp_min(1e-8)
-
-
-def _sample_anchor_indices(
-    n_anchor: int,
-    num_points: int,
-    point_prob: torch.Tensor | None,
-    anchor_sampling_mode: str,
-    generator: torch.Generator | None,
-    temperature: float,
-    device: torch.device,
-) -> torch.Tensor:
-    n = int(max(1, min(int(n_anchor), int(num_points))))
-    mode = str(anchor_sampling_mode).lower().strip()
-    if mode == "uniform":
-        return torch.randperm(int(num_points), device=device, generator=generator)[:n]
-    if mode != "point_prob":
-        raise ValueError(f"Invalid anchor_sampling_mode={anchor_sampling_mode}. Use 'point_prob' or 'uniform'.")
-    if point_prob is None:
-        raise ValueError("point_prob is required when anchor_sampling_mode='point_prob'.")
-
-    p = point_prob.to(device=device, dtype=torch.float32).clamp_min(1e-8)
-    t = float(max(1e-3, float(temperature)))
-    if abs(t - 1.0) > 1e-6:
-        p = p.pow(1.0 / t)
-    p = p / p.sum().clamp_min(1e-8)
-    return torch.multinomial(p, num_samples=n, replacement=False, generator=generator)
-
-
-def _sample_target_count(
-    count_values: torch.Tensor,
-    num_points: int,
-    generator: torch.Generator | None,
-    device: torch.device,
-) -> int:
-    if int(count_values.numel()) == 0:
-        raise ValueError("count_values is empty.")
-    idx = int(
-        torch.randint(
-            0,
-            int(count_values.numel()),
-            (1,),
-            device=device,
+        q_batch = self._sample_random_q_batch(model=model, batch_size=int(batch_size), generator=generator)
+        hand_points, hand_normals = model.get_surface_points_normals_batch(q=q_batch)
+        patch_params = self._sample_synthetic_patch_params(
+            spec=spec,
+            batch_size=int(batch_size),
             generator=generator,
-        ).item()
-    )
-    return int(max(1, min(int(num_points), int(count_values[idx].item()))))
-
-
-def _resize_mask_to_target_count(mask: torch.Tensor, scores: torch.Tensor, target_count: int) -> torch.Tensor:
-    n = int(mask.numel())
-    k = int(max(1, min(n, int(target_count))))
-    order = torch.argsort(scores, descending=True)
-    out = torch.zeros_like(mask, dtype=torch.bool)
-    out[order[:k]] = True
-    return out
+        )
+        object_points, object_valid_mask = model._sample_virtual_object_patches_batch(
+            hand_points=hand_points,
+            hand_normals=hand_normals,
+            anchor_indices=patch_params["anchor_indices"],
+            anchor_valid_mask=patch_params["anchor_valid_mask"],
+            anchor_point_valid_mask=patch_params["anchor_point_valid_mask"],
+            generator=generator,
+            anchor_shift_min=self.patch_anchor_shift_min,
+            anchor_shift_max=self.patch_anchor_shift_max,
+            max_plane_extent_min=self.patch_extent_min,
+            max_plane_extent_max=self.patch_extent_max,
+            patch_shift_power=self.patch_shift_power,
+            patch_extent_power=self.patch_extent_power,
+            normal_jitter_max_deg=self.patch_normal_jitter_max_deg,
+            penetration_clearance=self.patch_penetration_clearance,
+        )
+        flat_object_points = object_points.reshape(int(batch_size), -1, 3)
+        flat_object_valid_mask = object_valid_mask.reshape(int(batch_size), -1)
+        contact_values = model._compute_gendex_contact_value_source_target_batch(
+            source_points=hand_points,
+            source_normals=hand_normals,
+            target_points=flat_object_points,
+            target_valid_mask=flat_object_valid_mask,
+            align_exp_scale=self.align_exp_scale,
+            sigmoid_scale=self.sigmoid_scale,
+        )
+        masks, count_interval_stats = self._build_surface_mask_batch(
+            contact_values=contact_values,
+            contact_count_range=spec["contact_count_range"],
+        )
+        vis_points, vis_mask = self._select_visual_patch_points(
+            object_points=object_points,
+            object_valid_mask=object_valid_mask,
+        )
+        anchor_indices = patch_params["anchor_indices"].masked_fill(~patch_params["anchor_valid_mask"], -1)
+        patch_types = torch.full_like(anchor_indices, -1)
+        patch_types[patch_params["anchor_valid_mask"]] = 0
+        return {
+            "masks": masks,
+            "q": q_batch,
+            "hand_points": hand_points,
+            "contact_values": contact_values,
+            "object_patch_points": vis_points,
+            "object_patch_mask": vis_mask,
+            "anchor_indices": anchor_indices,
+            "patch_types": patch_types,
+            "mask_count_interval_stats": count_interval_stats,
+        }
 
 
 @hydra.main(config_path=".", config_name="config_generate_random_contact_masks", version_base="1.3")
@@ -168,74 +184,62 @@ def main(cfg: DictConfig) -> None:
         f"[sampling] mode={sample_count_mode} requested={int(cfg.sample_count)} "
         f"robots={len(robot_names)} total_masks_to_generate={total_jobs}"
     )
-    for r in robot_names:
-        print(f"[sampling] {r}: {sample_count_map[r]} masks")
-
-    num_points_by_robot: dict[str, int] = {}
-    for rn in robot_names:
-        if rn in hparams_robots:
-            num_points_by_robot[rn] = int(hparams_robots[rn]["num_surface_points"])
+    for robot_name in robot_names:
+        print(f"[sampling] {robot_name}: {sample_count_map[robot_name]} masks")
 
     real_masks_path = _abs_path(str(cfg.real_masks_path))
-    real_masks_by_robot = _load_real_masks_by_robot(
-        real_masks_path=real_masks_path,
-        num_points_by_robot=num_points_by_robot,
-    )
-
     output_dir = _abs_path(str(cfg.output_dir))
     os.makedirs(output_dir, exist_ok=True)
 
-    sys.path.append(PROJECT_ROOT)
-    from robot_model.robot_model import create_robot_model  # type: ignore
+    sampler = _RandomMaskSampler(
+        robot_names=robot_names,
+        hparams_path=hparams_path,
+        real_masks_path=real_masks_path,
+        max_contact_points=1,
+        seed=int(cfg.seed),
+        device=str(cfg.device),
+        check_template_hash=bool(cfg.check_template_hash),
+        threshold=float(cfg.threshold),
+        align_exp_scale=float(cfg.align_exp_scale),
+        sigmoid_scale=float(cfg.sigmoid_scale),
+        component_sampling_mode=str(cfg.component_sampling_mode),
+        anchor_sampling_mode=str(cfg.anchor_sampling_mode),
+        anchor_temperature=float(cfg.anchor_temperature),
+        patch_anchor_shift_min=float(cfg.patch_anchor_shift_min),
+        patch_anchor_shift_max=float(cfg.patch_anchor_shift_max),
+        patch_extent_min=float(cfg.patch_extent_min),
+        patch_extent_max=float(cfg.patch_extent_max),
+        patch_extent_power=float(cfg.patch_extent_power),
+        patch_shift_power=float(cfg.patch_shift_power),
+        patch_normal_jitter_max_deg=float(cfg.patch_normal_jitter_max_deg),
+        patch_points_per_anchor_min=int(cfg.patch_points_per_anchor_min),
+        patch_points_per_anchor_max=int(cfg.patch_points_per_anchor_max),
+        patch_penetration_clearance=float(cfg.patch_penetration_clearance),
+    )
 
     for robot_name in robot_names:
-        if robot_name not in hparams_robots:
+        if robot_name not in sampler.robot_specs:
             print(f"[skip] {robot_name}: not found in {hparams_path}")
             continue
-        if robot_name not in real_masks_by_robot:
-            raise RuntimeError(f"{robot_name}: no real masks found in {real_masks_path}")
 
-        rcfg = hparams_robots[robot_name]
-        resolved_robot_name = str(rcfg["robot_model_name"])
-        num_surface_points = int(rcfg["num_surface_points"])
-        expected_template_hash = str(rcfg["surface_template_hash"])
-        fit_component_range = _to_int_list(rcfg.get("component_range", [1, 4]))
-        if len(fit_component_range) < 2:
-            fit_component_range = [1, 4]
-        comp_lo_fit, comp_hi_fit = int(fit_component_range[0]), int(fit_component_range[1])
-
-        model = create_robot_model(
-            robot_name=resolved_robot_name,
-            device=torch.device(str(cfg.device)),
-            num_points=num_surface_points,
-        )
+        spec = sampler.robot_specs[robot_name]
+        resolved_robot_name = str(spec["robot_model_name"])
+        num_surface_points = int(spec["surface_num_points"])
+        model = spec["model"]
         model_template_hash = model.get_surface_template_hash()
-        if bool(cfg.check_template_hash) and model_template_hash != expected_template_hash:
-            raise RuntimeError(
-                f"{robot_name}: template hash mismatch ({model_template_hash} != {expected_template_hash}). "
-                "Regenerate hyperparameters/extracted contacts with current code."
-            )
-
-        comp_lo = comp_lo_fit if int(cfg.component_min) <= 0 else int(cfg.component_min)
-        comp_hi = comp_hi_fit if int(cfg.component_max) <= 0 else int(cfg.component_max)
-        comp_lo = max(1, min(comp_lo, 16))
-        comp_hi = max(comp_lo, min(comp_hi, 16))
-
-        anchor_sampling_mode = str(getattr(cfg, "anchor_sampling_mode", "point_prob")).strip().lower()
-        if anchor_sampling_mode not in {"point_prob", "uniform"}:
-            raise ValueError(
-                f"Invalid anchor_sampling_mode={anchor_sampling_mode}. Use 'point_prob' or 'uniform'."
-            )
-        count_values = _extract_real_count_values(real_masks_by_robot[robot_name])
-        point_prob = (
-            _build_point_prob_from_real_masks(real_masks_by_robot[robot_name])
-            if anchor_sampling_mode == "point_prob"
-            else None
+        fit_component_range, used_component_range = sampler.resolve_component_range(
+            robot_name=robot_name,
+            component_min=int(cfg.component_min),
+            component_max=int(cfg.component_max),
         )
+        anchor_sampling_mode = str(cfg.anchor_sampling_mode).strip().lower()
+        component_sampling_mode = str(cfg.component_sampling_mode).strip().lower()
         print(
             f"[{robot_name}] model={resolved_robot_name} num_surface_points={num_surface_points} "
-            f"component_range_fit={[comp_lo_fit, comp_hi_fit]} component_range_used={[comp_lo, comp_hi]} "
-            f"real_masks={int(real_masks_by_robot[robot_name].shape[0])} "
+            f"component_range_fit={list(fit_component_range)} component_range_used={list(used_component_range)} "
+            f"contact_count_range={list(spec['contact_count_range'])} "
+            f"real_masks={int(spec['real_masks'].shape[0])} "
+            f"component_sampling_mode={component_sampling_mode} "
             f"anchor_sampling_mode={anchor_sampling_mode}"
         )
 
@@ -245,6 +249,7 @@ def main(cfg: DictConfig) -> None:
         sampled_masks_list: list[torch.Tensor] = []
         sampled_q_list: list[torch.Tensor] = []
         vis_samples: list[dict[str, torch.Tensor | int | str]] = []
+        count_interval_stats = _init_contact_count_interval_stats()
         remain = int(sample_count_map[robot_name])
         chunk = int(max(1, int(cfg.sample_chunk)))
         vis_budget = int(max(0, int(cfg.save_visualization_samples)))
@@ -252,146 +257,46 @@ def main(cfg: DictConfig) -> None:
 
         while remain > 0:
             b = min(chunk, remain)
-            masks_b = torch.zeros((b, num_surface_points), dtype=torch.bool, device=model.device)
-            q_b = torch.zeros((b, model.dof), dtype=torch.float32, device=model.device)
-            hand_points_b = torch.zeros((b, num_surface_points, 3), dtype=torch.float32, device=model.device)
-            obj_points_b = torch.zeros((b, int(cfg.patch_points), 3), dtype=torch.float32, device=model.device)
-            obj_mask_b = torch.zeros((b, int(cfg.patch_points)), dtype=torch.bool, device=model.device)
-            values_b = torch.zeros((b, num_surface_points), dtype=torch.float32, device=model.device)
-            anchors_b = torch.full((b, 16), -1, dtype=torch.long, device=model.device)
-            patch_types_b = torch.full((b, 16), -1, dtype=torch.long, device=model.device)
-
-            for i in range(b):
-                q = model._sample_q_for_contact(generator=generator)
-                hand_points, hand_normals = model.get_surface_points_normals(q=q)
-
-                n_anchor = int(
-                    torch.randint(
-                        int(comp_lo),
-                        int(comp_hi) + 1,
-                        (1,),
-                        device=model.device,
-                        generator=generator,
-                    ).item()
-                )
-                anchor_idx = _sample_anchor_indices(
-                    n_anchor=n_anchor,
-                    num_points=num_surface_points,
-                    point_prob=point_prob,
-                    anchor_sampling_mode=anchor_sampling_mode,
-                    generator=generator,
-                    temperature=float(cfg.anchor_temperature),
-                    device=model.device,
-                )
-                target_count = _sample_target_count(
-                    count_values=count_values.to(model.device),
-                    num_points=num_surface_points,
-                    generator=generator,
-                    device=model.device,
-                )
-
-                us = float(torch.rand(1, device=model.device, generator=generator).item())
-                ue = float(torch.rand(1, device=model.device, generator=generator).item())
-                ps = float(max(1e-3, float(cfg.patch_shift_power)))
-                pe = float(max(1e-3, float(cfg.patch_extent_power)))
-                us = us ** ps
-                ue = ue ** pe
-                s_lo = float(cfg.patch_anchor_shift_min)
-                s_hi = float(cfg.patch_anchor_shift_max)
-                e_lo = float(cfg.patch_extent_min)
-                e_hi = float(cfg.patch_extent_max)
-                anchor_shift = float(s_lo + us * max(1e-8, s_hi - s_lo))
-                max_extent = float(e_lo + ue * max(1e-8, e_hi - e_lo))
-
-                ppa = int(
-                    torch.randint(
-                        int(cfg.patch_points_per_anchor_min),
-                        int(cfg.patch_points_per_anchor_max) + 1,
-                        (1,),
-                        device=model.device,
-                        generator=generator,
-                    ).item()
-                )
-                patch_points_gen = int(max(int(cfg.patch_points), int(ppa * n_anchor)))
-
-                obj_pts, patch_meta = model._sample_virtual_object_patches(
-                    hand_points=hand_points,
-                    hand_normals=hand_normals,
-                    num_anchors=n_anchor,
-                    total_patch_points=patch_points_gen,
-                    generator=generator,
-                    anchor_indices=anchor_idx,
-                    anchor_shift=anchor_shift,
-                    max_plane_extent=max_extent,
-                    penetration_clearance=float(cfg.patch_penetration_clearance),
-                )
-                val = model._compute_gendex_contact_value_source_target(
-                    source_points=hand_points,
-                    source_normals=hand_normals,
-                    target_points=obj_pts,
-                    align_exp_scale=float(cfg.align_exp_scale),
-                    sigmoid_scale=float(cfg.sigmoid_scale),
-                )
-                mask = val >= float(cfg.threshold)
-
-                if bool(
-                    torch.rand(1, device=model.device, generator=generator).item()
-                    < float(max(0.0, min(1.0, float(cfg.patch_exact_count_prob))))
-                ):
-                    mask = _resize_mask_to_target_count(mask=mask, scores=val, target_count=target_count)
-                else:
-                    clamp_r = float(max(0.0, float(cfg.patch_count_clamp_ratio)))
-                    k_lo = int(max(1, round((1.0 - clamp_r) * float(target_count))))
-                    k_hi = int(min(num_surface_points, round((1.0 + clamp_r) * float(target_count))))
-                    cur_k = int(mask.sum().item())
-                    if cur_k < k_lo:
-                        mask = _resize_mask_to_target_count(mask=mask, scores=val, target_count=k_lo)
-                    elif cur_k > k_hi:
-                        mask = _resize_mask_to_target_count(mask=mask, scores=val, target_count=k_hi)
-
-                masks_b[i] = mask
-                values_b[i] = val
-                q_b[i] = q
-                hand_points_b[i] = hand_points
-
-                if int(obj_pts.shape[0]) > int(cfg.patch_points):
-                    keep = torch.randperm(int(obj_pts.shape[0]), device=model.device, generator=generator)[
-                        : int(cfg.patch_points)
-                    ]
-                    obj_vis = obj_pts[keep]
-                else:
-                    obj_vis = obj_pts
-                n_obj = int(min(int(cfg.patch_points), int(obj_vis.shape[0])))
-                if n_obj > 0:
-                    obj_points_b[i, :n_obj] = obj_vis[:n_obj]
-                    obj_mask_b[i, :n_obj] = True
-                na = int(min(16, int(patch_meta["anchor_indices"].shape[0])))
-                anchors_b[i, :na] = patch_meta["anchor_indices"][:na]
-                patch_types_b[i, :na] = patch_meta["patch_types"][:na]
-
-            sampled_masks_list.append(masks_b.detach().cpu())
-            sampled_q_list.append(q_b.detach().cpu())
+            batch = sampler.generate_batch(
+                robot_name=robot_name,
+                batch_size=b,
+                generator=generator,
+                component_min=int(cfg.component_min),
+                component_max=int(cfg.component_max),
+            )
+            masks_cpu = batch["masks"].detach().cpu().bool()
+            q_cpu = batch["q"].detach().cpu().float()
+            sampled_masks_list.append(masks_cpu)
+            sampled_q_list.append(q_cpu)
+            _merge_contact_count_interval_stats(
+                count_interval_stats,
+                batch["mask_count_interval_stats"],
+            )
 
             if vis_budget > 0:
                 take = min(vis_budget, b)
+                hand_points_cpu = batch["hand_points"].detach().cpu().float()
+                object_points_cpu = batch["object_patch_points"].detach().cpu().float()
+                object_mask_cpu = batch["object_patch_mask"].detach().cpu().bool()
+                contact_values_cpu = batch["contact_values"].detach().cpu().float()
+                anchor_indices_cpu = batch["anchor_indices"].detach().cpu().long()
+                patch_types_cpu = batch["patch_types"].detach().cpu().long()
                 for i in range(take):
-                    m = masks_b[i].detach().cpu().bool()
-                    hp = hand_points_b[i].detach().cpu().float()
-                    op = obj_points_b[i].detach().cpu().float()
-                    om = obj_mask_b[i].detach().cpu().bool()
+                    mask_i = masks_cpu[i]
+                    hand_points_i = hand_points_cpu[i]
                     vis_samples.append(
                         {
                             "sample_id": len(vis_samples),
                             "robot_name": robot_name,
                             "robot_model_name": resolved_robot_name,
-                            "q": q_b[i].detach().cpu().float(),
-                            "hand_points": hp,
-                            "hand_contact_mask": m,
-                            "hand_contact_points": hp[m],
-                            "object_patch_points": op[om],
-                            "contact_values": values_b[i].detach().cpu().float(),
-                            "anchor_indices": anchors_b[i].detach().cpu().long(),
-                            "patch_types": patch_types_b[i].detach().cpu().long(),
+                            "q": q_cpu[i],
+                            "hand_points": hand_points_i,
+                            "hand_contact_mask": mask_i,
+                            "hand_contact_points": hand_points_i[mask_i],
+                            "object_patch_points": object_points_cpu[i][object_mask_cpu[i]],
+                            "contact_values": contact_values_cpu[i],
+                            "anchor_indices": anchor_indices_cpu[i],
+                            "patch_types": patch_types_cpu[i],
                         }
                     )
                 vis_budget -= take
@@ -413,22 +318,30 @@ def main(cfg: DictConfig) -> None:
                 "sample_count_requested": int(cfg.sample_count),
                 "sample_count_mode": sample_count_mode,
                 "sample_count_effective": int(sample_count_map[robot_name]),
-                "component_range_fit": [int(comp_lo_fit), int(comp_hi_fit)],
-                "component_range_used": [int(comp_lo), int(comp_hi)],
+                "component_range_fit": [int(fit_component_range[0]), int(fit_component_range[1])],
+                "component_range_used": [int(used_component_range[0]), int(used_component_range[1])],
                 "surface_template_hash": model_template_hash,
                 "hparams_path": hparams_path,
                 "real_masks_path": real_masks_path,
                 "threshold": float(cfg.threshold),
                 "align_exp_scale": float(cfg.align_exp_scale),
                 "sigmoid_scale": float(cfg.sigmoid_scale),
+                "component_sampling_mode": component_sampling_mode,
                 "anchor_temperature": float(cfg.anchor_temperature),
                 "anchor_sampling_mode": anchor_sampling_mode,
+                "contact_count_range": [int(spec["contact_count_range"][0]), int(spec["contact_count_range"][1])],
+                "patch_normal_jitter_max_deg": float(cfg.patch_normal_jitter_max_deg),
                 "sampling_mode": "real_stats_guided_patch_distance",
+                "sampling_impl": "contact_policy_dataset_batched",
             },
             "summary": {
                 "sampled_num_samples": int(sampled_masks_t.shape[0]),
                 "sampled_count_mean": float(sampled_counts.float().mean().item()),
                 "sampled_count_std": float(sampled_counts.float().std(unbiased=False).item()),
+                "out_of_interval_ratio": float(
+                    (int(count_interval_stats["too_low"]) + int(count_interval_stats["too_high"]))
+                    / max(1, int(count_interval_stats["num_samples"]))
+                ),
             },
             "sampled_masks": sampled_masks_t,
             "sampled_q": sampled_q_t,
@@ -436,6 +349,7 @@ def main(cfg: DictConfig) -> None:
         }
         out_path = os.path.join(output_dir, f"{robot_name}_random_masks.pt")
         torch.save(payload, out_path)
+        print(_format_contact_count_interval_summary(f"sample_masks:{robot_name}", count_interval_stats))
         print(f"[saved] {out_path}")
         print(f"[summary] {robot_name}: {payload['summary']}")
 

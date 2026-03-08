@@ -5,7 +5,6 @@ import copy
 import os
 import random
 import sys
-import time
 from typing import Any, Dict
 
 import hydra
@@ -187,14 +186,14 @@ def _build_policy(cfg: DictConfig, action_dim: int) -> ContactDiffusionPolicy:
     )
 
 
-def _build_loader_kwargs(cfg: DictConfig) -> Dict[str, Any]:
+def _build_loader_kwargs(cfg: DictConfig, *, persistent_workers: bool) -> Dict[str, Any]:
     num_workers = int(cfg.dataset.num_workers)
     kwargs: Dict[str, Any] = {
         "num_workers": num_workers,
         "pin_memory": bool(cfg.dataset.pin_memory),
     }
     if num_workers > 0:
-        kwargs["persistent_workers"] = True
+        kwargs["persistent_workers"] = bool(persistent_workers)
         kwargs["prefetch_factor"] = int(cfg.dataset.prefetch_factor)
     return kwargs
 
@@ -223,9 +222,6 @@ def _compute_validation_metrics(
     valid_action_mse = 0.0
     contact_point_mse = 0.0
     inactive_surface_mse = 0.0
-    fetch_time_total = 0.0
-    predict_time_total = 0.0
-    metric_time_total = 0.0
     n_action = 0
     n_contact = 0
     n_inactive = 0
@@ -239,22 +235,17 @@ def _compute_validation_metrics(
         iterator = iter(loader)
         progress = tqdm(total=target_batches, desc=prefix, leave=False)
         while n_batches < target_batches:
-            fetch_t0 = time.perf_counter()
             try:
                 batch = next(iterator)
             except StopIteration:
                 break
-            fetch_time_total += time.perf_counter() - fetch_t0
 
-            predict_t0 = time.perf_counter()
             batch_device = _move_batch_to_device(batch, device)
             with _autocast_context(device, use_amp, amp_dtype):
                 pred_action = policy.predict_action(batch_device)["action_pred"].detach()
             _cuda_sync_if_needed(device)
-            predict_time_total += time.perf_counter() - predict_t0
             pred_action = pred_action.cpu()
 
-            metric_t0 = time.perf_counter()
             gt_action = batch["action"].float()
             action_valid_mask = batch["action_valid_mask"].float()
             sq_error = (pred_action - gt_action).pow(2)
@@ -291,7 +282,6 @@ def _compute_validation_metrics(
                     )
                     n_inactive += 1
 
-            metric_time_total += time.perf_counter() - metric_t0
             n_batches += 1
             progress.update(1)
         progress.close()
@@ -304,9 +294,6 @@ def _compute_validation_metrics(
         f"{prefix}/action_mse_valid": valid_action_mse / max(n_action, 1),
         f"{prefix}/contact_point_mse": contact_point_mse / max(n_contact, 1),
         f"{prefix}/inactive_surface_mse": inactive_surface_mse / max(n_inactive, 1),
-        f"{prefix}/fetch_s": fetch_time_total / max(n_batches, 1),
-        f"{prefix}/predict_s": predict_time_total / max(n_batches, 1),
-        f"{prefix}/metric_s": metric_time_total / max(n_batches, 1),
     }
 
 
@@ -321,49 +308,81 @@ def main(cfg: DictConfig) -> None:
     use_amp = bool(cfg.training.use_amp)
     amp_dtype = _get_amp_dtype(str(cfg.training.amp_dtype))
 
-    dataset_kwargs = {
+    common_dataset_kwargs = {
         "robot_names": list(cfg.dataset.robot_names),
         "hparams_path": _resolve_project_path(str(cfg.dataset.hparams_path)),
         "real_masks_path": _resolve_project_path(str(cfg.dataset.real_masks_path)),
         "max_contact_points": int(cfg.dataset.max_contact_points),
         "seed": int(cfg.seed),
-        "device": str(cfg.dataset.robot_model_device),
         "check_template_hash": bool(cfg.dataset.check_template_hash),
         "threshold": float(cfg.dataset.threshold),
         "align_exp_scale": float(cfg.dataset.align_exp_scale),
         "sigmoid_scale": float(cfg.dataset.sigmoid_scale),
+        "component_sampling_mode": str(cfg.dataset.component_sampling_mode),
         "anchor_sampling_mode": str(cfg.dataset.anchor_sampling_mode),
         "anchor_temperature": float(cfg.dataset.anchor_temperature),
-        "patch_points": int(cfg.dataset.patch_points),
         "patch_anchor_shift_min": float(cfg.dataset.patch_anchor_shift_min),
         "patch_anchor_shift_max": float(cfg.dataset.patch_anchor_shift_max),
         "patch_extent_min": float(cfg.dataset.patch_extent_min),
         "patch_extent_max": float(cfg.dataset.patch_extent_max),
         "patch_extent_power": float(cfg.dataset.patch_extent_power),
         "patch_shift_power": float(cfg.dataset.patch_shift_power),
+        "patch_normal_jitter_max_deg": float(cfg.dataset.patch_normal_jitter_max_deg),
         "patch_points_per_anchor_min": int(cfg.dataset.patch_points_per_anchor_min),
         "patch_points_per_anchor_max": int(cfg.dataset.patch_points_per_anchor_max),
         "patch_penetration_clearance": float(cfg.dataset.patch_penetration_clearance),
-        "patch_exact_count_prob": float(cfg.dataset.patch_exact_count_prob),
-        "patch_count_clamp_ratio": float(cfg.dataset.patch_count_clamp_ratio),
     }
+    train_generation_device = _prepare_device(str(cfg.dataset.train_generation_device))
+    real_val_build_device = _prepare_device(
+        str(getattr(cfg.dataset, "real_val_build_device", cfg.dataset.robot_model_device))
+    )
     train_dataset = OnTheFlySyntheticContactPolicyDataset(
         samples_per_epoch=int(cfg.dataset.train_samples_per_epoch),
-        train_chunk_size=int(cfg.dataset.train_chunk_size),
-        **dataset_kwargs,
+        buffer_refresh_fraction=float(cfg.dataset.buffer_refresh_fraction),
+        buffer_build_batch_size_per_robot=int(cfg.dataset.buffer_build_batch_size_per_robot),
+        buffer_refresh_batch_size_per_robot=int(cfg.dataset.buffer_refresh_batch_size_per_robot),
+        device=str(train_generation_device),
+        store_full_metadata=False,
+        progress_label="train_synth",
+        **common_dataset_kwargs,
+    )
+    synthetic_val_dataset = OnTheFlySyntheticContactPolicyDataset(
+        samples_per_epoch=int(cfg.dataset.synthetic_val_samples_per_epoch),
+        buffer_refresh_fraction=float(cfg.dataset.buffer_refresh_fraction),
+        buffer_build_batch_size_per_robot=int(cfg.dataset.buffer_build_batch_size_per_robot),
+        buffer_refresh_batch_size_per_robot=int(cfg.dataset.buffer_refresh_batch_size_per_robot),
+        device=str(train_generation_device),
+        store_full_metadata=True,
+        progress_label="validate_synth",
+        **common_dataset_kwargs,
     )
     val_dataset = RealContactPolicyValDataset(
         cache_processed_samples=bool(cfg.dataset.cache_validation_samples),
-        **dataset_kwargs,
+        cache_build_batch_size=int(getattr(cfg.dataset, "real_val_cache_build_batch_size", 256)),
+        device=str(real_val_build_device),
+        progress_label="validate_real",
+        **common_dataset_kwargs,
     )
 
-    loader_kwargs = _build_loader_kwargs(cfg)
+    train_loader_kwargs = _build_loader_kwargs(cfg, persistent_workers=False)
+    synthetic_val_loader_kwargs = _build_loader_kwargs(cfg, persistent_workers=False)
+    real_val_loader_kwargs = _build_loader_kwargs(
+        cfg,
+        persistent_workers=bool(cfg.dataset.num_workers > 0),
+    )
     train_loader = DataLoader(
         train_dataset,
         batch_size=int(cfg.dataset.batch_size),
-        shuffle=False,
+        shuffle=True,
         drop_last=bool(cfg.dataset.drop_last),
-        **loader_kwargs,
+        **train_loader_kwargs,
+    )
+    synthetic_val_loader = DataLoader(
+        synthetic_val_dataset,
+        batch_size=int(cfg.dataset.val_batch_size),
+        shuffle=False,
+        drop_last=False,
+        **synthetic_val_loader_kwargs,
     )
 
     full_val_loader = DataLoader(
@@ -371,7 +390,7 @@ def main(cfg: DictConfig) -> None:
         batch_size=int(cfg.dataset.val_batch_size),
         shuffle=False,
         drop_last=False,
-        **loader_kwargs,
+        **real_val_loader_kwargs,
     )
     subset_indices = _build_val_subset_indices(
         dataset_len=len(val_dataset),
@@ -386,7 +405,7 @@ def main(cfg: DictConfig) -> None:
             batch_size=int(cfg.dataset.val_batch_size),
             shuffle=False,
             drop_last=False,
-            **loader_kwargs,
+            **real_val_loader_kwargs,
         )
 
     model = _build_policy(cfg, action_dim=train_dataset.action_dim).to(device)
@@ -444,18 +463,16 @@ def main(cfg: DictConfig) -> None:
 
     metric_models = {name: spec["model"] for name, spec in val_dataset.robot_specs.items()}
     best_val = float("inf")
-    best_metric_key = "validate_subset/action_mse_valid"
+    best_metric_key = "validate_real/action_mse_valid"
     global_step = 0
     log_every_n_steps = int(max(1, cfg.training.log_every_n_steps))
     max_train_batches = int(cfg.training.max_train_batches)
     max_val_batches = int(cfg.training.max_val_batches)
 
     for epoch in range(1, int(cfg.training.epochs) + 1):
+        train_dataset.prepare_epoch(epoch)
         model.train()
         train_losses: list[float] = []
-        data_wait_times: list[float] = []
-        h2d_times: list[float] = []
-        train_step_times: list[float] = []
 
         train_batches_total = len(train_loader)
         if max_train_batches > 0:
@@ -465,20 +482,14 @@ def main(cfg: DictConfig) -> None:
         progress = tqdm(total=train_batches_total, desc=f"train:{epoch}")
         batch_idx = 0
         while batch_idx < train_batches_total:
-            fetch_t0 = time.perf_counter()
             try:
                 batch = next(iterator)
             except StopIteration:
                 break
-            data_wait_s = time.perf_counter() - fetch_t0
 
-            h2d_t0 = time.perf_counter()
             batch_device = _move_batch_to_device(batch, device)
-            _cuda_sync_if_needed(device)
-            h2d_s = time.perf_counter() - h2d_t0
 
             optimizer.zero_grad(set_to_none=True)
-            step_t0 = time.perf_counter()
             with _autocast_context(device, use_amp, amp_dtype):
                 loss, loss_dict = model.compute_loss(batch_device)
             loss.backward()
@@ -488,21 +499,13 @@ def main(cfg: DictConfig) -> None:
             lr_scheduler.step()
             if ema is not None:
                 ema.step(model)
-            _cuda_sync_if_needed(device)
-            train_step_s = time.perf_counter() - step_t0
 
             loss_value = float(loss.item())
             train_losses.append(loss_value)
-            data_wait_times.append(data_wait_s)
-            h2d_times.append(h2d_s)
-            train_step_times.append(train_step_s)
 
             step_log = {
                 "train/loss": loss_value,
                 "train/lr": float(lr_scheduler.get_last_lr()[0]),
-                "train/data_wait_s": data_wait_s,
-                "train/h2d_s": h2d_s,
-                "train/train_step_s": train_step_s,
                 "global_step": global_step,
                 "epoch": epoch,
             }
@@ -511,11 +514,7 @@ def main(cfg: DictConfig) -> None:
             if should_log_step:
                 wandb.log(step_log, step=global_step)
 
-            progress.set_postfix(
-                loss=f"{loss_value:.4f}",
-                wait=f"{data_wait_s:.3f}",
-                step=f"{train_step_s:.3f}",
-            )
+            progress.set_postfix(loss=f"{loss_value:.4f}")
             global_step += 1
             batch_idx += 1
             progress.update(1)
@@ -524,23 +523,33 @@ def main(cfg: DictConfig) -> None:
         epoch_log = {
             "epoch": epoch,
             "train/loss_epoch": float(np.mean(train_losses)) if train_losses else float("nan"),
-            "train/data_wait_s_epoch": float(np.mean(data_wait_times)) if data_wait_times else float("nan"),
-            "train/h2d_s_epoch": float(np.mean(h2d_times)) if h2d_times else float("nan"),
-            "train/train_step_s_epoch": float(np.mean(train_step_times)) if train_step_times else float("nan"),
         }
 
         eval_policy = ema_model if ema_model is not None else model
-        subset_metrics = _compute_validation_metrics(
+        synthetic_val_dataset.prepare_epoch(epoch)
+        synth_metrics = _compute_validation_metrics(
             eval_policy,
-            subset_val_loader,
+            synthetic_val_loader,
             metric_models=metric_models,
             device=device,
-            prefix="validate_subset",
+            prefix="validate_synth",
             max_batches=max_val_batches,
             use_amp=use_amp,
             amp_dtype=amp_dtype,
         )
-        epoch_log.update(subset_metrics)
+        epoch_log.update(synth_metrics)
+
+        real_metrics = _compute_validation_metrics(
+            eval_policy,
+            subset_val_loader,
+            metric_models=metric_models,
+            device=device,
+            prefix="validate_real",
+            max_batches=max_val_batches,
+            use_amp=use_amp,
+            amp_dtype=amp_dtype,
+        )
+        epoch_log.update(real_metrics)
 
         run_full_validation = False
         if subset_val_loader is not full_val_loader:
@@ -552,14 +561,14 @@ def main(cfg: DictConfig) -> None:
                 full_val_loader,
                 metric_models=metric_models,
                 device=device,
-                prefix="validate_full",
+                prefix="validate_real_full",
                 max_batches=max_val_batches,
                 use_amp=use_amp,
                 amp_dtype=amp_dtype,
             )
             epoch_log.update(full_metrics)
         elif subset_val_loader is full_val_loader:
-            epoch_log["validate_full/action_mse_valid"] = epoch_log[best_metric_key]
+            epoch_log["validate_real_full/action_mse_valid"] = epoch_log[best_metric_key]
 
         wandb.log(epoch_log, step=global_step)
 
@@ -584,12 +593,11 @@ def main(cfg: DictConfig) -> None:
         summary = (
             f"[Epoch {epoch}] "
             f"train_loss={epoch_log['train/loss_epoch']:.6f} "
-            f"subset_action_valid={epoch_log['validate_subset/action_mse_valid']:.6f} "
-            f"data_wait={epoch_log['train/data_wait_s_epoch']:.4f}s "
-            f"train_step={epoch_log['train/train_step_s_epoch']:.4f}s"
+            f"synth_action_valid={epoch_log['validate_synth/action_mse_valid']:.6f} "
+            f"real_action_valid={epoch_log['validate_real/action_mse_valid']:.6f}"
         )
-        if "validate_full/action_mse_valid" in epoch_log:
-            summary += f" full_action_valid={epoch_log['validate_full/action_mse_valid']:.6f}"
+        if "validate_real_full/action_mse_valid" in epoch_log:
+            summary += f" real_full_action_valid={epoch_log['validate_real_full/action_mse_valid']:.6f}"
         print(summary)
 
     wandb.finish()

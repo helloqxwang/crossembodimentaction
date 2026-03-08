@@ -15,35 +15,40 @@ dataset:
     - shadowhand
   hparams_path: ./contact_gen/contact_sampler_hparams.yaml
   real_masks_path: ./contact_gen/contact_points_validate.pt
-  robot_model_device: cpu
+  train_generation_device: cuda
+  robot_model_device: cuda
+  real_val_build_device: cuda
   check_template_hash: true
   train_samples_per_epoch: 1000000
-  train_chunk_size: 256
-  batch_size: 256
-  val_batch_size: 128
-  num_workers: 16
+  synthetic_val_samples_per_epoch: 1024
+  buffer_refresh_fraction: 0.1
+  buffer_build_batch_size_per_robot: 1024
+  buffer_refresh_batch_size_per_robot: 1024
+  batch_size: 512
+  val_batch_size: 512
+  num_workers: 22
   prefetch_factor: 2
   pin_memory: true
   drop_last: true
   cache_validation_samples: true
+  real_val_cache_build_batch_size: 256
   max_contact_points: 256
   threshold: 0.4
   align_exp_scale: 2.0
   sigmoid_scale: 10.0
+  component_sampling_mode: distribution
   anchor_sampling_mode: point_prob
   anchor_temperature: 1.0
-  patch_points: 96
   patch_anchor_shift_min: 0.0002
   patch_anchor_shift_max: 0.0030
   patch_extent_min: 0.006
   patch_extent_max: 0.050
   patch_extent_power: 1.0
   patch_shift_power: 1.0
+  patch_normal_jitter_max_deg: 10.0
   patch_points_per_anchor_min: 28
   patch_points_per_anchor_max: 84
   patch_penetration_clearance: 0.00008
-  patch_exact_count_prob: 1.0
-  patch_count_clamp_ratio: 0.3
 
 model:
   p_hat_encoder:
@@ -76,7 +81,7 @@ model:
 
 training:
   device: cuda
-  epochs: 100000
+  epochs: 10000
   lr: 1.0e-4
   betas: [0.95, 0.999]
   eps: 1.0e-8

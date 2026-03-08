@@ -72,7 +72,11 @@ def _as_mesh(scene_or_mesh):
     return None
 
 
-def farthest_point_sampling(pos: torch.Tensor, n_sampling: int) -> Tuple[torch.Tensor, torch.Tensor]:
+def farthest_point_sampling(
+    pos: torch.Tensor,
+    n_sampling: int,
+    lengths: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
     if pos.ndim == 2:
         pos = pos.unsqueeze(0)
         squeeze = True
@@ -86,17 +90,41 @@ def farthest_point_sampling(pos: torch.Tensor, n_sampling: int) -> Tuple[torch.T
     if k <= 0:
         raise ValueError("n_sampling must be positive")
 
+    if lengths is not None:
+        lengths = torch.as_tensor(lengths, dtype=torch.long, device=pos.device).view(-1)
+        if int(lengths.numel()) != int(pos.shape[0]):
+            raise ValueError(
+                f"lengths must have one entry per batch element, got {tuple(lengths.shape)} for batch {pos.shape[0]}"
+            )
+        lengths = lengths.clamp_min(0).clamp_max(int(n_points))
+
     if sample_farthest_points is not None:
-        sampled_xyz, sampled_idx = sample_farthest_points(pos[..., :3].contiguous(), K=k)
+        sampled_xyz, sampled_idx = sample_farthest_points(
+            pos[..., :3].contiguous(),
+            lengths=lengths,
+            K=k,
+        )
         if pos.shape[-1] > 3:
-            gather_idx = sampled_idx[..., :, None].expand(*sampled_idx.shape, pos.shape[-1])
+            gather_idx = sampled_idx.clamp_min(0)[..., :, None].expand(*sampled_idx.shape, pos.shape[-1])
             sampled = torch.gather(pos, -2, gather_idx)
+            sampled = sampled.masked_fill(sampled_idx[..., None] < 0, 0.0)
         else:
             sampled = sampled_xyz
     else:
-        sampled_idx = torch.randperm(n_points, device=pos.device)[:k]
-        sampled = pos[:, sampled_idx, :]
-        sampled_idx = sampled_idx.unsqueeze(0).expand(pos.shape[0], -1)
+        sampled_rows = []
+        sampled_idx_rows = []
+        for batch_idx in range(int(pos.shape[0])):
+            cur_len = int(lengths[batch_idx].item()) if lengths is not None else int(n_points)
+            cur_idx = torch.full((k,), -1, dtype=torch.long, device=pos.device)
+            cur_sample = torch.zeros((k, pos.shape[-1]), dtype=pos.dtype, device=pos.device)
+            if cur_len > 0:
+                keep = torch.randperm(cur_len, device=pos.device)[: min(k, cur_len)]
+                cur_idx[: int(keep.numel())] = keep
+                cur_sample[: int(keep.numel())] = pos[batch_idx, keep]
+            sampled_rows.append(cur_sample)
+            sampled_idx_rows.append(cur_idx)
+        sampled = torch.stack(sampled_rows, dim=0)
+        sampled_idx = torch.stack(sampled_idx_rows, dim=0)
 
     if squeeze:
         sampled = sampled.squeeze(0)
@@ -1671,7 +1699,10 @@ class RobotModel:
         if len(self.base_translation_indices) == 0:
             return q
         q_out = q.clone()
-        q_out[self.base_translation_indices] = 0.0
+        if q_out.ndim == 1:
+            q_out[self.base_translation_indices] = 0.0
+        else:
+            q_out[..., self.base_translation_indices] = 0.0
         return q_out
 
     def update_status(self, q: torch.Tensor) -> None:
@@ -1718,18 +1749,21 @@ class RobotModel:
 
         return torch.cat(all_pc_se3, dim=0)
 
-    def get_surface_points_normals(self, q: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+    def get_surface_points_normals_batch(self, q: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         if q is None:
-            q = torch.zeros(self.dof, dtype=torch.float32, device=self.device)
+            q = torch.zeros((1, self.dof), dtype=torch.float32, device=self.device)
+        if q.ndim == 1:
+            q = q.unsqueeze(0)
         self.update_status(q)
 
         n_total = int(self.surface_template_points_local.shape[0])
         if n_total <= 0:
-            empty = torch.zeros((self.surface_num_points, 3), dtype=torch.float32, device=self.device)
+            empty = torch.zeros((int(q.shape[0]), self.surface_num_points, 3), dtype=torch.float32, device=self.device)
             return empty, empty
 
-        points = torch.zeros((n_total, 3), dtype=torch.float32, device=self.device)
-        normals = torch.zeros((n_total, 3), dtype=torch.float32, device=self.device)
+        batch_size = int(q.shape[0])
+        points = torch.zeros((batch_size, n_total, 3), dtype=torch.float32, device=self.device)
+        normals = torch.zeros((batch_size, n_total, 3), dtype=torch.float32, device=self.device)
         link_idx = self.surface_template_link_indices
         link_names = self.mesh_link_names
 
@@ -1742,20 +1776,23 @@ class RobotModel:
             pts_local = self.surface_template_points_local[mask]
             nrms_local = self.surface_template_normals_local[mask]
 
-            tf = self.frame_status[link_name].get_matrix()[0].to(self.device)
-            rot = tf[:3, :3]
-            pts_h = torch.cat(
-                [pts_local, torch.ones((pts_local.shape[0], 1), dtype=torch.float32, device=self.device)],
-                dim=1,
-            )
-            pts_world = (pts_h @ tf.T)[:, :3]
-            nrms_world = nrms_local @ rot.T
-            nrms_world = nrms_world / torch.norm(nrms_world, dim=1, keepdim=True).clamp_min(1e-8)
+            tf = self.frame_status[link_name].get_matrix().to(self.device)
+            if tf.ndim == 2:
+                tf = tf.unsqueeze(0)
+            rot = tf[:, :3, :3]
+            trans = tf[:, :3, 3]
+            pts_world = torch.matmul(pts_local.unsqueeze(0), rot.transpose(1, 2)) + trans.unsqueeze(1)
+            nrms_world = torch.matmul(nrms_local.unsqueeze(0), rot.transpose(1, 2))
+            nrms_world = nrms_world / torch.norm(nrms_world, dim=-1, keepdim=True).clamp_min(1e-8)
 
-            points[mask] = pts_world
-            normals[mask] = nrms_world
+            points[:, mask] = pts_world
+            normals[:, mask] = nrms_world
 
         return points, normals
+
+    def get_surface_points_normals(self, q: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
+        points, normals = self.get_surface_points_normals_batch(q=q)
+        return points[0], normals[0]
 
     def sample_random_q(
         self,
@@ -1764,12 +1801,42 @@ class RobotModel:
     ) -> torch.Tensor:
         if int(batch_size) <= 0:
             raise ValueError("batch_size must be positive")
-        if int(batch_size) == 1:
-            return self._sample_q_for_contact(generator=generator)
-        return torch.stack(
-            [self._sample_q_for_contact(generator=generator) for _ in range(int(batch_size))],
-            dim=0,
-        )
+        batch_size = int(batch_size)
+        lower, upper = self.pk_chain.get_joint_limits()
+        lower_t = torch.tensor(lower, dtype=torch.float32, device=self.device)
+        upper_t = torch.tensor(upper, dtype=torch.float32, device=self.device)
+        finite = torch.isfinite(lower_t) & torch.isfinite(upper_t)
+        q = torch.zeros((batch_size, self.dof), dtype=torch.float32, device=self.device)
+        if finite.any():
+            u = torch.rand((batch_size, self.dof), device=self.device, generator=generator)
+            mode = torch.rand((batch_size, 1), device=self.device, generator=generator)
+            correlated = 0.75 * torch.rand((batch_size, 1), device=self.device, generator=generator) + 0.25 * u
+            extreme_choice = torch.randint(
+                0,
+                2,
+                (batch_size, 1),
+                device=self.device,
+                generator=generator,
+            ).bool()
+            extreme = torch.where(extreme_choice, u.pow(2.5), 1.0 - u.pow(2.5))
+            center = 0.5 + 0.5 * (2.0 * u - 1.0).pow(3)
+            t = torch.where(
+                mode < 0.25,
+                u,
+                torch.where(mode < 0.55, correlated, torch.where(mode < 0.80, extreme, center)),
+            ).clamp(0.0, 1.0)
+            finite_mask = finite.unsqueeze(0).expand(batch_size, -1)
+            q[finite_mask] = (
+                lower_t.unsqueeze(0).expand(batch_size, -1)[finite_mask]
+                + t[finite_mask]
+                * (upper_t.unsqueeze(0).expand(batch_size, -1)[finite_mask] - lower_t.unsqueeze(0).expand(batch_size, -1)[finite_mask])
+            )
+        if (~finite).any():
+            q[:, ~finite] = (torch.rand((batch_size, int((~finite).sum().item())), device=self.device, generator=generator) * 2.0 - 1.0) * torch.pi
+        q = self._zero_base_translation_in_q(q)
+        if batch_size == 1:
+            return q[0]
+        return q
 
     def mix_q_by_contact_mask(
         self,
@@ -1826,6 +1893,76 @@ class RobotModel:
         return mixed
 
     @staticmethod
+    def _compute_gendex_contact_value_source_target_batch(
+        source_points: torch.Tensor,
+        source_normals: torch.Tensor,
+        target_points: torch.Tensor,
+        target_valid_mask: Optional[torch.Tensor] = None,
+        align_exp_scale: float = 2.0,
+        sigmoid_scale: float = 10.0,
+    ) -> torch.Tensor:
+        if source_points.ndim != 3 or source_normals.ndim != 3 or target_points.ndim != 3:
+            raise ValueError(
+                "Expected batched tensors with shapes "
+                "(B, N, 3), (B, N, 3), and (B, K, 3)"
+            )
+        if source_points.shape != source_normals.shape:
+            raise ValueError(
+                f"source_points and source_normals must have the same shape, "
+                f"got {tuple(source_points.shape)} vs {tuple(source_normals.shape)}"
+            )
+        if source_points.shape[0] != target_points.shape[0]:
+            raise ValueError(
+                f"source_points batch and target_points batch must match, "
+                f"got {source_points.shape[0]} vs {target_points.shape[0]}"
+            )
+        if source_points.shape[-1] != 3 or target_points.shape[-1] != 3:
+            raise ValueError("Expected xyz points/normals with last dim = 3")
+
+        batch_size = int(source_points.shape[0])
+        num_source = int(source_points.shape[1])
+        num_target = int(target_points.shape[1])
+        if num_source == 0:
+            return torch.zeros((batch_size, 0), dtype=torch.float32, device=source_points.device)
+        if num_target == 0:
+            return torch.zeros((batch_size, num_source), dtype=torch.float32, device=source_points.device)
+
+        source_points = source_points.float()
+        source_normals = source_normals.float()
+        target_points = target_points.float()
+
+        if target_valid_mask is not None:
+            target_valid_mask = target_valid_mask.to(device=source_points.device).bool()
+            if target_valid_mask.shape != target_points.shape[:2]:
+                raise ValueError(
+                    f"target_valid_mask must have shape {tuple(target_points.shape[:2])}, "
+                    f"got {tuple(target_valid_mask.shape)}"
+                )
+
+        ss = (source_points * source_points).sum(dim=2, keepdim=True)
+        tt = (target_points * target_points).sum(dim=2).unsqueeze(1)
+        st = torch.matmul(source_points, target_points.transpose(1, 2))
+        source_target_dist = torch.sqrt((ss + tt - 2.0 * st).clamp_min(0.0))
+
+        target_dot_normal = torch.matmul(target_points, source_normals.transpose(1, 2))
+        source_dot_normal = (source_points * source_normals).sum(dim=2, keepdim=True)
+        source_target_align = target_dot_normal.transpose(1, 2) - source_dot_normal
+        source_target_align = source_target_align / (source_target_dist + 1e-5)
+
+        source_target_align_dist = source_target_dist * torch.exp(
+            float(align_exp_scale) * (1.0 - source_target_align)
+        )
+        if target_valid_mask is not None:
+            source_target_align_dist = source_target_align_dist.masked_fill(
+                ~target_valid_mask.unsqueeze(1),
+                float("inf"),
+            )
+
+        contact_dist = torch.sqrt(source_target_align_dist.min(dim=2).values.clamp_min(0.0))
+        contact_value = 1.0 - 2.0 * (torch.sigmoid(float(sigmoid_scale) * contact_dist) - 0.5)
+        return contact_value.clamp(0.0, 1.0)
+
+    @staticmethod
     def _compute_gendex_contact_value_source_target(
         source_points: torch.Tensor,
         source_normals: torch.Tensor,
@@ -1833,31 +1970,20 @@ class RobotModel:
         align_exp_scale: float = 2.0,
         sigmoid_scale: float = 10.0,
     ) -> torch.Tensor:
-        if source_points.numel() == 0:
-            return torch.zeros((0,), dtype=torch.float32, device=source_points.device)
-        if target_points.numel() == 0:
-            return torch.zeros((source_points.shape[0],), dtype=torch.float32, device=source_points.device)
+        if source_points.ndim != 2 or source_normals.ndim != 2 or target_points.ndim != 2:
+            raise ValueError(
+                "Expected unbatched tensors with shapes (N, 3), (N, 3), and (K, 3)"
+            )
 
-        source_points = source_points.float()
-        source_normals = source_normals.float()
-        target_points = target_points.float()
-
-        ss = (source_points * source_points).sum(dim=1, keepdim=True)
-        tt = (target_points * target_points).sum(dim=1).unsqueeze(0)
-        st = source_points @ target_points.T
-        source_target_dist = torch.sqrt((ss + tt - 2.0 * st).clamp_min(0.0))
-
-        target_dot_normal = target_points @ source_normals.T
-        source_dot_normal = (source_points * source_normals).sum(dim=1, keepdim=True)
-        source_target_align = target_dot_normal.T - source_dot_normal
-        source_target_align = source_target_align / (source_target_dist + 1e-5)
-
-        source_target_align_dist = source_target_dist * torch.exp(
-            float(align_exp_scale) * (1.0 - source_target_align)
+        values = RobotModel._compute_gendex_contact_value_source_target_batch(
+            source_points=source_points.unsqueeze(0),
+            source_normals=source_normals.unsqueeze(0),
+            target_points=target_points.unsqueeze(0),
+            target_valid_mask=None,
+            align_exp_scale=align_exp_scale,
+            sigmoid_scale=sigmoid_scale,
         )
-        contact_dist = torch.sqrt(source_target_align_dist.min(dim=1).values.clamp_min(0.0))
-        contact_value = 1.0 - 2.0 * (torch.sigmoid(float(sigmoid_scale) * contact_dist) - 0.5)
-        return contact_value.clamp(0.0, 1.0)
+        return values[0]
 
     def _mask_component_count(self, mask: torch.Tensor) -> int:
         mask_bool = mask.detach().bool().cpu()
@@ -1891,7 +2017,11 @@ class RobotModel:
 
     @staticmethod
     def _random_tangent_basis(normals: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        ref = torch.tensor([1.0, 0.0, 0.0], dtype=torch.float32, device=normals.device).unsqueeze(0).repeat(normals.shape[0], 1)
+        ref = (
+            torch.tensor([1.0, 0.0, 0.0], dtype=torch.float32, device=normals.device)
+            .unsqueeze(0)
+            .repeat(normals.shape[0], 1)
+        )
         alt = torch.tensor([0.0, 1.0, 0.0], dtype=torch.float32, device=normals.device).unsqueeze(0).repeat(normals.shape[0], 1)
         use_alt = torch.abs((normals * ref).sum(dim=1)) > 0.9
         ref[use_alt] = alt[use_alt]
@@ -1900,6 +2030,218 @@ class RobotModel:
         t2 = torch.cross(normals, t1, dim=1)
         t2 = t2 / torch.norm(t2, dim=1, keepdim=True).clamp_min(1e-8)
         return t1, t2
+
+    @staticmethod
+    def _broadcast_batch_param(
+        value: float | torch.Tensor,
+        *,
+        batch_size: int,
+        device: torch.device,
+        name: str,
+    ) -> torch.Tensor:
+        out = torch.as_tensor(value, dtype=torch.float32, device=device)
+        if out.ndim == 0:
+            out = out.repeat(batch_size)
+        else:
+            out = out.view(-1)
+        if int(out.numel()) != int(batch_size):
+            raise ValueError(f"{name} must broadcast to batch size {batch_size}, got {tuple(out.shape)}")
+        return out
+
+    def _sample_virtual_patch_geometry_batch(
+        self,
+        *,
+        anchor_points: torch.Tensor,
+        anchor_normals: torch.Tensor,
+        generator: Optional[torch.Generator] = None,
+        anchor_shift_min: float | torch.Tensor,
+        anchor_shift_max: float | torch.Tensor,
+        max_plane_extent_min: float | torch.Tensor,
+        max_plane_extent_max: float | torch.Tensor,
+        patch_shift_power: float,
+        patch_extent_power: float,
+        normal_jitter_max_deg: float,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch_size, max_anchors, _ = anchor_points.shape
+        anchor_shift_min_t = self._broadcast_batch_param(
+            anchor_shift_min,
+            batch_size=batch_size,
+            device=self.device,
+            name="anchor_shift_min",
+        )
+        anchor_shift_max_t = self._broadcast_batch_param(
+            anchor_shift_max,
+            batch_size=batch_size,
+            device=self.device,
+            name="anchor_shift_max",
+        )
+        anchor_shift_max_t = torch.maximum(anchor_shift_max_t, anchor_shift_min_t)
+        extent_min_t = self._broadcast_batch_param(
+            max_plane_extent_min,
+            batch_size=batch_size,
+            device=self.device,
+            name="max_plane_extent_min",
+        )
+        extent_max_t = self._broadcast_batch_param(
+            max_plane_extent_max,
+            batch_size=batch_size,
+            device=self.device,
+            name="max_plane_extent_max",
+        )
+        extent_max_t = torch.maximum(extent_max_t, extent_min_t)
+
+        us = torch.rand((batch_size,), device=self.device, generator=generator).pow(max(1e-3, float(patch_shift_power)))
+        ue = torch.rand((batch_size,), device=self.device, generator=generator).pow(max(1e-3, float(patch_extent_power)))
+        anchor_shift_t = anchor_shift_min_t + us * (anchor_shift_max_t - anchor_shift_min_t).clamp_min(1e-8)
+        max_plane_extent_t = extent_min_t + ue * (extent_max_t - extent_min_t).clamp_min(1e-8)
+
+        base_t1, base_t2 = self._random_tangent_basis(anchor_normals.reshape(-1, 3))
+        base_t1 = base_t1.view(batch_size, max_anchors, 3)
+        base_t2 = base_t2.view(batch_size, max_anchors, 3)
+        max_jitter_rad = math.radians(max(0.0, float(normal_jitter_max_deg)))
+        if max_jitter_rad > 0.0:
+            jitter_phi = torch.rand((batch_size, max_anchors), device=self.device, generator=generator) * (2.0 * math.pi)
+            jitter_theta = torch.rand((batch_size, max_anchors), device=self.device, generator=generator) * max_jitter_rad
+            jitter_tangent = (
+                torch.cos(jitter_phi).unsqueeze(-1) * base_t1
+                + torch.sin(jitter_phi).unsqueeze(-1) * base_t2
+            )
+            perturbed_normals = (
+                torch.cos(jitter_theta).unsqueeze(-1) * anchor_normals
+                + torch.sin(jitter_theta).unsqueeze(-1) * jitter_tangent
+            )
+            perturbed_normals = perturbed_normals / perturbed_normals.norm(dim=-1, keepdim=True).clamp_min(1e-8)
+        else:
+            perturbed_normals = anchor_normals
+
+        flat_t1, flat_t2 = self._random_tangent_basis(perturbed_normals.reshape(-1, 3))
+        t1 = flat_t1.view(batch_size, max_anchors, 3)
+        t2 = flat_t2.view(batch_size, max_anchors, 3)
+        centers = anchor_points + anchor_shift_t[:, None, None] * perturbed_normals
+
+        u0 = torch.rand((batch_size, max_anchors), device=self.device, generator=generator)
+        u1 = torch.rand((batch_size, max_anchors), device=self.device, generator=generator)
+        ex = max_plane_extent_t[:, None] * u0.pow(0.32)
+        ey = max_plane_extent_t[:, None] * u1.pow(0.32)
+
+        boost_mask = torch.rand((batch_size, max_anchors), device=self.device, generator=generator) < 0.18
+        boost = torch.empty((batch_size, max_anchors), device=self.device).uniform_(1.2, 1.8, generator=generator)
+        ex = torch.where(boost_mask, ex * boost, ex)
+        ey = torch.where(boost_mask, ey * boost, ey)
+
+        edge_mask = torch.rand((batch_size, max_anchors), device=self.device, generator=generator) < 0.35
+        edge_scale = torch.empty((batch_size, max_anchors), device=self.device).uniform_(0.04, 0.25, generator=generator)
+        edge_axis = torch.randint(
+            0,
+            2,
+            (batch_size, max_anchors),
+            device=self.device,
+            generator=generator,
+        ).bool()
+        ex = torch.where(edge_mask & edge_axis, ex * edge_scale, ex)
+        ey = torch.where(edge_mask & (~edge_axis), ey * edge_scale, ey)
+        ex = ex.clamp_min(2e-4)
+        ey = ey.clamp_min(2e-4)
+        return centers, t1, t2, ex, ey
+
+    def _sample_virtual_object_patches_batch(
+        self,
+        hand_points: torch.Tensor,
+        hand_normals: torch.Tensor,
+        anchor_indices: torch.Tensor,
+        anchor_valid_mask: torch.Tensor,
+        anchor_point_valid_mask: torch.Tensor,
+        generator: Optional[torch.Generator] = None,
+        anchor_shift_min: float | torch.Tensor = 0.0002,
+        anchor_shift_max: float | torch.Tensor = 0.0030,
+        max_plane_extent_min: float | torch.Tensor = 0.006,
+        max_plane_extent_max: float | torch.Tensor = 0.050,
+        patch_shift_power: float = 1.0,
+        patch_extent_power: float = 1.0,
+        normal_jitter_max_deg: float = 10.0,
+        penetration_clearance: float = 0.0001,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        if hand_points.ndim != 3 or hand_normals.ndim != 3:
+            raise ValueError(
+                f"hand_points and hand_normals must have shape (B, N, 3), got {tuple(hand_points.shape)} and {tuple(hand_normals.shape)}"
+            )
+        if hand_points.shape != hand_normals.shape:
+            raise ValueError(
+                f"hand_points and hand_normals must have the same shape, got {tuple(hand_points.shape)} vs {tuple(hand_normals.shape)}"
+            )
+        if anchor_indices.ndim != 2 or anchor_valid_mask.ndim != 2:
+            raise ValueError(
+                f"anchor_indices and anchor_valid_mask must have shape (B, A), got {tuple(anchor_indices.shape)} and {tuple(anchor_valid_mask.shape)}"
+            )
+        if anchor_indices.shape != anchor_valid_mask.shape:
+            raise ValueError(
+                f"anchor_indices and anchor_valid_mask must have the same shape, got {tuple(anchor_indices.shape)} vs {tuple(anchor_valid_mask.shape)}"
+            )
+        if anchor_point_valid_mask.ndim != 3 or anchor_point_valid_mask.shape[:2] != anchor_indices.shape:
+            raise ValueError(
+                "anchor_point_valid_mask must have shape (B, A, P) aligned with anchor_indices, "
+                f"got {tuple(anchor_point_valid_mask.shape)} for anchors {tuple(anchor_indices.shape)}"
+            )
+
+        batch_size, num_points, _ = hand_points.shape
+        _, max_anchors = anchor_indices.shape
+        max_points_per_anchor = int(anchor_point_valid_mask.shape[-1])
+        if int(batch_size) == 0 or max_anchors == 0 or max_points_per_anchor == 0:
+            empty_points = torch.zeros(
+                (batch_size, max_anchors, max_points_per_anchor, 3),
+                dtype=torch.float32,
+                device=self.device,
+            )
+            empty_mask = torch.zeros(
+                (batch_size, max_anchors, max_points_per_anchor),
+                dtype=torch.bool,
+                device=self.device,
+            )
+            return empty_points, empty_mask
+
+        anchor_indices = anchor_indices.to(device=self.device, dtype=torch.long) # (B, A)
+        anchor_valid_mask = anchor_valid_mask.to(device=self.device).bool() # (B, A)
+        anchor_point_valid_mask = anchor_point_valid_mask.to(device=self.device).bool() # (B, A, P)
+        safe_anchor_indices = anchor_indices.clamp(0, max(0, int(num_points) - 1))
+        gather_idx = safe_anchor_indices.unsqueeze(-1).expand(-1, -1, 3)
+        anchor_points = torch.gather(hand_points, 1, gather_idx)
+        anchor_normals = torch.gather(hand_normals, 1, gather_idx)
+        centers, t1, t2, ex, ey = self._sample_virtual_patch_geometry_batch(
+            anchor_points=anchor_points,
+            anchor_normals=anchor_normals,
+            generator=generator,
+            anchor_shift_min=anchor_shift_min,
+            anchor_shift_max=anchor_shift_max,
+            max_plane_extent_min=max_plane_extent_min,
+            max_plane_extent_max=max_plane_extent_max,
+            patch_shift_power=patch_shift_power,
+            patch_extent_power=patch_extent_power,
+            normal_jitter_max_deg=normal_jitter_max_deg,
+        )
+
+        u = (torch.rand((batch_size, max_anchors, max_points_per_anchor), device=self.device, generator=generator) * 2.0 - 1.0) * ex.unsqueeze(-1)
+        v = (torch.rand((batch_size, max_anchors, max_points_per_anchor), device=self.device, generator=generator) * 2.0 - 1.0) * ey.unsqueeze(-1)
+        object_points = (
+            centers.unsqueeze(2)
+            + u.unsqueeze(-1) * t1.unsqueeze(2)
+            + v.unsqueeze(-1) * t2.unsqueeze(2)
+        )
+
+        point_valid_mask = anchor_point_valid_mask & anchor_valid_mask.unsqueeze(-1)
+        flat_points = object_points.view(batch_size, max_anchors * max_points_per_anchor, 3)
+        flat_valid_mask = point_valid_mask.view(batch_size, max_anchors * max_points_per_anchor)
+        if bool(flat_valid_mask.any()):
+            nearest_idx = torch.cdist(flat_points, hand_points).argmin(dim=-1)
+            nearest_gather = nearest_idx.unsqueeze(-1).expand(-1, -1, 3)
+            ref_points = torch.gather(hand_points, 1, nearest_gather)
+            ref_normals = torch.gather(hand_normals, 1, nearest_gather)
+            signed = torch.sum((flat_points - ref_points) * ref_normals, dim=-1)
+            flat_valid_mask = flat_valid_mask & (signed >= float(penetration_clearance))
+        flat_points = flat_points.masked_fill(~flat_valid_mask.unsqueeze(-1), 0.0)
+        return (
+            flat_points.view(batch_size, max_anchors, max_points_per_anchor, 3),
+            flat_valid_mask.view(batch_size, max_anchors, max_points_per_anchor),
+        )
 
     def _sample_virtual_object_patches(
         self,
@@ -1928,77 +2270,33 @@ class RobotModel:
             else:
                 anchor_indices = anchor_indices[:n_anchors]
         n_anchors = int(anchor_indices.numel())
-        anchor_points = hand_points[anchor_indices]
-        anchor_normals = hand_normals[anchor_indices]
-        t1, t2 = self._random_tangent_basis(anchor_normals)
-        # Shift anchors to the outside of hand surface; these are patch centers.
-        centers = anchor_points + float(anchor_shift) * anchor_normals
-
-        base = total_patch_points // n_anchors
-        rem = total_patch_points % n_anchors
-        counts = [base + (1 if i < rem else 0) for i in range(n_anchors)]
-        patch_types = []
-        patch_points = []
-        for i in range(n_anchors):
-            m = int(max(1, counts[i]))
-            c = centers[i]
-            b1 = t1[i]
-            b2 = t2[i]
-
-            # Plane-only patch: heavy-tailed extents for richer data-less coverage.
-            u0 = float(torch.rand(1, device=self.device, generator=generator).item())
-            u1 = float(torch.rand(1, device=self.device, generator=generator).item())
-            ex = float(max_plane_extent) * (u0 ** 0.32)
-            ey = float(max_plane_extent) * (u1 ** 0.32)
-            if bool(torch.rand(1, device=self.device, generator=generator).item() < 0.18):
-                boost = float(torch.empty(1, device=self.device).uniform_(1.2, 1.8, generator=generator).item())
-                ex *= boost
-                ey *= boost
-            if bool(torch.rand(1, device=self.device, generator=generator).item() < 0.35):
-                # Edge-like patch by shrinking one side.
-                if bool(torch.randint(0, 2, (1,), device=self.device, generator=generator).item()):
-                    ex *= float(torch.empty(1, device=self.device).uniform_(0.04, 0.25, generator=generator).item())
-                else:
-                    ey *= float(torch.empty(1, device=self.device).uniform_(0.04, 0.25, generator=generator).item())
-            ex = max(ex, 2e-4)
-            ey = max(ey, 2e-4)
-
-            # Densely sample on plane using jittered grid.
-            nx = int(max(1, round(math.sqrt(float(m)))))
-            ny = int(max(1, math.ceil(float(m) / float(nx))))
-            gx = torch.linspace(-ex, ex, steps=nx, device=self.device)
-            gy = torch.linspace(-ey, ey, steps=ny, device=self.device)
-            uu, vv = torch.meshgrid(gx, gy, indexing="xy")
-            uv = torch.stack([uu.reshape(-1), vv.reshape(-1)], dim=1)
-            if int(uv.shape[0]) > m:
-                perm = torch.randperm(int(uv.shape[0]), device=self.device, generator=generator)[:m]
-                uv = uv[perm]
-            elif int(uv.shape[0]) < m:
-                extra = int(m - uv.shape[0])
-                e_u = torch.empty((extra,), device=self.device).uniform_(-ex, ex, generator=generator)
-                e_v = torch.empty((extra,), device=self.device).uniform_(-ey, ey, generator=generator)
-                uv = torch.cat([uv, torch.stack([e_u, e_v], dim=1)], dim=0)
-            jit_u = torch.randn((m,), device=self.device, generator=generator) * (0.03 * ex)
-            jit_v = torch.randn((m,), device=self.device, generator=generator) * (0.03 * ey)
-            u = uv[:, 0] + jit_u
-            v = uv[:, 1] + jit_v
-            pts = c.unsqueeze(0) + u.unsqueeze(1) * b1.unsqueeze(0) + v.unsqueeze(1) * b2.unsqueeze(0)
-            patch_points.append(pts)
-            patch_types.append(0)  # 0 = plane
-
-        object_points = torch.cat(patch_points, dim=0)
-        # Post-process: project penetrated points outwards without dropping points.
-        if int(object_points.shape[0]) > 0:
-            d = torch.cdist(object_points.unsqueeze(0), hand_points.unsqueeze(0)).squeeze(0)  # (K, N)
-            nn = torch.argmin(d, dim=1)
-            ref_p = hand_points[nn]
-            ref_n = hand_normals[nn]
-            signed = torch.sum((object_points - ref_p) * ref_n, dim=1)
-            push = (float(penetration_clearance) - signed).clamp_min(0.0)
-            object_points = object_points + push.unsqueeze(1) * ref_n
-
-        patch_types_t = torch.tensor(patch_types, dtype=torch.long, device=self.device)
-        return object_points, {"anchor_indices": anchor_indices, "patch_types": patch_types_t}
+        total_patch_points = max(int(total_patch_points), n_anchors)
+        counts = torch.full((n_anchors,), total_patch_points // n_anchors, dtype=torch.long, device=self.device)
+        counts[: total_patch_points % n_anchors] += 1
+        max_points_per_anchor = int(counts.max().item())
+        anchor_valid_mask = torch.ones((1, n_anchors), dtype=torch.bool, device=self.device)
+        anchor_point_valid_mask = (
+            torch.arange(max_points_per_anchor, device=self.device).view(1, 1, max_points_per_anchor)
+            < counts.view(1, n_anchors, 1)
+        )
+        object_points, object_valid_mask = self._sample_virtual_object_patches_batch(
+            hand_points=hand_points.unsqueeze(0),
+            hand_normals=hand_normals.unsqueeze(0),
+            anchor_indices=anchor_indices.view(1, n_anchors),
+            anchor_valid_mask=anchor_valid_mask,
+            anchor_point_valid_mask=anchor_point_valid_mask,
+            generator=generator,
+            anchor_shift_min=anchor_shift,
+            anchor_shift_max=anchor_shift,
+            max_plane_extent_min=max_plane_extent,
+            max_plane_extent_max=max_plane_extent,
+            patch_shift_power=1.0,
+            patch_extent_power=1.0,
+            normal_jitter_max_deg=0.0,
+            penetration_clearance=penetration_clearance,
+        )
+        patch_types_t = torch.zeros((n_anchors,), dtype=torch.long, device=self.device)
+        return object_points[0][object_valid_mask[0]], {"anchor_indices": anchor_indices, "patch_types": patch_types_t}
 
     def _sample_patch_anchor_indices(
         self,
@@ -2060,19 +2358,21 @@ class RobotModel:
                     break
         return torch.tensor(order[:n_anchor], dtype=torch.long, device=self.device)
 
-    def set_contact_mask_sampler_state(self, state: Dict[str, torch.Tensor]) -> None:
-        self.contact_mask_sampler_state = {}
-        for k, v in state.items():
-            if torch.is_tensor(v):
-                self.contact_mask_sampler_state[k] = v.detach().cpu()
-            else:
-                self.contact_mask_sampler_state[k] = torch.tensor(v)
-
-    def load_contact_mask_sampler_state(self, path: str) -> None:
-        state = torch.load(path, map_location="cpu")
-        if not isinstance(state, dict):
-            raise ValueError(f"Invalid sampler state at {path}")
-        self.set_contact_mask_sampler_state(state)
+    @staticmethod
+    def _estimate_contact_count_range(
+        counts: torch.Tensor,
+        *,
+        lower_quantile: float = 0.05,
+        upper_quantile: float = 0.95,
+    ) -> Tuple[int, int]:
+        counts = counts.detach().view(-1).float().cpu()
+        if int(counts.numel()) == 0:
+            return 1, 1
+        lower = int(torch.quantile(counts, q=float(lower_quantile)).floor().item())
+        upper = int(torch.quantile(counts, q=float(upper_quantile)).ceil().item())
+        lower = max(1, lower)
+        upper = max(lower, upper)
+        return lower, upper
 
     def fit_contact_mask_sampler(
         self,
@@ -2089,6 +2389,7 @@ class RobotModel:
 
         counts = masks.sum(dim=1).long()
         count_hist = torch.bincount(counts, minlength=self.surface_num_points + 1).float()
+        count_lo, count_hi = self._estimate_contact_count_range(counts)
 
         max_comp = 32
         comp_hist = torch.zeros((max_comp + 1,), dtype=torch.float32)
@@ -2117,238 +2418,29 @@ class RobotModel:
             comp_hi = max(comp_lo, comp_hi)
         comp_lo = min(comp_lo, 8)
         comp_hi = max(comp_lo, min(comp_hi, 8))
+        component_count_values = torch.arange(comp_lo, comp_hi + 1, dtype=torch.long)
+        component_count_distribution = comp_hist[comp_lo : comp_hi + 1].float()
+        if float(component_count_distribution.sum().item()) <= 0.0:
+            component_count_distribution = torch.ones_like(component_count_distribution)
+        component_count_distribution = component_count_distribution / component_count_distribution.sum().clamp_min(1e-8)
 
         state: Dict[str, torch.Tensor] = {
             "count_hist": count_hist,
             "component_hist": comp_hist,
             "component_range": torch.tensor([comp_lo, comp_hi], dtype=torch.long),
+            "component_count_values": component_count_values,
+            "component_count_distribution": component_count_distribution,
+            "contact_count_range": torch.tensor([count_lo, count_hi], dtype=torch.long),
             "num_real_samples": torch.tensor([int(masks.shape[0])], dtype=torch.long),
         }
-
-        self.set_contact_mask_sampler_state(state)
-        return state
+        self.contact_mask_sampler_state = {
+            k: (v.detach().cpu() if torch.is_tensor(v) else torch.tensor(v))
+            for k, v in state.items()
+        }
+        return self.contact_mask_sampler_state
 
     def _sample_q_for_contact(self, generator: Optional[torch.Generator] = None) -> torch.Tensor:
-        lower, upper = self.pk_chain.get_joint_limits()
-        lower_t = torch.tensor(lower, dtype=torch.float32, device=self.device)
-        upper_t = torch.tensor(upper, dtype=torch.float32, device=self.device)
-        finite = torch.isfinite(lower_t) & torch.isfinite(upper_t)
-        q = torch.zeros(self.dof, dtype=torch.float32, device=self.device)
-        if finite.any():
-            u = torch.rand(self.dof, device=self.device, generator=generator)
-            mode = float(torch.rand(1, device=self.device, generator=generator).item())
-            if mode < 0.25:
-                # Independent uniform.
-                t = u
-            elif mode < 0.55:
-                # Correlated global posture with per-joint jitter.
-                g = torch.rand(1, device=self.device, generator=generator)
-                t = 0.75 * g + 0.25 * u
-            elif mode < 0.80:
-                # Extreme-biased posture (near one side of joint range).
-                if bool(torch.randint(0, 2, (1,), device=self.device, generator=generator).item()):
-                    t = u.pow(2.5)
-                else:
-                    t = 1.0 - u.pow(2.5)
-            else:
-                # Center-heavy posture.
-                x = 2.0 * u - 1.0
-                t = 0.5 + 0.5 * x.pow(3)
-            t = t.clamp(0.0, 1.0)
-            q[finite] = lower_t[finite] + t[finite] * (upper_t[finite] - lower_t[finite])
-        if (~finite).any():
-            cnt = int((~finite).sum().item())
-            q[~finite] = (torch.rand(cnt, device=self.device, generator=generator) * 2.0 - 1.0) * torch.pi
-        return self._zero_base_translation_in_q(q)
-
-    def sample_contact_masks_with_details(
-        self,
-        B: int,
-        threshold: float = 0.4,
-        align_exp_scale: float = 2.0,
-        sigmoid_scale: float = 10.0,
-        patch_points: int = 96,
-        component_min: Optional[int] = None,
-        component_max: Optional[int] = None,
-        seed: Optional[int] = None,
-    ) -> Dict[str, torch.Tensor]:
-        if int(B) <= 0:
-            raise ValueError("B must be positive")
-        generator = None
-        if seed is not None:
-            generator = torch.Generator(device=self.device.type)
-            generator.manual_seed(int(seed))
-
-        comp_lo_default, comp_hi_default = 1, 4
-        if self.contact_mask_sampler_state is not None:
-            comp_range = self.contact_mask_sampler_state.get("component_range")
-            if comp_range is not None and torch.is_tensor(comp_range) and comp_range.numel() >= 2:
-                comp_lo_default = int(comp_range[0].item())
-                comp_hi_default = int(comp_range[1].item())
-        comp_lo = int(comp_lo_default if component_min is None else component_min)
-        comp_hi = int(comp_hi_default if component_max is None else component_max)
-        comp_lo = max(1, min(comp_lo, 8))
-        comp_hi = max(comp_lo, min(comp_hi, 8))
-
-        masks = torch.zeros((B, self.surface_num_points), dtype=torch.bool, device=self.device)
-        values = torch.zeros((B, self.surface_num_points), dtype=torch.float32, device=self.device)
-        q_batch = torch.zeros((B, self.dof), dtype=torch.float32, device=self.device)
-        hand_points_batch = torch.zeros((B, self.surface_num_points, 3), dtype=torch.float32, device=self.device)
-        object_points_padded = torch.zeros((B, patch_points, 3), dtype=torch.float32, device=self.device)
-        object_points_mask = torch.zeros((B, patch_points), dtype=torch.bool, device=self.device)
-        anchor_indices_padded = torch.full((B, 8), -1, dtype=torch.long, device=self.device)
-        patch_types_padded = torch.full((B, 8), -1, dtype=torch.long, device=self.device)
-
-        for b in range(B):
-            q = self._sample_q_for_contact(generator=generator)
-            hand_points, hand_normals = self.get_surface_points_normals(q=q)
-            bbox_extent = hand_points.max(dim=0).values - hand_points.min(dim=0).values
-            hand_scale = float(torch.norm(bbox_extent).item())
-            hand_scale = max(hand_scale, 1e-4)
-            span = max(0, comp_hi - comp_lo)
-            if span == 0:
-                n_anchor = int(comp_lo)
-            else:
-                # Multi-shape component prior for broader coverage (still data-less).
-                u_mode = float(torch.rand(1, device=self.device, generator=generator).item())
-                u_comp = float(torch.rand(1, device=self.device, generator=generator).item())
-                if u_mode < 0.33:
-                    frac = u_comp ** 2.0
-                elif u_mode < 0.66:
-                    frac = 1.0 - (u_comp ** 2.0)
-                else:
-                    frac = u_comp
-                if comp_hi <= 5:
-                    frac = frac ** 1.15
-                n_anchor = int(comp_lo + round(frac * span))
-            # Data-less multi-regime sampler to broaden coverage without relying on real masks.
-            mode_u = float(torch.rand(1, device=self.device, generator=generator).item())
-            if mode_u < 0.20:
-                shift_lo = max(0.00006, 0.0060 * hand_scale)
-                shift_hi = min(0.0042, 0.0180 * hand_scale)
-                ext_lo = max(0.0030, 0.0200 * hand_scale)
-                ext_hi = min(0.0240, 0.0700 * hand_scale)
-                anchor_shift_i = float(
-                    torch.empty(1, device=self.device).uniform_(shift_lo, max(shift_lo + 1e-6, shift_hi), generator=generator).item()
-                )
-                max_extent_i = float(
-                    torch.empty(1, device=self.device).uniform_(ext_lo, max(ext_lo + 1e-6, ext_hi), generator=generator).item()
-                )
-                patch_points_gen = int(max(int(patch_points), int(20 * n_anchor)))
-            elif mode_u < 0.55:
-                shift_lo = max(0.00004, 0.0030 * hand_scale)
-                shift_hi = min(0.0030, 0.0120 * hand_scale)
-                ext_lo = max(0.0060, 0.0400 * hand_scale)
-                ext_hi = min(0.0340, 0.1100 * hand_scale)
-                anchor_shift_i = float(
-                    torch.empty(1, device=self.device).uniform_(shift_lo, max(shift_lo + 1e-6, shift_hi), generator=generator).item()
-                )
-                max_extent_i = float(
-                    torch.empty(1, device=self.device).uniform_(ext_lo, max(ext_lo + 1e-6, ext_hi), generator=generator).item()
-                )
-                patch_points_gen = int(max(int(patch_points), int(32 * n_anchor)))
-            elif mode_u < 0.85:
-                shift_lo = max(0.00002, 0.0010 * hand_scale)
-                shift_hi = min(0.0020, 0.0080 * hand_scale)
-                ext_lo = max(0.0120, 0.0700 * hand_scale)
-                ext_hi = min(0.0500, 0.1800 * hand_scale)
-                anchor_shift_i = float(
-                    torch.empty(1, device=self.device).uniform_(shift_lo, max(shift_lo + 1e-6, shift_hi), generator=generator).item()
-                )
-                max_extent_i = float(
-                    torch.empty(1, device=self.device).uniform_(ext_lo, max(ext_lo + 1e-6, ext_hi), generator=generator).item()
-                )
-                patch_points_gen = int(max(int(patch_points), int(56 * n_anchor)))
-            else:
-                shift_lo = 0.0
-                shift_hi = min(0.0012, 0.0040 * hand_scale)
-                ext_lo = max(0.0180, 0.1000 * hand_scale)
-                ext_hi = min(0.0850, 0.2600 * hand_scale)
-                anchor_shift_i = float(
-                    torch.empty(1, device=self.device).uniform_(shift_lo, max(shift_lo + 1e-6, shift_hi), generator=generator).item()
-                )
-                max_extent_i = float(
-                    torch.empty(1, device=self.device).uniform_(ext_lo, max(ext_lo + 1e-6, ext_hi), generator=generator).item()
-                )
-                patch_points_gen = int(max(int(patch_points), int(80 * n_anchor)))
-            # For simple/low-component manipulators, bias toward smaller and more separated patches.
-            if comp_hi <= 5:
-                s_shrink = float(
-                    torch.empty(1, device=self.device).uniform_(0.25, 0.55, generator=generator).item()
-                )
-                s_shift = float(
-                    torch.empty(1, device=self.device).uniform_(1.4, 2.2, generator=generator).item()
-                )
-                max_extent_i *= s_shrink
-                anchor_shift_i *= s_shift
-                patch_points_gen = int(max(int(patch_points), int(round(0.45 * float(patch_points_gen)))))
-            anchor_indices = self._sample_patch_anchor_indices(
-                hand_points=hand_points,
-                n_anchor=n_anchor,
-                generator=generator,
-            )
-            obj_pts, patch_meta = self._sample_virtual_object_patches(
-                hand_points=hand_points,
-                hand_normals=hand_normals,
-                num_anchors=n_anchor,
-                total_patch_points=patch_points_gen,
-                generator=generator,
-                anchor_indices=anchor_indices,
-                anchor_shift=anchor_shift_i,
-                max_plane_extent=max_extent_i,
-                penetration_clearance=0.00008,
-            )
-            val = self._compute_gendex_contact_value_source_target(
-                source_points=hand_points,
-                source_normals=hand_normals,
-                target_points=obj_pts,
-                align_exp_scale=float(align_exp_scale),
-                sigmoid_scale=float(sigmoid_scale),
-            )
-            mask = val >= float(threshold)
-            masks[b] = mask
-            values[b] = val
-            q_batch[b] = q
-            hand_points_batch[b] = hand_points
-
-            if int(obj_pts.shape[0]) > int(patch_points):
-                keep = torch.randperm(int(obj_pts.shape[0]), device=self.device, generator=generator)[: int(patch_points)]
-                obj_vis = obj_pts[keep]
-            else:
-                obj_vis = obj_pts
-            n_obj = int(min(obj_vis.shape[0], patch_points))
-            object_points_padded[b, :n_obj] = obj_vis[:n_obj]
-            object_points_mask[b, :n_obj] = True
-            na = int(min(patch_meta["anchor_indices"].shape[0], 8))
-            anchor_indices_padded[b, :na] = patch_meta["anchor_indices"][:na]
-            patch_types_padded[b, :na] = patch_meta["patch_types"][:na]
-
-        return {
-            "masks": masks.detach().cpu(),
-            "contact_values": values.detach().cpu(),
-            "q": q_batch.detach().cpu(),
-            "hand_points": hand_points_batch.detach().cpu(),
-            "object_patch_points": object_points_padded.detach().cpu(),
-            "object_patch_mask": object_points_mask.detach().cpu(),
-            "anchor_indices": anchor_indices_padded.detach().cpu(),
-            "patch_types": patch_types_padded.detach().cpu(),
-        }
-
-    def sample_contact_masks(
-        self,
-        B: int,
-        threshold: float = 0.4,
-        align_exp_scale: float = 2.0,
-        sigmoid_scale: float = 10.0,
-        seed: Optional[int] = None,
-    ) -> torch.Tensor:
-        return self.sample_contact_masks_with_details(
-            B=B,
-            threshold=threshold,
-            align_exp_scale=align_exp_scale,
-            sigmoid_scale=sigmoid_scale,
-            seed=seed,
-        )["masks"]
+        return self.sample_random_q(batch_size=1, generator=generator)
 
     def get_sampled_pc(
         self,
