@@ -14,16 +14,12 @@ from omegaconf import DictConfig, OmegaConf
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(ROOT_DIR)
 
-
-def _load_payload(path: str) -> dict:
-    payload = torch.load(path, map_location="cpu")
-    if not isinstance(payload, dict):
-        raise ValueError(f"Expected dict payload in {path}")
-    if "samples" not in payload:
-        raise KeyError(f"Payload at {path} missing 'samples'")
-    return payload
-
-
+from experiment.grasp_sample_index import (
+    get_sample_for_robot,
+    group_entries_by_robot,
+    load_ordered_cmap_entries,
+    load_ordered_results_entries,
+)
 def _find_dro_root(cfg_dro_root: str | None, payload: dict) -> str:
     if cfg_dro_root is not None:
         return cfg_dro_root
@@ -53,38 +49,56 @@ def _to_tensor_q(sample: dict, key: str) -> torch.Tensor | None:
     return torch.tensor(q, dtype=torch.float32)
 
 
-@hydra.main(version_base="1.2", config_path="../conf", config_name="config_visualize_cross_cvae")
+@hydra.main(version_base="1.2", config_path="conf", config_name="config_visualize_cross_cvae")
 def main(cfg: DictConfig) -> None:
     print("******************************** [Config] ********************************")
     print(OmegaConf.to_yaml(cfg))
     print("******************************** [Config] ********************************")
 
-    results_path = to_absolute_path(str(cfg.visualization.results_path))
-    payload = _load_payload(results_path)
-    all_samples = list(payload["samples"])
-    if len(all_samples) == 0:
-        raise RuntimeError(f"No samples in results file: {results_path}")
+    vis_cfg = cfg.visualization
+    input_mode = str(vis_cfg.get("input_mode", "results")).lower()
+    filter_robots = None if vis_cfg.robot_names is None else [str(x) for x in vis_cfg.robot_names]
+    max_samples = int(vis_cfg.max_samples)
+    max_samples_per_robot = int(vis_cfg.get("max_samples_per_robot", -1))
 
-    dro_root = _find_dro_root(
-        None if cfg.visualization.dro_root is None else to_absolute_path(str(cfg.visualization.dro_root)),
-        payload,
-    )
+    if input_mode == "results":
+        payload, entries, robot_names = load_ordered_results_entries(
+            str(vis_cfg.results_path),
+            robot_names=filter_robots,
+            max_samples=max_samples,
+            max_samples_per_robot=max_samples_per_robot,
+        )
+        dro_root = _find_dro_root(
+            None if vis_cfg.dro_root is None else to_absolute_path(str(vis_cfg.dro_root)),
+            payload,
+        )
+    elif input_mode == "cmap_gt":
+        if vis_cfg.dro_root is None:
+            raise ValueError("visualization.dro_root must be set for input_mode=cmap_gt")
+        dro_root = to_absolute_path(str(vis_cfg.dro_root))
+        cmap_object_names = None
+        cmap_cfg = vis_cfg.get("cmap_gt", {})
+        if cmap_cfg.get("object_names") is not None:
+            cmap_object_names = [str(x) for x in cmap_cfg.object_names]
+        payload, entries, robot_names = load_ordered_cmap_entries(
+            dro_root=dro_root,
+            split=str(cmap_cfg.get("split", "validate")),
+            robot_names=filter_robots,
+            object_names=cmap_object_names,
+            max_samples_per_robot=max_samples_per_robot,
+        )
+    else:
+        raise ValueError(f"Unsupported visualization.input_mode: {input_mode}")
+
+    if len(entries) == 0:
+        raise RuntimeError("No samples left after filtering.")
 
     # Import DRO hand model lazily after root resolution.
     sys.path.append(dro_root)
     from utils.hand_model import create_hand_model  # type: ignore
 
-    filter_robots = None if cfg.visualization.robot_names is None else set(cfg.visualization.robot_names)
-    samples = []
-    for s in all_samples:
-        if filter_robots is not None and s["robot_name"] not in filter_robots:
-            continue
-        samples.append(s)
-    if len(samples) == 0:
-        raise RuntimeError("No samples left after filtering by robot_names.")
-
-    if int(cfg.visualization.max_samples) >= 0:
-        samples = samples[: int(cfg.visualization.max_samples)]
+    entries_by_robot = group_entries_by_robot(entries)
+    max_ordered_idx = max(len(rows) for rows in entries_by_robot.values()) - 1
 
     hand_cache: dict[str, object] = {}
     object_mesh_cache: dict[str, trimesh.Trimesh] = {}
@@ -94,17 +108,39 @@ def main(cfg: DictConfig) -> None:
         port=int(cfg.visualization.port),
     )
 
-    any_gt = any(("q_gt" in s or "q_gt_padded" in s) for s in samples)
+    any_gt = input_mode == "cmap_gt" or any(
+        ("q_gt" in entry["raw_sample"] or "q_gt_padded" in entry["raw_sample"]) for entry in entries
+    )
+    mode_label = "display_mode (0=pred,1=gt,2=both)"
     mode_max = 2 if any_gt else 0
-    sample_slider = server.gui.add_slider(
-        label="sample_index",
+    if input_mode == "cmap_gt":
+        mode_label = "display_mode (0=grasp)"
+        mode_max = 0
+
+    initial_robot_index = int(vis_cfg.get("initial_robot_index", 0))
+    initial_robot_name = vis_cfg.get("initial_robot_name")
+    if initial_robot_name is not None:
+        initial_robot_name = str(initial_robot_name)
+        if initial_robot_name in robot_names:
+            initial_robot_index = robot_names.index(initial_robot_name)
+    initial_robot_index = max(0, min(initial_robot_index, len(robot_names) - 1))
+
+    robot_slider = server.gui.add_slider(
+        label="robot_index",
         min=0,
-        max=max(0, len(samples) - 1),
+        max=max(0, len(robot_names) - 1),
         step=1,
-        initial_value=0,
+        initial_value=initial_robot_index,
+    )
+    sample_slider = server.gui.add_slider(
+        label="ordered_idx",
+        min=0,
+        max=max(0, max_ordered_idx),
+        step=1,
+        initial_value=max(0, int(vis_cfg.get("initial_ordered_idx", 0))),
     )
     mode_slider = server.gui.add_slider(
-        label="display_mode (0=pred,1=gt,2=both)",
+        label=mode_label,
         min=0,
         max=mode_max,
         step=1,
@@ -122,11 +158,22 @@ def main(cfg: DictConfig) -> None:
             object_mesh_cache[object_name] = trimesh.load_mesh(path)
         return object_mesh_cache[object_name]
 
-    def _render(idx: int, display_mode: int) -> None:
-        sample = samples[idx]
-        robot_name = sample["robot_name"]
-        object_name = sample["object_name"]
-        dof = int(sample["dof"])
+    def _selected_robot_name() -> str:
+        return robot_names[max(0, min(int(robot_slider.value), len(robot_names) - 1))]
+
+    def _render(_robot_idx: int, display_mode: int) -> None:
+        robot_name = _selected_robot_name()
+        robot_entries = entries_by_robot[robot_name]
+        requested_ordered_idx = int(sample_slider.value)
+        actual_ordered_idx = max(0, min(requested_ordered_idx, len(robot_entries) - 1))
+        if actual_ordered_idx != requested_ordered_idx:
+            sample_slider.value = actual_ordered_idx
+            return
+
+        entry = get_sample_for_robot(entries_by_robot, robot_name, actual_ordered_idx)
+        sample = entry["raw_sample"]
+        object_name = str(entry["object_name"])
+        dof = int(entry["dof"])
 
         object_mesh = _get_mesh(object_name)
         server.scene.add_mesh_simple(
@@ -141,6 +188,10 @@ def main(cfg: DictConfig) -> None:
 
         q_pred = _to_tensor_q(sample, "q_pred")
         q_gt = _to_tensor_q(sample, "q_gt")
+        if input_mode == "cmap_gt":
+            q_gt = _to_tensor_q(sample, "q_gt")
+            if q_gt is None:
+                q_gt = _to_tensor_q(entry, "q_gt")
 
         if q_pred is None:
             q_pred_padded = _to_tensor_q(sample, "q_pred_padded")
@@ -154,6 +205,9 @@ def main(cfg: DictConfig) -> None:
 
         show_pred = display_mode in (0, 2)
         show_gt = display_mode in (1, 2)
+        if input_mode == "cmap_gt":
+            show_pred = False
+            show_gt = True
         # For no-data entries, GT may be missing; always show generated if available.
         if q_gt is None and q_pred is not None:
             show_pred = True
@@ -196,15 +250,20 @@ def main(cfg: DictConfig) -> None:
             )
 
         print(
-            f"[sample {idx}] robot={robot_name} object={object_name} dof={dof} "
-            f"mode={display_mode} mse_valid={sample.get('mse_valid', 'n/a')}"
+            f"[robot={robot_name} ordered_idx={actual_ordered_idx}] "
+            f"object={object_name} dof={dof} input_mode={input_mode} mode={display_mode} "
+            f"sample_id={sample.get('sample_id', 'n/a')} global_index={entry.get('global_index', 'n/a')} "
+            f"dataset_index={entry.get('dataset_index', 'n/a')} mse_valid={sample.get('mse_valid', 'n/a')}"
         )
 
-    sample_slider.on_update(lambda _: _render(int(sample_slider.value), int(mode_slider.value)))
-    mode_slider.on_update(lambda _: _render(int(sample_slider.value), int(mode_slider.value)))
+    robot_slider.on_update(lambda _: _render(int(robot_slider.value), int(mode_slider.value)))
+    sample_slider.on_update(lambda _: _render(int(robot_slider.value), int(mode_slider.value)))
+    mode_slider.on_update(lambda _: _render(int(robot_slider.value), int(mode_slider.value)))
 
-    _render(0, int(mode_slider.value))
+    _render(int(robot_slider.value), int(mode_slider.value))
     print(f"Viewer URL: http://{cfg.visualization.host}:{cfg.visualization.port}")
+    if bool(vis_cfg.get("exit_after_first_render", False)):
+        return
     while True:
         time.sleep(1.0)
 

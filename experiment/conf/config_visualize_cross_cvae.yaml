@@ -2,14 +2,24 @@ defaults:
   - _self_
 
 visualization:
+  input_mode: cmap_gt  # results or cmap_gt
   results_path: ./outputs/cross_cvae/validation/generated_grasps.pt
   dro_root: ../DRO-Grasp  # null -> read from results meta
   robot_names: null  # null -> all robots in result file
   max_samples: 500  # -1 means all
+  max_samples_per_robot: -1  # -1 means all
 
   host: 127.0.0.1
   port: 8080
   initial_display_mode: 2  # 0=pred, 1=gt, 2=both
+  initial_robot_index: 0
+  initial_robot_name: null
+  initial_ordered_idx: 0
+  exit_after_first_render: false
+
+  cmap_gt:
+    split: validate
+    object_names: null
 
   object_opacity: 1.0
   hand_opacity: 0.8

@@ -4,7 +4,6 @@ defaults:
 seed: 42
 
 paths:
-  spider_root: ../spider
   dro_root: ../DRO-Grasp
 
 input:
@@ -19,36 +18,48 @@ input:
     q_key: q_pred  # q_pred or q_gt
 
   cmap_gt:
+    data_pt_path: null  # null -> use DRO-Grasp split file
     split: validate
     robot_names:
       - allegro
       - barrett
       - ezgripper
       - shadowhand
+    object_names: null
 
 mujoco:
-  num_steps: 1000
+  backend: mjwarp  # mjwarp or cpu
+  device: cuda:0
+  max_worlds_per_batch: 1024
+  nconmax_per_world: 512
+  njmax_per_world: 2048
+  capture_cuda_graph: true
+
+  num_steps: 600  # settle/hold steps before disturbance
   object_pose6: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
   sim_dt: 0.005
   steps_per_frame: 1
+  gravity_enabled: false
   in_hand_distance_threshold: 0.25
-
-  show_viewer: true
-  save_video: false
-  render_fps: null 
-  render_width: 720
-  render_height: 480
-  render_every_n_steps: 1
-  use_visual_mesh_for_viewer: true
+  object_density: 500.0
 
   hand_kp: 40.0
   hand_kd: 5.0
   hand_max_force: 10.0
 
+  squeezing:
+    enabled: true
+
+  disturbance:
+    enabled: true
+    push_steps: 100
+    recovery_steps: 200
+    force_acceleration: 2.45
+    force_cap: 1.0
+    directions: [+x, -x, +y, -y, +z, -z]
+
 output:
   save_path: ./outputs/cross_cvae/mujoco/mujoco_eval.pt
-  save_full_rollout: false
-  video_dir: ./outputs/cross_cvae/mujoco/videos
   urdf_patch_dir: ./outputs/cross_cvae/mujoco/urdf_patches
 
 hydra:

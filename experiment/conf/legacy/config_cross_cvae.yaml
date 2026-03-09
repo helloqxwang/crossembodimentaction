@@ -7,7 +7,6 @@ experiment:
   name: cross_embodiment_cvae_mvp
 
 dataset:
-  # Path to DRO-Grasp root directory.
   dro_root: ../DRO-Grasp
   robot_names:
     - allegro

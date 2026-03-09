@@ -1,0 +1,63 @@
+defaults:
+  - _self_
+
+baseline:
+  type: cross_embodiment
+
+env:
+  repr_python: /home/qianxu/miniconda3/envs/repr/bin/python
+  mujoco_python: /home/qianxu/Project/spider/.venv/bin/python
+
+model:
+  cross:
+    ckpt_path: ./checkpoints/baselines/cross_embodiment_cvae/best.pt
+    dataset_meta_path: null
+  single:
+    checkpoint_root: ./checkpoints/baselines/single_embodiment_cvae
+    checkpoint_name: best.pt
+    dataset_meta_name: dataset_meta.pt
+
+validate:
+  common_overrides:
+    - validation.test_rounds=2
+    - validation.pred_mode=recon
+    - validation.recon_use_mean_latent=true
+    - validation.compute_chamfer=true
+  train_overrides:
+    - dataset.split=train
+  test_overrides:
+    - dataset.split=validate
+
+visualization:
+  launch: true
+  train_port: 8081
+  test_port: 8082
+  extra_overrides:
+    - visualization.max_samples=500
+
+mujoco:
+  common_overrides:
+    - input.max_total_samples=200
+    - input.max_samples_per_robot=-1
+    - input.shuffle=false
+    - mujoco.backend=mjwarp
+    - mujoco.device=cuda:0
+    - mujoco.num_steps=200
+
+outputs:
+  train_validate_pt: ./outputs/cvae_baselines/pipeline/train_generated_grasps.pt
+  test_validate_pt: ./outputs/cvae_baselines/pipeline/test_generated_grasps.pt
+  train_count_csv: ./outputs/cvae_baselines/pipeline/train_count_table.csv
+  test_count_csv: ./outputs/cvae_baselines/pipeline/test_count_table.csv
+  train_mujoco_pred_pt: ./outputs/cvae_baselines/pipeline/train_mujoco_pred_eval.pt
+  test_mujoco_pred_pt: ./outputs/cvae_baselines/pipeline/test_mujoco_pred_eval.pt
+  train_mujoco_gt_pt: ./outputs/cvae_baselines/pipeline/train_mujoco_gt_eval.pt
+  test_mujoco_gt_pt: ./outputs/cvae_baselines/pipeline/test_mujoco_gt_eval.pt
+  report_md: ./outputs/cvae_baselines/pipeline/cvae_report.md
+  report_json: ./outputs/cvae_baselines/pipeline/cvae_report.json
+
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}_run_cvae_pipeline
+  job:
+    chdir: false

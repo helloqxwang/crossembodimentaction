@@ -30,10 +30,10 @@ mujoco:
   common_overrides:
     - input.max_total_samples=200
     - input.max_samples_per_robot=-1
+    - input.shuffle=false
+    - mujoco.backend=mjwarp
+    - mujoco.device=cuda:0
     - mujoco.num_steps=200
-    # Full pipeline defaults to headless; override to true if you want an interactive run.
-    - mujoco.show_viewer=false
-    - mujoco.save_video=false
 
 outputs:
   train_validate_pt: ./outputs/cross_cvae/pipeline/train_generated_grasps.pt

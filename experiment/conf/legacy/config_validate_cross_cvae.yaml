@@ -7,7 +7,6 @@ dataset:
   dro_root: ../DRO-Grasp
   split: validate  # train or validate
   num_points: 512
-  # Unused by round-based evaluator, kept for compatibility.
   batch_size: 64
   num_workers: 8
   pin_memory: true
@@ -15,9 +14,8 @@ dataset:
 
 model:
   ckpt_path: ./checkpoints/cross_embodiment_cvae_mvp/best.pt
-  dataset_meta_path: null  # null -> infer as dirname(ckpt_path)/dataset_meta.pt
+  dataset_meta_path: null
 
-  # Fallback architecture definition if ckpt config is unavailable.
   dgcnn_k: 20
   object_emb_dim: 256
   embodiment_dim: 8
@@ -27,14 +25,14 @@ model:
 
 validation:
   device: cuda
-  robot_names: null  # null -> use all robots in dataset_meta; otherwise list, e.g. [allegro, shadowhand]
-  object_names: null  # null -> all objects in split, or list like [ycb+peach, contactdb+apple]
-  max_objects: -1  # -1 means all selected objects
-  only_pairs_with_gt: false  # true -> skip no-data pairs completely
+  robot_names: null
+  object_names: null
+  max_objects: -1
+  only_pairs_with_gt: false
   compute_chamfer: true
-  pred_mode: sample  # sample or recon
+  pred_mode: sample
   recon_use_mean_latent: true
-  test_rounds: 1  # round-0 covers all (hand, object) pairs once; round-1 does second sample/no-data
+  test_rounds: 1
   save_gt: true
   object_pose6: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 

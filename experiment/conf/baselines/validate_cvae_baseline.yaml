@@ -1,0 +1,54 @@
+defaults:
+  - _self_
+
+seed: 42
+
+baseline:
+  type: cross_embodiment  # cross_embodiment or single_embodiment
+
+dataset:
+  dro_root: ../DRO-Grasp
+  split: validate
+  num_points: 512
+  batch_size: 64
+  num_workers: 8
+  pin_memory: true
+  shuffle: false
+
+model:
+  architecture:
+    dgcnn_k: 20
+    object_emb_dim: 256
+    embodiment_dim: 8
+    latent_dim: 32
+    encoder_hidden_dims: [512, 256]
+    decoder_hidden_dims: [256, 256]
+  cross:
+    ckpt_path: ./checkpoints/baselines/cross_embodiment_cvae/best.pt
+    dataset_meta_path: null
+  single:
+    checkpoint_root: ./checkpoints/baselines/single_embodiment_cvae
+    checkpoint_name: best.pt
+    dataset_meta_name: dataset_meta.pt
+
+validation:
+  device: cuda
+  robot_names: null
+  object_names: null
+  max_objects: -1
+  only_pairs_with_gt: false
+  compute_chamfer: true
+  pred_mode: sample
+  recon_use_mean_latent: true
+  test_rounds: 1
+  save_gt: true
+  object_pose6: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+
+output:
+  save_path: ./outputs/cvae_baselines/validation/generated_grasps.pt
+
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}_validate_cvae_baseline
+  job:
+    chdir: false

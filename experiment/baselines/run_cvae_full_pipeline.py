@@ -11,7 +11,7 @@ import hydra
 from hydra.utils import to_absolute_path
 from omegaconf import DictConfig, OmegaConf
 
-ROOT_DIR = Path(__file__).resolve().parents[1]
+ROOT_DIR = Path(__file__).resolve().parents[2]
 
 
 def _run(cmd: Sequence[str], *, workdir: Path) -> None:
@@ -19,7 +19,27 @@ def _run(cmd: Sequence[str], *, workdir: Path) -> None:
     subprocess.run(list(cmd), cwd=str(workdir), check=True)
 
 
-@hydra.main(version_base="1.2", config_path="../conf", config_name="config_run_cross_cvae_full_pipeline")
+def _baseline_validate_overrides(cfg: DictConfig) -> list[str]:
+    baseline_type = str(cfg.baseline.type)
+    overrides = [f"baseline.type={baseline_type}"]
+    if baseline_type == "cross_embodiment":
+        overrides.append(f"model.cross.ckpt_path={to_absolute_path(str(cfg.model.cross.ckpt_path))}")
+        if cfg.model.cross.dataset_meta_path is not None:
+            overrides.append(
+                f"model.cross.dataset_meta_path={to_absolute_path(str(cfg.model.cross.dataset_meta_path))}"
+            )
+    elif baseline_type == "single_embodiment":
+        overrides.append(
+            f"model.single.checkpoint_root={to_absolute_path(str(cfg.model.single.checkpoint_root))}"
+        )
+        overrides.append(f"model.single.checkpoint_name={str(cfg.model.single.checkpoint_name)}")
+        overrides.append(f"model.single.dataset_meta_name={str(cfg.model.single.dataset_meta_name)}")
+    else:
+        raise ValueError(f"Unsupported baseline.type: {baseline_type}")
+    return overrides
+
+
+@hydra.main(version_base="1.2", config_path="../conf/baselines", config_name="run_cvae_full_pipeline")
 def main(cfg: DictConfig) -> None:
     print("******************************** [Config] ********************************")
     print(OmegaConf.to_yaml(cfg))
@@ -37,16 +57,19 @@ def main(cfg: DictConfig) -> None:
     report_md = to_absolute_path(str(cfg.outputs.report_md))
     report_json = to_absolute_path(str(cfg.outputs.report_json))
 
-    Path(train_validate_pt).parent.mkdir(parents=True, exist_ok=True)
-    Path(test_validate_pt).parent.mkdir(parents=True, exist_ok=True)
-    Path(train_mujoco_pred_pt).parent.mkdir(parents=True, exist_ok=True)
-    Path(test_mujoco_pred_pt).parent.mkdir(parents=True, exist_ok=True)
-    Path(train_mujoco_gt_pt).parent.mkdir(parents=True, exist_ok=True)
-    Path(test_mujoco_gt_pt).parent.mkdir(parents=True, exist_ok=True)
-    Path(report_md).parent.mkdir(parents=True, exist_ok=True)
-    Path(report_json).parent.mkdir(parents=True, exist_ok=True)
+    for path in [
+        train_validate_pt,
+        test_validate_pt,
+        train_mujoco_pred_pt,
+        test_mujoco_pred_pt,
+        train_mujoco_gt_pt,
+        test_mujoco_gt_pt,
+        report_md,
+        report_json,
+    ]:
+        Path(path).parent.mkdir(parents=True, exist_ok=True)
 
-    validate_script = ROOT_DIR / "experiment" / "validate_cross_cvae.py"
+    validate_script = ROOT_DIR / "experiment" / "baselines" / "validate_cvae_baseline.py"
     vis_script = ROOT_DIR / "experiment" / "visualize_cross_cvae_results.py"
     mujoco_script = ROOT_DIR / "experiment" / "mujoco_test_cross_cvae.py"
     report_script = ROOT_DIR / "experiment" / "make_cross_cvae_report.py"
@@ -60,11 +83,13 @@ def main(cfg: DictConfig) -> None:
     validate_common = [str(x) for x in cfg.validate.common_overrides]
     validate_train = [str(x) for x in cfg.validate.train_overrides]
     validate_test = [str(x) for x in cfg.validate.test_overrides]
+    validate_baseline = _baseline_validate_overrides(cfg)
 
     _run(
         [
             repr_python,
             str(validate_script),
+            *validate_baseline,
             *validate_common,
             *validate_train,
             f"output.save_path={train_validate_pt}",
@@ -75,6 +100,7 @@ def main(cfg: DictConfig) -> None:
         [
             repr_python,
             str(validate_script),
+            *validate_baseline,
             *validate_common,
             *validate_test,
             f"output.save_path={test_validate_pt}",
@@ -202,6 +228,7 @@ def main(cfg: DictConfig) -> None:
     )
 
     print("\n=== Full Pipeline Done ===")
+    print(f"baseline_type: {cfg.baseline.type}")
     print(f"train_validate_pt: {train_validate_pt}")
     print(f"test_validate_pt: {test_validate_pt}")
     print(f"train_mujoco_pred_pt: {train_mujoco_pred_pt}")
@@ -214,8 +241,8 @@ def main(cfg: DictConfig) -> None:
     print(f"report_json: {report_json}")
     if vis_procs:
         print("Visualization processes:")
-        for p in vis_procs:
-            print(f"  pid={p.pid}")
+        for proc in vis_procs:
+            print(f"  pid={proc.pid}")
 
 
 if __name__ == "__main__":
