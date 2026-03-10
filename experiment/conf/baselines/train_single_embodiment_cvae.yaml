@@ -8,7 +8,7 @@ experiment:
 
 dataset:
   dro_root: ../DRO-Grasp
-  robot_name: allegro
+  robot_name: shadowhand
   num_points: 512
   batch_size: 64
   val_batch_size: 128

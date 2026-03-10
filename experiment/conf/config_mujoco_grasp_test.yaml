@@ -39,7 +39,7 @@ mujoco:
   object_pose6: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
   sim_dt: 0.005
   steps_per_frame: 1
-  gravity_enabled: false
+  gravity_enabled: true
   in_hand_distance_threshold: 0.25
   object_density: 500.0
 
@@ -48,7 +48,7 @@ mujoco:
   hand_max_force: 10.0
 
   squeezing:
-    enabled: true
+    enabled: false
 
   disturbance:
     enabled: true
@@ -64,6 +64,6 @@ output:
 
 hydra:
   run:
-    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}_mujoco_cross_cvae
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}_mujoco_grasp_test
   job:
     chdir: false

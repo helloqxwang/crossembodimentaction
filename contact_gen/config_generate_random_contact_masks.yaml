@@ -45,6 +45,9 @@ patch_normal_jitter_max_deg: 10.0
 patch_points_per_anchor_min: 28
 patch_points_per_anchor_max: 84
 patch_penetration_clearance: 0.00008
+q2_base_translation_min: [-0.10, -0.10, -0.10]
+q2_base_translation_max: [0.10, 0.10, 0.10]
+q2_base_rotation_mode: uniform_so3
 
 output_dir: contact_gen/generated_masks
 

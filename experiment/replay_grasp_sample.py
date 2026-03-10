@@ -12,7 +12,7 @@ import torch
 ROOT_DIR = Path(__file__).resolve().parents[1]
 sys.path.append(str(ROOT_DIR))
 
-from experiment.cross_cvae_utils import get_robot_asset_paths
+from experiment.baselines.io import get_robot_asset_paths
 from experiment.sim.assets import prepare_hand_path_for_mujoco
 from experiment.sim.config_utils import load_mujoco_test_config
 from experiment.sim.grasp_validation import resolve_disturbance_directions, run_static_grasp_validation_cpu

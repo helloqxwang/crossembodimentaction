@@ -9,8 +9,12 @@ def experiment_conf_dir() -> Path:
     return Path(__file__).resolve().parents[1] / "conf"
 
 
+def mujoco_grasp_test_config_path() -> Path:
+    return experiment_conf_dir() / "config_mujoco_grasp_test.yaml"
+
+
 def mujoco_test_config_path() -> Path:
-    return experiment_conf_dir() / "config_mujoco_test_cross_cvae.yaml"
+    return mujoco_grasp_test_config_path()
 
 
 def load_mujoco_test_config(path: str | None = None) -> DictConfig:

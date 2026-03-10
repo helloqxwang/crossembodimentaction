@@ -18,7 +18,7 @@ from omegaconf import DictConfig, OmegaConf
 ROOT_DIR = Path(__file__).resolve().parents[1]
 sys.path.append(str(ROOT_DIR))
 
-from experiment.cross_cvae_utils import ensure_parent_dir, get_robot_asset_paths
+from experiment.baselines.io import ensure_parent_dir, get_robot_asset_paths
 from experiment.sim.assets import prepare_hand_path_for_mujoco
 from experiment.sim.grasp_validation import resolve_disturbance_directions, run_static_grasp_validation_cpu
 from experiment.sim.mjwarp_batch import evaluate_static_grasp_batch_mjwarp
@@ -223,7 +223,7 @@ def _run_cpu_group(
     return records
 
 
-@hydra.main(version_base="1.2", config_path="conf", config_name="config_mujoco_test_cross_cvae")
+@hydra.main(version_base="1.2", config_path="conf", config_name="config_mujoco_grasp_test")
 def main(cfg: DictConfig) -> None:
     print("******************************** [Config] ********************************")
     print(OmegaConf.to_yaml(cfg))

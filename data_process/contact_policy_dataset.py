@@ -196,6 +196,7 @@ class _BaseContactPolicyDataset:
         self,
         *,
         robot_names: List[str],
+        global_robot_names: List[str] | None = None,
         hparams_path: str | Path,
         real_masks_path: str | Path,
         max_contact_points: int = 256,
@@ -218,8 +219,24 @@ class _BaseContactPolicyDataset:
         patch_points_per_anchor_min: int = 28,
         patch_points_per_anchor_max: int = 84,
         patch_penetration_clearance: float = 0.00008,
+        q2_base_translation_min: List[float] | Tuple[float, float, float] = (-0.10, -0.10, -0.10),
+        q2_base_translation_max: List[float] | Tuple[float, float, float] = (0.10, 0.10, 0.10),
+        q2_base_rotation_mode: str = "uniform_so3",
     ) -> None:
         self.robot_names = [str(x) for x in robot_names]
+        if global_robot_names is None:
+            global_robot_names = self.robot_names
+        self.global_robot_names = [str(x) for x in global_robot_names]
+        if len(self.global_robot_names) == 0:
+            raise ValueError("global_robot_names must be non-empty")
+        missing_global = sorted(set(self.robot_names) - set(self.global_robot_names))
+        if missing_global:
+            raise ValueError(
+                f"robot_names must be a subset of global_robot_names, missing={missing_global}"
+            )
+        self.robot_name_to_global_index = {
+            name: idx for idx, name in enumerate(self.global_robot_names)
+        }
         self.hparams_path = Path(hparams_path)
         self.real_masks_path = Path(real_masks_path)
         self.max_contact_points = int(max_contact_points)
@@ -243,6 +260,19 @@ class _BaseContactPolicyDataset:
         self.patch_points_per_anchor_min = int(patch_points_per_anchor_min)
         self.patch_points_per_anchor_max = int(patch_points_per_anchor_max)
         self.patch_penetration_clearance = float(patch_penetration_clearance)
+        q2_base_translation_min_t = torch.as_tensor(q2_base_translation_min, dtype=torch.float32)
+        q2_base_translation_max_t = torch.as_tensor(q2_base_translation_max, dtype=torch.float32)
+        if q2_base_translation_min_t.shape != (3,) or q2_base_translation_max_t.shape != (3,):
+            raise ValueError("q2_base_translation_min/max must be length-3 vectors")
+        if bool((q2_base_translation_max_t < q2_base_translation_min_t).any()):
+            raise ValueError("q2_base_translation_max must be >= q2_base_translation_min elementwise")
+        self.q2_base_translation_min = q2_base_translation_min_t.to(self.device)
+        self.q2_base_translation_max = q2_base_translation_max_t.to(self.device)
+        self.q2_base_rotation_mode = str(q2_base_rotation_mode).strip().lower()
+        if self.q2_base_rotation_mode != "uniform_so3":
+            raise ValueError(
+                f"Unsupported q2_base_rotation_mode={q2_base_rotation_mode}. Expected 'uniform_so3'."
+            )
 
         with open(self.hparams_path, "r", encoding="utf-8") as f:
             hparams = yaml.safe_load(f)
@@ -331,6 +361,7 @@ class _BaseContactPolicyDataset:
                 "robot_model_name": str(rcfg["robot_model_name"]),
                 "model": model,
                 "surface_num_points": surface_num_points_i,
+                "num_links": int(len(model.mesh_link_names)),
                 "real_masks": real_masks,
                 "point_prob": point_prob,
                 "component_range": component_range,
@@ -346,6 +377,7 @@ class _BaseContactPolicyDataset:
 
         self.surface_num_points = int(surface_num_points or 0)
         self.action_dim = int(max_action_dim)
+        self.max_num_links = max((int(spec["num_links"]) for spec in self.robot_specs.values()), default=0)
 
     def _make_generator(self, sample_seed: int) -> torch.Generator:
         generator = torch.Generator(device=self.device.type)
@@ -357,10 +389,44 @@ class _BaseContactPolicyDataset:
         model: Any,
         batch_size: int,
         generator: torch.Generator,
+        *,
+        base_pose_mode: str = "canonical",
     ) -> torch.Tensor:
         q = model.sample_random_q(batch_size=int(batch_size), generator=generator).to(self.device)
         if q.ndim == 1:
             q = q.unsqueeze(0)
+        mode = str(base_pose_mode).strip().lower()
+        if mode == "canonical":
+            return model._zero_base_pose_in_q(q)
+        if mode == "sampled_q2":
+            q = model._zero_base_pose_in_q(q)
+            if len(model.base_translation_indices) > 0:
+                u = torch.rand(
+                    (int(batch_size), len(model.base_translation_indices)),
+                    dtype=torch.float32,
+                    device=self.device,
+                    generator=generator,
+                )
+                base_translation = self.q2_base_translation_min.view(1, -1) + u * (
+                    self.q2_base_translation_max.view(1, -1) - self.q2_base_translation_min.view(1, -1)
+                )
+            else:
+                base_translation = None
+            if len(model.base_rotation_indices) > 0:
+                base_rotation = model.sample_uniform_base_rotation_euler_xyz(
+                    batch_size=int(batch_size),
+                    generator=generator,
+                )
+            else:
+                base_rotation = None
+            return model.set_base_pose_in_q(
+                q,
+                base_translation=base_translation,
+                base_rotation_euler=base_rotation,
+            )
+        if mode == "raw":
+            return q
+        raise ValueError(f"Unsupported base_pose_mode={base_pose_mode}")
         return q
 
     def _resolve_component_distribution_for_spec(
@@ -510,7 +576,7 @@ class _BaseContactPolicyDataset:
         points: torch.Tensor,
         normals: torch.Tensor,
         surface_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if points.ndim != 3 or normals.ndim != 3:
             raise ValueError(
                 f"points and normals must have shape (B, N, 3), got {tuple(points.shape)} and {tuple(normals.shape)}"
@@ -542,10 +608,9 @@ class _BaseContactPolicyDataset:
             dtype=torch.long,
             device=self.device,
         )
-        contact_center = torch.zeros((batch_size, 3), dtype=torch.float32, device=self.device)
         max_len = int(lengths.max().item()) if int(lengths.numel()) > 0 else 0
         if max_len <= 0:
-            return contact_cloud, contact_valid_mask, contact_point_indices, contact_center
+            return contact_cloud, contact_valid_mask, contact_point_indices
 
         order = torch.argsort(surface_mask.long(), dim=1, descending=True)
         packed_idx = order[:, :max_len]
@@ -575,14 +640,8 @@ class _BaseContactPolicyDataset:
             contact_valid_mask[:, :max_len] = packed_valid
             contact_point_indices[:, :max_len] = packed_idx.masked_fill(~packed_valid, -1)
 
-        xyz = contact_cloud[:, :, :3]
-        valid_float = contact_valid_mask.unsqueeze(-1).float()
-        denom = valid_float.sum(dim=1).clamp_min(1.0)
-        contact_center = (xyz * valid_float).sum(dim=1) / denom
-        centered_xyz = (xyz - contact_center.unsqueeze(1)).masked_fill(~contact_valid_mask.unsqueeze(-1), 0.0)
-        contact_cloud = torch.cat([centered_xyz, contact_cloud[:, :, 3:]], dim=-1)
         contact_cloud = contact_cloud.masked_fill(~contact_valid_mask.unsqueeze(-1), 0.0)
-        return contact_cloud, contact_valid_mask, contact_point_indices, contact_center
+        return contact_cloud, contact_valid_mask, contact_point_indices
 
     def _pad_action_batch(self, q: torch.Tensor) -> torch.Tensor:
         if q.ndim == 1:
@@ -590,6 +649,25 @@ class _BaseContactPolicyDataset:
         out = torch.zeros((int(q.shape[0]), self.action_dim), dtype=torch.float32, device=self.device)
         out[:, : int(q.shape[-1])] = q
         return out
+
+    def _build_inactive_link_mask_batch(
+        self,
+        model: Any,
+        surface_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        if surface_mask.ndim != 2:
+            raise ValueError(f"surface_mask must have shape (B, N), got {tuple(surface_mask.shape)}")
+        inactive_link_mask = torch.zeros(
+            (int(surface_mask.shape[0]), self.max_num_links),
+            dtype=torch.bool,
+            device=self.device,
+        )
+        inactive_local = model.get_inactive_link_mask_by_contact_mask(
+            surface_mask.to(device=self.device).bool(),
+            ignore_base_pose=True,
+        )
+        inactive_link_mask[:, : int(inactive_local.shape[1])] = inactive_local
+        return inactive_link_mask
 
     def _build_sample_batch(
         self,
@@ -600,6 +678,7 @@ class _BaseContactPolicyDataset:
         q2: torch.Tensor,
         surface_mask: torch.Tensor,
         include_metadata: bool,
+        include_full_metadata: bool = False,
         q1_points: torch.Tensor | None = None,
         q1_normals: torch.Tensor | None = None,
         q2_points: torch.Tensor | None = None,
@@ -619,17 +698,13 @@ class _BaseContactPolicyDataset:
             q2_points, q2_normals = model.get_surface_points_normals_batch(q=q2)
 
         p_hat = torch.cat([q1_points, q1_normals], dim=-1)
-        contact_cloud, contact_valid_mask, contact_point_indices, contact_center = self._prepare_contact_cloud_batch(
+        contact_cloud, contact_valid_mask, contact_point_indices = self._prepare_contact_cloud_batch(
             points=q2_points,
             normals=q2_normals,
             surface_mask=surface_mask,
         )
 
         mixed_q = model.mix_q_by_contact_mask(q1, q2, surface_mask).clone()
-        has_contact = contact_valid_mask.any(dim=1)
-        if bool(has_contact.any()) and len(model.base_translation_indices) > 0:
-            for axis, joint_idx in enumerate(model.base_translation_indices[:3]):
-                mixed_q[has_contact, joint_idx] = mixed_q[has_contact, joint_idx] - contact_center[has_contact, axis]
 
         out: Dict[str, torch.Tensor] = {
             "p_hat": p_hat,
@@ -638,18 +713,13 @@ class _BaseContactPolicyDataset:
             "action": self._pad_action_batch(mixed_q),
         }
         if include_metadata:
-            action_valid_mask = torch.zeros(
-                (int(q1.shape[0]), self.action_dim),
-                dtype=torch.bool,
-                device=self.device,
-            )
-            action_valid_mask[:, : int(spec["local_dof"])] = True
+            inactive_link_mask = self._build_inactive_link_mask_batch(model, surface_mask.bool())
             out.update(
                 {
-                    "action_valid_mask": action_valid_mask,
-                    "contact_mask_surface": surface_mask.bool(),
+                    "q1_padded": self._pad_action_batch(q1),
+                    "q2_padded": self._pad_action_batch(q2),
                     "contact_point_indices": contact_point_indices,
-                    "contact_center": contact_center,
+                    "inactive_link_mask": inactive_link_mask,
                     "local_dof": torch.full(
                         (int(q1.shape[0]),),
                         int(spec["local_dof"]),
@@ -662,6 +732,19 @@ class _BaseContactPolicyDataset:
                         dtype=torch.long,
                         device=self.device,
                     ),
+                }
+            )
+        if include_full_metadata:
+            action_valid_mask = torch.zeros(
+                (int(q1.shape[0]), self.action_dim),
+                dtype=torch.bool,
+                device=self.device,
+            )
+            action_valid_mask[:, : int(spec["local_dof"])] = True
+            out.update(
+                {
+                    "action_valid_mask": action_valid_mask,
+                    "contact_mask_surface": surface_mask.bool(),
                 }
             )
         return out
@@ -682,11 +765,11 @@ class _BaseContactPolicyDataset:
             q2=q2,
             surface_mask=surface_mask,
             include_metadata=True,
+            include_full_metadata=True,
         )
         sample: Dict[str, torch.Tensor | str] = {
             key: value[0].detach().cpu()
             for key, value in batch.items()
-            if key != "robot_index"
         }
         sample["robot_name"] = str(spec["robot_name"])
         return sample
@@ -700,12 +783,23 @@ class _BaseContactPolicyDataset:
         generator: torch.Generator,
         robot_index: int,
         include_metadata: bool = False,
+        include_full_metadata: bool = False,
     ) -> tuple[Dict[str, torch.Tensor], Dict[str, int]]:
         batch_size = int(max(1, batch_size))
         model = spec["model"]
 
-        q1_batch = self._sample_random_q_batch(model=model, batch_size=batch_size, generator=generator)
-        q2_batch = self._sample_random_q_batch(model=model, batch_size=batch_size, generator=generator)
+        q1_batch = self._sample_random_q_batch(
+            model=model,
+            batch_size=batch_size,
+            generator=generator,
+            base_pose_mode="canonical",
+        )
+        q2_batch = self._sample_random_q_batch(
+            model=model,
+            batch_size=batch_size,
+            generator=generator,
+            base_pose_mode="sampled_q2",
+        )
         q1_points_batch, q1_normals_batch = model.get_surface_points_normals_batch(q=q1_batch)
         q2_points_batch, q2_normals_batch = model.get_surface_points_normals_batch(q=q2_batch)
 
@@ -752,6 +846,7 @@ class _BaseContactPolicyDataset:
                 q2=q2_batch,
                 surface_mask=surface_mask_batch,
                 include_metadata=include_metadata,
+                include_full_metadata=include_full_metadata,
                 q1_points=q1_points_batch,
                 q1_normals=q1_normals_batch,
                 q2_points=q2_points_batch,
@@ -769,6 +864,7 @@ class SyntheticContactPolicyDataset(Dataset, _BaseContactPolicyDataset):
         buffer_refresh_fraction: float = 0.2,
         buffer_build_batch_size_per_robot: int = 32,
         buffer_refresh_batch_size_per_robot: int | None = None,
+        store_aux_metadata: bool = False,
         store_full_metadata: bool = False,
         progress_label: str = "synthetic_buffer",
         **kwargs: Any,
@@ -794,7 +890,9 @@ class SyntheticContactPolicyDataset(Dataset, _BaseContactPolicyDataset):
         if buffer_refresh_batch_size_per_robot is None:
             buffer_refresh_batch_size_per_robot = self.buffer_build_batch_size_per_robot
         self.buffer_refresh_batch_size_per_robot = int(max(1, buffer_refresh_batch_size_per_robot))
+        self.store_aux_metadata = bool(store_aux_metadata)
         self.store_full_metadata = bool(store_full_metadata)
+        self._store_loss_metadata = self.store_aux_metadata or self.store_full_metadata
         self.progress_label = str(progress_label)
 
         self.robot_slot_ranges: Dict[str, tuple[int, int]] = {}
@@ -821,31 +919,33 @@ class SyntheticContactPolicyDataset(Dataset, _BaseContactPolicyDataset):
             dtype=torch.float32,
             device="cpu",
         )
-        self.buffer_action_valid_mask: torch.Tensor | None = None
-        self.buffer_contact_mask_surface: torch.Tensor | None = None
+        self.buffer_q1_padded: torch.Tensor | None = None
+        self.buffer_q2_padded: torch.Tensor | None = None
         self.buffer_contact_point_indices: torch.Tensor | None = None
-        self.buffer_contact_center: torch.Tensor | None = None
+        self.buffer_inactive_link_mask: torch.Tensor | None = None
         self.buffer_local_dof: torch.Tensor | None = None
         self.buffer_robot_index: torch.Tensor | None = None
-        if self.store_full_metadata:
-            self.buffer_action_valid_mask = torch.empty(
+        self.buffer_action_valid_mask: torch.Tensor | None = None
+        self.buffer_contact_mask_surface: torch.Tensor | None = None
+        if self._store_loss_metadata:
+            self.buffer_q1_padded = torch.empty(
                 (self.samples_per_epoch, self.action_dim),
-                dtype=torch.bool,
+                dtype=torch.float32,
                 device="cpu",
             )
-            self.buffer_contact_mask_surface = torch.empty(
-                (self.samples_per_epoch, self.surface_num_points),
-                dtype=torch.bool,
+            self.buffer_q2_padded = torch.empty(
+                (self.samples_per_epoch, self.action_dim),
+                dtype=torch.float32,
                 device="cpu",
             )
             self.buffer_contact_point_indices = torch.empty(
                 (self.samples_per_epoch, self.max_contact_points),
-                dtype=torch.long,
+                dtype=torch.int16,
                 device="cpu",
             )
-            self.buffer_contact_center = torch.empty(
-                (self.samples_per_epoch, 3),
-                dtype=torch.float32,
+            self.buffer_inactive_link_mask = torch.empty(
+                (self.samples_per_epoch, self.max_num_links),
+                dtype=torch.bool,
                 device="cpu",
             )
             self.buffer_local_dof = torch.empty(
@@ -856,6 +956,17 @@ class SyntheticContactPolicyDataset(Dataset, _BaseContactPolicyDataset):
             self.buffer_robot_index = torch.empty(
                 (self.samples_per_epoch,),
                 dtype=torch.long,
+                device="cpu",
+            )
+        if self.store_full_metadata:
+            self.buffer_action_valid_mask = torch.empty(
+                (self.samples_per_epoch, self.action_dim),
+                dtype=torch.bool,
+                device="cpu",
+            )
+            self.buffer_contact_mask_surface = torch.empty(
+                (self.samples_per_epoch, self.surface_num_points),
+                dtype=torch.bool,
                 device="cpu",
             )
 
@@ -874,25 +985,38 @@ class SyntheticContactPolicyDataset(Dataset, _BaseContactPolicyDataset):
             "contact_valid_mask": self.buffer_contact_valid_mask[idx],
             "action": self.buffer_action[idx],
         }
+        if self._store_loss_metadata:
+            if (
+                self.buffer_q1_padded is None
+                or self.buffer_q2_padded is None
+                or self.buffer_contact_point_indices is None
+                or self.buffer_inactive_link_mask is None
+                or self.buffer_local_dof is None
+                or self.buffer_robot_index is None
+            ):
+                raise RuntimeError("Auxiliary metadata buffer storage is not initialized")
+            robot_index = int(self.buffer_robot_index[idx].item())
+            sample.update(
+                {
+                    "q1_padded": self.buffer_q1_padded[idx],
+                    "q2_padded": self.buffer_q2_padded[idx],
+                    "contact_point_indices": self.buffer_contact_point_indices[idx].to(dtype=torch.long),
+                    "inactive_link_mask": self.buffer_inactive_link_mask[idx],
+                    "local_dof": self.buffer_local_dof[idx],
+                    "robot_index": self.buffer_robot_index[idx],
+                }
+            )
         if self.store_full_metadata:
             if (
                 self.buffer_action_valid_mask is None
                 or self.buffer_contact_mask_surface is None
-                or self.buffer_contact_point_indices is None
-                or self.buffer_contact_center is None
-                or self.buffer_local_dof is None
-                or self.buffer_robot_index is None
             ):
                 raise RuntimeError("Full-metadata buffer storage is not initialized")
-            robot_index = int(self.buffer_robot_index[idx].item())
             sample.update(
                 {
                     "action_valid_mask": self.buffer_action_valid_mask[idx],
                     "contact_mask_surface": self.buffer_contact_mask_surface[idx],
-                    "contact_point_indices": self.buffer_contact_point_indices[idx],
-                    "contact_center": self.buffer_contact_center[idx],
-                    "local_dof": self.buffer_local_dof[idx],
-                    "robot_name": self.robot_names[robot_index],
+                    "robot_name": self.global_robot_names[robot_index],
                 }
             )
         return sample
@@ -938,22 +1062,30 @@ class SyntheticContactPolicyDataset(Dataset, _BaseContactPolicyDataset):
         self.buffer_contact_cloud[idx] = batch["contact_cloud"].detach().to(device="cpu", dtype=torch.float32)
         self.buffer_contact_valid_mask[idx] = batch["contact_valid_mask"].detach().to(device="cpu", dtype=torch.bool)
         self.buffer_action[idx] = batch["action"].detach().to(device="cpu", dtype=torch.float32)
+        if self._store_loss_metadata:
+            if (
+                self.buffer_q1_padded is None
+                or self.buffer_q2_padded is None
+                or self.buffer_contact_point_indices is None
+                or self.buffer_inactive_link_mask is None
+                or self.buffer_local_dof is None
+                or self.buffer_robot_index is None
+            ):
+                raise RuntimeError("Auxiliary metadata buffer storage is not initialized")
+            self.buffer_q1_padded[idx] = batch["q1_padded"].detach().to(device="cpu", dtype=torch.float32)
+            self.buffer_q2_padded[idx] = batch["q2_padded"].detach().to(device="cpu", dtype=torch.float32)
+            self.buffer_contact_point_indices[idx] = batch["contact_point_indices"].detach().to(device="cpu", dtype=torch.int16)
+            self.buffer_inactive_link_mask[idx] = batch["inactive_link_mask"].detach().to(device="cpu", dtype=torch.bool)
+            self.buffer_local_dof[idx] = batch["local_dof"].detach().to(device="cpu", dtype=torch.long)
+            self.buffer_robot_index[idx] = batch["robot_index"].detach().to(device="cpu", dtype=torch.long)
         if self.store_full_metadata:
             if (
                 self.buffer_action_valid_mask is None
                 or self.buffer_contact_mask_surface is None
-                or self.buffer_contact_point_indices is None
-                or self.buffer_contact_center is None
-                or self.buffer_local_dof is None
-                or self.buffer_robot_index is None
             ):
                 raise RuntimeError("Full-metadata buffer storage is not initialized")
             self.buffer_action_valid_mask[idx] = batch["action_valid_mask"].detach().to(device="cpu", dtype=torch.bool)
             self.buffer_contact_mask_surface[idx] = batch["contact_mask_surface"].detach().to(device="cpu", dtype=torch.bool)
-            self.buffer_contact_point_indices[idx] = batch["contact_point_indices"].detach().to(device="cpu", dtype=torch.long)
-            self.buffer_contact_center[idx] = batch["contact_center"].detach().to(device="cpu", dtype=torch.float32)
-            self.buffer_local_dof[idx] = batch["local_dof"].detach().to(device="cpu", dtype=torch.long)
-            self.buffer_robot_index[idx] = batch["robot_index"].detach().to(device="cpu", dtype=torch.long)
 
     def _fill_slots_for_robot(
         self,
@@ -979,7 +1111,8 @@ class SyntheticContactPolicyDataset(Dataset, _BaseContactPolicyDataset):
                 batch_size=cur,
                 generator=generator,
                 robot_index=robot_index,
-                include_metadata=self.store_full_metadata,
+                include_metadata=self._store_loss_metadata,
+                include_full_metadata=self.store_full_metadata,
             )
             _merge_contact_count_interval_stats(count_interval_stats, batch_stats)
             self._write_train_batch_to_buffer(
@@ -997,7 +1130,8 @@ class SyntheticContactPolicyDataset(Dataset, _BaseContactPolicyDataset):
     def _populate_initial_buffer(self) -> None:
         with torch.no_grad():
             progress = tqdm(total=self.samples_per_epoch, desc=f"{self.progress_label}:build", leave=False)
-            for robot_index, robot_name in enumerate(self.robot_names):
+            for robot_name in self.robot_names:
+                robot_index = self.robot_name_to_global_index[robot_name]
                 start, end = self.robot_slot_ranges[robot_name]
                 slot_indices = torch.arange(start, end, dtype=torch.long)
                 generator = self._make_generator(
@@ -1032,7 +1166,8 @@ class SyntheticContactPolicyDataset(Dataset, _BaseContactPolicyDataset):
                 desc=f"{self.progress_label}:refresh:{int(epoch)}",
                 leave=False,
             )
-            for robot_index, robot_name in enumerate(self.robot_names):
+            for robot_name in self.robot_names:
+                robot_index = self.robot_name_to_global_index[robot_name]
                 slot_indices = self.robot_refresh_blocks[robot_name][refresh_block_idx]
                 if int(slot_indices.numel()) == 0:
                     continue
@@ -1138,11 +1273,16 @@ class RealContactPolicyValDataset(Dataset, _BaseContactPolicyDataset):
     def _materialize_sample(self, sample: Dict[str, Any]) -> Dict[str, torch.Tensor | str]:
         robot_name = str(sample["robot_name"])
         spec = self.robot_specs[robot_name]
-        robot_index = self.robot_names.index(robot_name)
+        robot_index = self.robot_name_to_global_index[robot_name]
         sample_seed = self.seed + _stable_int_seed(f"{robot_name}|{int(sample['sample_id'])}|q1")
         generator = self._make_generator(sample_seed)
         model = spec["model"]
-        q1 = model.sample_random_q(generator=generator).to(self.device)
+        q1 = self._sample_random_q_batch(
+            model=model,
+            batch_size=1,
+            generator=generator,
+            base_pose_mode="canonical",
+        )[0]
         q2 = torch.as_tensor(sample["q2"], dtype=torch.float32, device=self.device)
         surface_mask = torch.as_tensor(sample["mask"], dtype=torch.bool, device=self.device)
         return self._build_single_sample(
@@ -1166,10 +1306,11 @@ class RealContactPolicyValDataset(Dataset, _BaseContactPolicyDataset):
             dynamic_ncols=True,
         )
         try:
-            for robot_index, robot_name in enumerate(self.robot_names):
+            for robot_name in self.robot_names:
                 sample_indices = sample_indices_by_robot.get(robot_name, [])
                 if len(sample_indices) == 0:
                     continue
+                robot_index = self.robot_name_to_global_index[robot_name]
                 spec = self.robot_specs[robot_name]
                 model = spec["model"]
                 start = 0
@@ -1184,7 +1325,14 @@ class RealContactPolicyValDataset(Dataset, _BaseContactPolicyDataset):
                             f"{robot_name}|{int(sample['sample_id'])}|q1"
                         )
                         generator = self._make_generator(sample_seed)
-                        q1_batch_list.append(model.sample_random_q(generator=generator).to(self.device))
+                        q1_batch_list.append(
+                            self._sample_random_q_batch(
+                                model=model,
+                                batch_size=1,
+                                generator=generator,
+                                base_pose_mode="canonical",
+                            )[0]
+                        )
                         q2_batch_list.append(
                             torch.as_tensor(sample["q2"], dtype=torch.float32, device=self.device)
                         )
@@ -1199,12 +1347,12 @@ class RealContactPolicyValDataset(Dataset, _BaseContactPolicyDataset):
                         q2=torch.stack(q2_batch_list, dim=0),
                         surface_mask=torch.stack(mask_batch_list, dim=0),
                         include_metadata=True,
+                        include_full_metadata=True,
                     )
                     for row_idx, sample_idx in enumerate(chunk_indices):
                         sample_out: Dict[str, torch.Tensor | str] = {
                             key: value[row_idx].detach().cpu()
                             for key, value in batch.items()
-                            if key != "robot_index"
                         }
                         sample_out["robot_name"] = robot_name
                         cached[sample_idx] = sample_out

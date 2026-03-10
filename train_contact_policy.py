@@ -25,6 +25,7 @@ from data_process.contact_policy_dataset import (  # noqa: E402
 )
 from networks.contact_diffusion_policy import ContactDiffusionPolicy  # noqa: E402
 from networks.simple_diffusion import SimpleDDIMScheduler  # noqa: E402
+from robot_model.robot_model import create_robot_model  # noqa: E402
 
 
 class EMAModel:
@@ -159,9 +160,70 @@ def _build_lr_scheduler(
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
-def _build_policy(cfg: DictConfig, action_dim: int) -> ContactDiffusionPolicy:
+def _build_action_normalizer_meta(
+    cfg: DictConfig,
+    *,
+    robot_specs: Dict[str, Dict[str, Any]],
+    global_robot_names: list[str],
+    action_dim: int,
+) -> Dict[str, Any]:
+    num_robots = len(global_robot_names)
+    scale = torch.ones((num_robots, int(action_dim)), dtype=torch.float32)
+    offset = torch.zeros((num_robots, int(action_dim)), dtype=torch.float32)
+    translation_min = torch.as_tensor(cfg.dataset.q2_base_translation_min, dtype=torch.float32).view(3)
+    translation_max = torch.as_tensor(cfg.dataset.q2_base_translation_max, dtype=torch.float32).view(3)
+    for robot_idx, robot_name in enumerate(global_robot_names):
+        spec = robot_specs[robot_name]
+        model = spec["model"]
+        lower, upper = model.pk_chain.get_joint_limits()
+        lower_t = torch.as_tensor(lower, dtype=torch.float32)
+        upper_t = torch.as_tensor(upper, dtype=torch.float32)
+        finite = torch.isfinite(lower_t) & torch.isfinite(upper_t)
+        lower_t = torch.where(finite, lower_t, torch.full_like(lower_t, -float(np.pi)))
+        upper_t = torch.where(finite, upper_t, torch.full_like(upper_t, float(np.pi)))
+        if len(model.base_translation_indices) > 0:
+            lower_t[model.base_translation_indices] = translation_min[: len(model.base_translation_indices)]
+            upper_t[model.base_translation_indices] = translation_max[: len(model.base_translation_indices)]
+        if len(model.base_rotation_indices) > 0:
+            lower_t[model.base_rotation_indices] = -float(np.pi)
+            upper_t[model.base_rotation_indices] = float(np.pi)
+        input_range = upper_t - lower_t
+        ignore_dim = input_range.abs() < 1e-6
+        input_range = input_range.clone()
+        input_range[ignore_dim] = 2.0
+        robot_scale = 2.0 / input_range
+        robot_offset = -1.0 - robot_scale * lower_t
+        robot_scale[ignore_dim] = 1.0
+        robot_offset[ignore_dim] = -lower_t[ignore_dim]
+        scale[robot_idx, : int(model.dof)] = robot_scale
+        offset[robot_idx, : int(model.dof)] = robot_offset
+    return {
+        "robot_names": list(global_robot_names),
+        "scale": scale,
+        "offset": offset,
+        "q2_base_translation_min": translation_min,
+        "q2_base_translation_max": translation_max,
+    }
+
+
+def _build_policy(
+    cfg: DictConfig,
+    action_dim: int,
+    *,
+    action_normalizer_meta: Dict[str, Any] | None = None,
+) -> ContactDiffusionPolicy:
+    robot_names: list[str] = []
+    action_scale = None
+    action_offset = None
+    if action_normalizer_meta is not None:
+        robot_names = [str(x) for x in action_normalizer_meta.get("robot_names", [])]
+        action_scale = action_normalizer_meta.get("scale")
+        action_offset = action_normalizer_meta.get("offset")
     return ContactDiffusionPolicy(
         action_dim=action_dim,
+        robot_names=robot_names,
+        action_normalizer_scale=action_scale,
+        action_normalizer_offset=action_offset,
         p_hat_encoder_cfg={
             "in_channels": int(cfg.model.p_hat_encoder.in_channels),
             "hidden_dim": int(cfg.model.p_hat_encoder.hidden_dim),
@@ -186,6 +248,108 @@ def _build_policy(cfg: DictConfig, action_dim: int) -> ContactDiffusionPolicy:
     )
 
 
+def build_contact_policy_common_dataset_kwargs(
+    cfg: DictConfig,
+    *,
+    robot_names: list[str] | None = None,
+    global_robot_names: list[str] | None = None,
+) -> Dict[str, Any]:
+    resolved_global_robot_names = (
+        list(cfg.dataset.robot_names)
+        if global_robot_names is None
+        else [str(x) for x in global_robot_names]
+    )
+    return {
+        "robot_names": list(cfg.dataset.robot_names) if robot_names is None else [str(x) for x in robot_names],
+        "global_robot_names": resolved_global_robot_names,
+        "hparams_path": _resolve_project_path(str(cfg.dataset.hparams_path)),
+        "real_masks_path": _resolve_project_path(str(cfg.dataset.real_masks_path)),
+        "max_contact_points": int(cfg.dataset.max_contact_points),
+        "seed": int(cfg.seed),
+        "check_template_hash": bool(cfg.dataset.check_template_hash),
+        "threshold": float(cfg.dataset.threshold),
+        "align_exp_scale": float(cfg.dataset.align_exp_scale),
+        "sigmoid_scale": float(cfg.dataset.sigmoid_scale),
+        "component_sampling_mode": str(cfg.dataset.component_sampling_mode),
+        "anchor_sampling_mode": str(cfg.dataset.anchor_sampling_mode),
+        "anchor_temperature": float(cfg.dataset.anchor_temperature),
+        "patch_anchor_shift_min": float(cfg.dataset.patch_anchor_shift_min),
+        "patch_anchor_shift_max": float(cfg.dataset.patch_anchor_shift_max),
+        "patch_extent_min": float(cfg.dataset.patch_extent_min),
+        "patch_extent_max": float(cfg.dataset.patch_extent_max),
+        "patch_extent_power": float(cfg.dataset.patch_extent_power),
+        "patch_shift_power": float(cfg.dataset.patch_shift_power),
+        "patch_normal_jitter_max_deg": float(cfg.dataset.patch_normal_jitter_max_deg),
+        "patch_points_per_anchor_min": int(cfg.dataset.patch_points_per_anchor_min),
+        "patch_points_per_anchor_max": int(cfg.dataset.patch_points_per_anchor_max),
+        "patch_penetration_clearance": float(cfg.dataset.patch_penetration_clearance),
+        "q2_base_translation_min": [float(x) for x in cfg.dataset.q2_base_translation_min],
+        "q2_base_translation_max": [float(x) for x in cfg.dataset.q2_base_translation_max],
+        "q2_base_rotation_mode": str(cfg.dataset.q2_base_rotation_mode),
+    }
+
+
+def load_contact_policy_checkpoint(
+    cfg: DictConfig,
+    *,
+    action_dim: int | None,
+    device: torch.device,
+    ckpt_path: str | None = None,
+    prefer_ema: bool = True,
+) -> tuple[ContactDiffusionPolicy, str, Dict[str, Any]]:
+    resolved_ckpt_path = (
+        _resolve_project_path(os.path.join(str(cfg.training.save_dir), "best.pt"))
+        if ckpt_path is None
+        else _resolve_project_path(str(ckpt_path))
+    )
+    ckpt = torch.load(resolved_ckpt_path, map_location=device, weights_only=False)
+    build_cfg = cfg
+    ckpt_cfg = ckpt.get("config")
+    if isinstance(ckpt_cfg, dict):
+        try:
+            build_cfg = OmegaConf.create(ckpt_cfg)
+        except Exception:
+            build_cfg = cfg
+
+    resolved_action_dim = action_dim
+    meta: Dict[str, Any] = {}
+    action_normalizer_meta: Dict[str, Any] | None = None
+    meta_path = os.path.join(os.path.dirname(resolved_ckpt_path), "dataset_meta.pt")
+    if os.path.isfile(meta_path):
+        meta = torch.load(meta_path, map_location="cpu")
+        if isinstance(meta, dict) and "action_dim" in meta:
+            resolved_action_dim = int(meta["action_dim"])
+        if (
+            isinstance(meta, dict)
+            and "action_normalizer_scale" in meta
+            and "action_normalizer_offset" in meta
+            and "robot_names" in meta
+        ):
+            action_normalizer_meta = {
+                "robot_names": [str(x) for x in meta["robot_names"]],
+                "scale": torch.as_tensor(meta["action_normalizer_scale"], dtype=torch.float32),
+                "offset": torch.as_tensor(meta["action_normalizer_offset"], dtype=torch.float32),
+            }
+    if resolved_action_dim is None:
+        raise ValueError("action_dim must be provided when dataset_meta.pt is unavailable")
+    if action_normalizer_meta is None:
+        raise ValueError(
+            f"Checkpoint metadata at {meta_path} is missing action normalizer tensors required by the current policy"
+        )
+
+    model = _build_policy(
+        build_cfg,
+        action_dim=int(resolved_action_dim),
+        action_normalizer_meta=action_normalizer_meta,
+    ).to(device)
+    state_dict = ckpt["model"]
+    if prefer_ema and "ema_model" in ckpt:
+        state_dict = ckpt["ema_model"]
+    model.load_state_dict(state_dict, strict=True)
+    model.eval()
+    return model, resolved_ckpt_path, meta
+
+
 def _build_loader_kwargs(cfg: DictConfig, *, persistent_workers: bool) -> Dict[str, Any]:
     num_workers = int(cfg.dataset.num_workers)
     kwargs: Dict[str, Any] = {
@@ -204,6 +368,115 @@ def _build_val_subset_indices(dataset_len: int, subset_size: int, seed: int) -> 
         return list(range(dataset_len))
     rng = np.random.default_rng(int(seed))
     return sorted(int(x) for x in rng.choice(dataset_len, size=n, replace=False).tolist())
+
+
+def _build_training_geometry_models(
+    train_dataset: OnTheFlySyntheticContactPolicyDataset,
+    device: torch.device,
+) -> Dict[str, Any]:
+    models: Dict[str, Any] = {}
+    for robot_name, spec in train_dataset.robot_specs.items():
+        model = spec["model"]
+        if str(getattr(model, "device", "")) == str(device):
+            models[robot_name] = model
+            continue
+        models[robot_name] = create_robot_model(
+            robot_name=str(spec["robot_model_name"]),
+            device=device,
+            num_points=int(spec["surface_num_points"]),
+        )
+    return models
+
+
+def _copy_base_pose_from_q(
+    model: Any,
+    q_target: torch.Tensor,
+    q_source: torch.Tensor,
+) -> torch.Tensor:
+    if q_target.ndim == 1:
+        q_target = q_target.unsqueeze(0)
+    if q_source.ndim == 1:
+        q_source = q_source.unsqueeze(0)
+    if q_target.shape != q_source.shape:
+        raise ValueError(f"q_target and q_source must have the same shape, got {tuple(q_target.shape)} vs {tuple(q_source.shape)}")
+    base_translation = None
+    base_rotation_euler = None
+    if len(model.base_translation_indices) > 0:
+        base_translation = q_source[:, model.base_translation_indices]
+    if len(model.base_rotation_indices) > 0:
+        base_rotation_euler = q_source[:, model.base_rotation_indices]
+    return model.set_base_pose_in_q(
+        q_target,
+        base_translation=base_translation,
+        base_rotation_euler=base_rotation_euler,
+    )
+
+
+def _compute_training_geometry_losses(
+    pred_action: torch.Tensor,
+    batch: Dict[str, Any],
+    *,
+    geometry_models: Dict[str, Any],
+    robot_names: list[str],
+) -> Dict[str, torch.Tensor]:
+    device = pred_action.device
+    contact_sse = torch.zeros((), dtype=torch.float32, device=device)
+    contact_count = torch.zeros((), dtype=torch.float32, device=device)
+    inactive_sse = torch.zeros((), dtype=torch.float32, device=device)
+    inactive_count = torch.zeros((), dtype=torch.float32, device=device)
+
+    robot_index = batch["robot_index"].to(device=device, dtype=torch.long).view(-1)
+    q1_padded = batch["q1_padded"].to(device=device, dtype=torch.float32)
+    q2_padded = batch["q2_padded"].to(device=device, dtype=torch.float32)
+
+    for ridx in torch.unique(robot_index):
+        robot_idx = int(ridx.item())
+        sample_mask = robot_index == ridx
+        sample_ids = torch.nonzero(sample_mask, as_tuple=False).view(-1)
+        if int(sample_ids.numel()) == 0:
+            continue
+
+        robot_name = robot_names[robot_idx]
+        model = geometry_models[robot_name]
+        pred_local = pred_action[sample_ids, : int(model.dof)].to(model.device, dtype=torch.float32)
+        q1_local = q1_padded[sample_ids, : int(model.dof)].to(model.device, dtype=torch.float32)
+        q2_local = q2_padded[sample_ids, : int(model.dof)].to(model.device, dtype=torch.float32)
+        pred_points, _ = model.get_surface_points_normals_batch(q=pred_local)
+        pred_points = pred_points[:, :, :3]
+
+        contact_valid = batch["contact_valid_mask"][sample_ids].to(model.device).bool()
+        contact_indices = batch["contact_point_indices"][sample_ids].to(model.device, dtype=torch.long)
+        safe_contact_indices = contact_indices.clamp(0, int(pred_points.shape[1]) - 1)
+        pred_contact = torch.gather(
+            pred_points,
+            1,
+            safe_contact_indices.unsqueeze(-1).expand(-1, -1, 3),
+        )
+        target_contact = batch["contact_cloud"][sample_ids, :, :3].to(model.device, dtype=torch.float32)
+        contact_mask = contact_valid.unsqueeze(-1).expand_as(target_contact)
+        contact_sse = contact_sse + ((pred_contact - target_contact).pow(2) * contact_mask.float()).sum()
+        contact_count = contact_count + contact_mask.float().sum()
+
+        q1_with_q2_base = _copy_base_pose_from_q(model, q1_local, q2_local)
+        q1_with_q2_base_points, _ = model.get_surface_points_normals_batch(q=q1_with_q2_base)
+        q1_with_q2_base_points = q1_with_q2_base_points[:, :, :3]
+
+        inactive_link_mask = batch["inactive_link_mask"][sample_ids].to(model.device).bool()
+        inactive_link_mask = inactive_link_mask[:, : len(model.mesh_link_names)]
+        link_indices = model.surface_template_link_indices.to(model.device, dtype=torch.long)
+        point_inactive = torch.gather(
+            inactive_link_mask,
+            1,
+            link_indices.view(1, -1).expand(int(sample_ids.numel()), -1),
+        )
+        inactive_mask_3 = point_inactive.unsqueeze(-1).expand_as(q1_with_q2_base_points)
+        inactive_sse = inactive_sse + ((pred_points - q1_with_q2_base_points).pow(2) * inactive_mask_3.float()).sum()
+        inactive_count = inactive_count + inactive_mask_3.float().sum()
+
+    return {
+        "contact_geometry_loss": contact_sse / contact_count.clamp_min(1.0),
+        "inactive_geometry_loss": inactive_sse / inactive_count.clamp_min(1.0),
+    }
 
 
 def _compute_validation_metrics(
@@ -255,14 +528,14 @@ def _compute_validation_metrics(
             )
             n_action += int(gt_action.shape[0])
 
-            q1_points_centered = batch["p_hat"][:, :, :3].float() - batch["contact_center"].float().unsqueeze(1)
             for i in range(int(gt_action.shape[0])):
                 robot_name = str(batch["robot_name"][i])
                 model = metric_models[robot_name]
                 local_dof = int(batch["local_dof"][i].item())
                 pred_local = pred_action[i, :local_dof].to(model.device)
+                q1_local = batch["q1_padded"][i, :local_dof].to(model.device, dtype=torch.float32)
+                q2_local = batch["q2_padded"][i, :local_dof].to(model.device, dtype=torch.float32)
                 contact_valid = batch["contact_valid_mask"][i].bool()
-                surface_mask = batch["contact_mask_surface"][i].bool()
                 contact_indices = batch["contact_point_indices"][i][contact_valid].long()
 
                 pred_points, _ = model.get_surface_points_normals(q=pred_local)
@@ -275,10 +548,17 @@ def _compute_validation_metrics(
                     )
                     n_contact += 1
 
-                inactive_idx = torch.nonzero(~surface_mask, as_tuple=False).view(-1)
+                q1_with_q2_base = _copy_base_pose_from_q(model, q1_local, q2_local)
+                q1_with_q2_base_points, _ = model.get_surface_points_normals(q=q1_with_q2_base)
+                q1_with_q2_base_points = q1_with_q2_base_points.detach().cpu()
+
+                inactive_link_mask = batch["inactive_link_mask"][i, : len(model.mesh_link_names)].bool()
+                link_indices = model.surface_template_link_indices.detach().cpu()
+                inactive_point_mask = inactive_link_mask[link_indices]
+                inactive_idx = torch.nonzero(inactive_point_mask, as_tuple=False).view(-1)
                 if int(inactive_idx.numel()) > 0:
                     inactive_surface_mse += float(
-                        torch.mean((pred_points[inactive_idx, :3] - q1_points_centered[i, inactive_idx, :3]) ** 2).item()
+                        torch.mean((pred_points[inactive_idx, :3] - q1_with_q2_base_points[inactive_idx, :3]) ** 2).item()
                     )
                     n_inactive += 1
 
@@ -308,30 +588,7 @@ def main(cfg: DictConfig) -> None:
     use_amp = bool(cfg.training.use_amp)
     amp_dtype = _get_amp_dtype(str(cfg.training.amp_dtype))
 
-    common_dataset_kwargs = {
-        "robot_names": list(cfg.dataset.robot_names),
-        "hparams_path": _resolve_project_path(str(cfg.dataset.hparams_path)),
-        "real_masks_path": _resolve_project_path(str(cfg.dataset.real_masks_path)),
-        "max_contact_points": int(cfg.dataset.max_contact_points),
-        "seed": int(cfg.seed),
-        "check_template_hash": bool(cfg.dataset.check_template_hash),
-        "threshold": float(cfg.dataset.threshold),
-        "align_exp_scale": float(cfg.dataset.align_exp_scale),
-        "sigmoid_scale": float(cfg.dataset.sigmoid_scale),
-        "component_sampling_mode": str(cfg.dataset.component_sampling_mode),
-        "anchor_sampling_mode": str(cfg.dataset.anchor_sampling_mode),
-        "anchor_temperature": float(cfg.dataset.anchor_temperature),
-        "patch_anchor_shift_min": float(cfg.dataset.patch_anchor_shift_min),
-        "patch_anchor_shift_max": float(cfg.dataset.patch_anchor_shift_max),
-        "patch_extent_min": float(cfg.dataset.patch_extent_min),
-        "patch_extent_max": float(cfg.dataset.patch_extent_max),
-        "patch_extent_power": float(cfg.dataset.patch_extent_power),
-        "patch_shift_power": float(cfg.dataset.patch_shift_power),
-        "patch_normal_jitter_max_deg": float(cfg.dataset.patch_normal_jitter_max_deg),
-        "patch_points_per_anchor_min": int(cfg.dataset.patch_points_per_anchor_min),
-        "patch_points_per_anchor_max": int(cfg.dataset.patch_points_per_anchor_max),
-        "patch_penetration_clearance": float(cfg.dataset.patch_penetration_clearance),
-    }
+    common_dataset_kwargs = build_contact_policy_common_dataset_kwargs(cfg)
     train_generation_device = _prepare_device(str(cfg.dataset.train_generation_device))
     real_val_build_device = _prepare_device(
         str(getattr(cfg.dataset, "real_val_build_device", cfg.dataset.robot_model_device))
@@ -342,6 +599,7 @@ def main(cfg: DictConfig) -> None:
         buffer_build_batch_size_per_robot=int(cfg.dataset.buffer_build_batch_size_per_robot),
         buffer_refresh_batch_size_per_robot=int(cfg.dataset.buffer_refresh_batch_size_per_robot),
         device=str(train_generation_device),
+        store_aux_metadata=True,
         store_full_metadata=False,
         progress_label="train_synth",
         **common_dataset_kwargs,
@@ -408,7 +666,17 @@ def main(cfg: DictConfig) -> None:
             **real_val_loader_kwargs,
         )
 
-    model = _build_policy(cfg, action_dim=train_dataset.action_dim).to(device)
+    action_normalizer_meta = _build_action_normalizer_meta(
+        cfg,
+        robot_specs=train_dataset.robot_specs,
+        global_robot_names=list(train_dataset.global_robot_names),
+        action_dim=int(train_dataset.action_dim),
+    )
+    model = _build_policy(
+        cfg,
+        action_dim=train_dataset.action_dim,
+        action_normalizer_meta=action_normalizer_meta,
+    ).to(device)
     ema_model = None
     ema = None
     if bool(cfg.training.use_ema):
@@ -453,26 +721,36 @@ def main(cfg: DictConfig) -> None:
     os.makedirs(save_dir, exist_ok=True)
     torch.save(
         {
-            "robot_names": list(cfg.dataset.robot_names),
+            "robot_names": list(train_dataset.global_robot_names),
             "action_dim": int(train_dataset.action_dim),
             "surface_num_points": int(train_dataset.surface_num_points),
             "max_contact_points": int(train_dataset.max_contact_points),
+            "action_normalizer_scale": action_normalizer_meta["scale"].detach().cpu(),
+            "action_normalizer_offset": action_normalizer_meta["offset"].detach().cpu(),
+            "q2_base_translation_min": action_normalizer_meta["q2_base_translation_min"].detach().cpu(),
+            "q2_base_translation_max": action_normalizer_meta["q2_base_translation_max"].detach().cpu(),
         },
         os.path.join(save_dir, "dataset_meta.pt"),
     )
 
     metric_models = {name: spec["model"] for name, spec in val_dataset.robot_specs.items()}
+    train_geometry_models = _build_training_geometry_models(train_dataset, device)
     best_val = float("inf")
     best_metric_key = "validate_real/action_mse_valid"
     global_step = 0
     log_every_n_steps = int(max(1, cfg.training.log_every_n_steps))
     max_train_batches = int(cfg.training.max_train_batches)
     max_val_batches = int(cfg.training.max_val_batches)
+    contact_geometry_loss_weight = float(getattr(cfg.training, "contact_geometry_loss_weight", 0.0))
+    inactive_geometry_loss_weight = float(getattr(cfg.training, "inactive_geometry_loss_weight", 0.0))
 
     for epoch in range(1, int(cfg.training.epochs) + 1):
         train_dataset.prepare_epoch(epoch)
         model.train()
         train_losses: list[float] = []
+        train_diffusion_losses: list[float] = []
+        train_contact_geometry_losses: list[float] = []
+        train_inactive_geometry_losses: list[float] = []
 
         train_batches_total = len(train_loader)
         if max_train_batches > 0:
@@ -491,7 +769,23 @@ def main(cfg: DictConfig) -> None:
 
             optimizer.zero_grad(set_to_none=True)
             with _autocast_context(device, use_amp, amp_dtype):
-                loss, loss_dict = model.compute_loss(batch_device)
+                diffusion_loss, loss_dict, loss_aux = model.compute_loss(batch_device, return_aux=True)
+            contact_geometry_loss = torch.zeros((), dtype=torch.float32, device=device)
+            inactive_geometry_loss = torch.zeros((), dtype=torch.float32, device=device)
+            if contact_geometry_loss_weight > 0.0 or inactive_geometry_loss_weight > 0.0:
+                geometry_losses = _compute_training_geometry_losses(
+                    loss_aux["pred_action"].to(dtype=torch.float32),
+                    batch_device,
+                    geometry_models=train_geometry_models,
+                    robot_names=list(train_dataset.global_robot_names),
+                )
+                contact_geometry_loss = geometry_losses["contact_geometry_loss"]
+                inactive_geometry_loss = geometry_losses["inactive_geometry_loss"]
+            loss = diffusion_loss
+            if contact_geometry_loss_weight > 0.0:
+                loss = loss + contact_geometry_loss_weight * contact_geometry_loss
+            if inactive_geometry_loss_weight > 0.0:
+                loss = loss + inactive_geometry_loss_weight * inactive_geometry_loss
             loss.backward()
             if float(cfg.training.grad_clip_norm) > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), float(cfg.training.grad_clip_norm))
@@ -502,9 +796,15 @@ def main(cfg: DictConfig) -> None:
 
             loss_value = float(loss.item())
             train_losses.append(loss_value)
+            train_diffusion_losses.append(float(diffusion_loss.item()))
+            train_contact_geometry_losses.append(float(contact_geometry_loss.item()))
+            train_inactive_geometry_losses.append(float(inactive_geometry_loss.item()))
 
             step_log = {
                 "train/loss": loss_value,
+                "train/diffusion_loss": float(diffusion_loss.item()),
+                "train/contact_geometry_loss": float(contact_geometry_loss.item()),
+                "train/inactive_geometry_loss": float(inactive_geometry_loss.item()),
                 "train/lr": float(lr_scheduler.get_last_lr()[0]),
                 "global_step": global_step,
                 "epoch": epoch,
@@ -523,6 +823,9 @@ def main(cfg: DictConfig) -> None:
         epoch_log = {
             "epoch": epoch,
             "train/loss_epoch": float(np.mean(train_losses)) if train_losses else float("nan"),
+            "train/diffusion_loss_epoch": float(np.mean(train_diffusion_losses)) if train_diffusion_losses else float("nan"),
+            "train/contact_geometry_loss_epoch": float(np.mean(train_contact_geometry_losses)) if train_contact_geometry_losses else float("nan"),
+            "train/inactive_geometry_loss_epoch": float(np.mean(train_inactive_geometry_losses)) if train_inactive_geometry_losses else float("nan"),
         }
 
         eval_policy = ema_model if ema_model is not None else model

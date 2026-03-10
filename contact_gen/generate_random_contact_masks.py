@@ -98,7 +98,12 @@ class _RandomMaskSampler(_BaseContactPolicyDataset):
         spec["component_range"] = component_range
         model = spec["model"]
 
-        q_batch = self._sample_random_q_batch(model=model, batch_size=int(batch_size), generator=generator)
+        q_batch = self._sample_random_q_batch(
+            model=model,
+            batch_size=int(batch_size),
+            generator=generator,
+            base_pose_mode="sampled_q2",
+        )
         hand_points, hand_normals = model.get_surface_points_normals_batch(q=q_batch)
         patch_params = self._sample_synthetic_patch_params(
             spec=spec,
@@ -215,6 +220,9 @@ def main(cfg: DictConfig) -> None:
         patch_points_per_anchor_min=int(cfg.patch_points_per_anchor_min),
         patch_points_per_anchor_max=int(cfg.patch_points_per_anchor_max),
         patch_penetration_clearance=float(cfg.patch_penetration_clearance),
+        q2_base_translation_min=[float(x) for x in cfg.q2_base_translation_min],
+        q2_base_translation_max=[float(x) for x in cfg.q2_base_translation_max],
+        q2_base_rotation_mode=str(cfg.q2_base_rotation_mode),
     )
 
     for robot_name in robot_names:

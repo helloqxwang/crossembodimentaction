@@ -109,17 +109,17 @@ def _chamfer_distance(pc_a: torch.Tensor, pc_b: torch.Tensor) -> torch.Tensor:
 
 
 def _load_cross_model(cfg: DictConfig, device: torch.device) -> tuple[LoadedModel, list[str]]:
-    ckpt_path = to_absolute_path(str(cfg.model.cross.ckpt_path))
+    ckpt_path = to_absolute_path(str(cfg.policy_paths.cross.ckpt_path))
     meta_path = (
-        to_absolute_path(str(cfg.model.cross.dataset_meta_path))
-        if cfg.model.cross.dataset_meta_path is not None
+        to_absolute_path(str(cfg.policy_paths.cross.dataset_meta_path))
+        if cfg.policy_paths.cross.dataset_meta_path is not None
         else os.path.join(os.path.dirname(ckpt_path), "dataset_meta.pt")
     )
     meta = load_dataset_meta(meta_path)
     ckpt = load_ckpt(ckpt_path, device=device)
     model, used_model_kwargs, model_source = create_model_from_ckpt(
         ckpt=ckpt,
-        cfg_arch=cfg.model.architecture,
+        cfg_arch=None,
         meta=meta,
         device=device,
     )
@@ -154,9 +154,9 @@ def _discover_single_robot_names(checkpoint_root: str, checkpoint_name: str) -> 
 
 
 def _load_single_models(cfg: DictConfig, device: torch.device, selected_robots: list[str] | None) -> dict[str, LoadedModel]:
-    checkpoint_root = to_absolute_path(str(cfg.model.single.checkpoint_root))
-    checkpoint_name = str(cfg.model.single.checkpoint_name)
-    dataset_meta_name = str(cfg.model.single.dataset_meta_name)
+    checkpoint_root = to_absolute_path(str(cfg.policy_paths.single.checkpoint_root))
+    checkpoint_name = str(cfg.policy_paths.single.checkpoint_name)
+    dataset_meta_name = str(cfg.policy_paths.single.dataset_meta_name)
     robot_names = selected_robots or _discover_single_robot_names(checkpoint_root, checkpoint_name)
 
     out: dict[str, LoadedModel] = {}
@@ -173,7 +173,7 @@ def _load_single_models(cfg: DictConfig, device: torch.device, selected_robots: 
         ckpt = load_ckpt(ckpt_path, device=device)
         model, used_model_kwargs, model_source = create_model_from_ckpt(
             ckpt=ckpt,
-            cfg_arch=cfg.model.architecture,
+            cfg_arch=None,
             meta=meta,
             device=device,
         )
@@ -248,7 +248,7 @@ def main(cfg: DictConfig) -> None:
 
     dro_root = to_absolute_path(str(cfg.dataset.dro_root))
     split = str(cfg.dataset.split)
-    baseline_type = str(cfg.baseline.type)
+    baseline_type = str(cfg.policy.type)
     selected_robots_cfg = None if cfg.validation.robot_names is None else [str(x) for x in cfg.validation.robot_names]
 
     if baseline_type == "cross_embodiment":
@@ -265,7 +265,7 @@ def main(cfg: DictConfig) -> None:
         if unknown:
             raise ValueError(f"Missing single-baseline checkpoints for robots: {unknown}")
     else:
-        raise ValueError(f"Unsupported baseline.type: {baseline_type}")
+        raise ValueError(f"Unsupported policy.type: {baseline_type}")
 
     object_names = sorted(load_split_objects(dro_root, split=split))
     if cfg.validation.object_names is not None:

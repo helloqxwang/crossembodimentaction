@@ -3,7 +3,7 @@ defaults:
 
 seed: 42
 
-baseline:
+policy:
   type: cross_embodiment  # cross_embodiment or single_embodiment
 
 dataset:
@@ -15,14 +15,7 @@ dataset:
   pin_memory: true
   shuffle: false
 
-model:
-  architecture:
-    dgcnn_k: 20
-    object_emb_dim: 256
-    embodiment_dim: 8
-    latent_dim: 32
-    encoder_hidden_dims: [512, 256]
-    decoder_hidden_dims: [256, 256]
+policy_paths:
   cross:
     ckpt_path: ./checkpoints/baselines/cross_embodiment_cvae/best.pt
     dataset_meta_path: null

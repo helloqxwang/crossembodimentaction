@@ -185,6 +185,57 @@ def _axisangle_to_matrix(axis: torch.Tensor, angle: torch.Tensor) -> torch.Tenso
     )
 
 
+def _quat_xyzw_to_matrix_torch(quat_xyzw: torch.Tensor) -> torch.Tensor:
+    if quat_xyzw.ndim != 2 or quat_xyzw.shape[-1] != 4:
+        raise ValueError(f"quat_xyzw must have shape (B, 4), got {tuple(quat_xyzw.shape)}")
+    quat_xyzw = quat_xyzw / torch.norm(quat_xyzw, dim=-1, keepdim=True).clamp_min(1e-8)
+    x, y, z, w = quat_xyzw.unbind(dim=-1)
+    xx = x * x
+    yy = y * y
+    zz = z * z
+    ww = w * w
+    xy = x * y
+    xz = x * z
+    yz = y * z
+    xw = x * w
+    yw = y * w
+    zw = z * w
+    return torch.stack(
+        [
+            torch.stack([ww + xx - yy - zz, 2.0 * (xy - zw), 2.0 * (xz + yw)], dim=-1),
+            torch.stack([2.0 * (xy + zw), ww - xx + yy - zz, 2.0 * (yz - xw)], dim=-1),
+            torch.stack([2.0 * (xz - yw), 2.0 * (yz + xw), ww - xx - yy + zz], dim=-1),
+        ],
+        dim=-2,
+    )
+
+
+def _sample_uniform_so3_euler_xyz(
+    batch_size: int,
+    *,
+    device: torch.device,
+    generator: Optional[torch.Generator] = None,
+) -> torch.Tensor:
+    batch_size = int(batch_size)
+    if batch_size <= 0:
+        return torch.zeros((0, 3), dtype=torch.float32, device=device)
+    u1 = torch.rand((batch_size,), dtype=torch.float32, device=device, generator=generator)
+    u2 = torch.rand((batch_size,), dtype=torch.float32, device=device, generator=generator)
+    u3 = torch.rand((batch_size,), dtype=torch.float32, device=device, generator=generator)
+    two_pi = float(2.0 * math.pi)
+    quat_xyzw = torch.stack(
+        [
+            torch.sqrt(1.0 - u1) * torch.sin(two_pi * u2),
+            torch.sqrt(1.0 - u1) * torch.cos(two_pi * u2),
+            torch.sqrt(u1) * torch.sin(two_pi * u3),
+            torch.sqrt(u1) * torch.cos(two_pi * u3),
+        ],
+        dim=-1,
+    )
+    rot_mats = _quat_xyzw_to_matrix_torch(quat_xyzw)
+    return _matrix_to_euler_xyz(rot_mats)
+
+
 def q_euler_to_q_rot6d(q_euler: torch.Tensor) -> torch.Tensor:
     if q_euler.shape[-1] < 6:
         return q_euler
@@ -1118,6 +1169,7 @@ class RobotModel:
         self.joint_orders = [joint.name for joint in self.pk_chain.get_joints()]
         self.base_pose_indices = self._infer_base_pose_indices()
         self.base_translation_indices = self._infer_base_translation_indices()
+        self.base_rotation_indices = self._infer_base_rotation_indices()
         # NOTE: num_points now means whole-hand surface point count.
         self.link_num_points = int(num_points)
         self.surface_num_points = int(num_points)
@@ -1695,6 +1747,43 @@ class RobotModel:
             idx.append(i)
         return sorted(set(idx))
 
+    def _infer_base_rotation_indices(self) -> List[int]:
+        idx: List[int] = []
+        direct = {
+            "root_roll",
+            "root_pitch",
+            "root_yaw",
+            "base_roll",
+            "base_pitch",
+            "base_yaw",
+            "world_roll",
+            "world_pitch",
+            "world_yaw",
+            "global_roll",
+            "global_pitch",
+            "global_yaw",
+            "floating_roll",
+            "floating_pitch",
+            "floating_yaw",
+            "virtual_joint_roll",
+            "virtual_joint_pitch",
+            "virtual_joint_yaw",
+            "virtual_roll",
+            "virtual_pitch",
+            "virtual_yaw",
+        }
+        for i, name in enumerate(self.joint_orders):
+            n = name.lower().replace("-", "_").replace(" ", "")
+            if n in direct:
+                idx.append(i)
+                continue
+            has_base_token = any(t in n for t in ("root", "base", "world", "global", "floating", "virtual"))
+            if not has_base_token:
+                continue
+            if any(t in n for t in ("roll", "pitch", "yaw", "_rx", "_ry", "_rz", "rot")):
+                idx.append(i)
+        return sorted(set(idx))
+
     def _zero_base_translation_in_q(self, q: torch.Tensor) -> torch.Tensor:
         if len(self.base_translation_indices) == 0:
             return q
@@ -1704,6 +1793,134 @@ class RobotModel:
         else:
             q_out[..., self.base_translation_indices] = 0.0
         return q_out
+
+    def _zero_base_pose_in_q(self, q: torch.Tensor) -> torch.Tensor:
+        if len(self.base_pose_indices) == 0:
+            return q
+        q_out = q.clone()
+        if q_out.ndim == 1:
+            q_out[self.base_pose_indices] = 0.0
+        else:
+            q_out[..., self.base_pose_indices] = 0.0
+        return q_out
+
+    def set_base_pose_in_q(
+        self,
+        q: torch.Tensor,
+        *,
+        base_translation: Optional[torch.Tensor] = None,
+        base_rotation_euler: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        squeeze = False
+        if q.ndim == 1:
+            q = q.unsqueeze(0)
+            squeeze = True
+        q_out = q.clone()
+        if base_translation is not None and len(self.base_translation_indices) > 0:
+            base_translation = torch.as_tensor(base_translation, dtype=torch.float32, device=self.device)
+            if base_translation.ndim == 1:
+                base_translation = base_translation.unsqueeze(0)
+            expected_dim = len(self.base_translation_indices)
+            if base_translation.shape != (int(q_out.shape[0]), expected_dim):
+                raise ValueError(
+                    f"base_translation must have shape ({q_out.shape[0]}, {expected_dim}), "
+                    f"got {tuple(base_translation.shape)}"
+                )
+            q_out[:, self.base_translation_indices] = base_translation
+        if base_rotation_euler is not None and len(self.base_rotation_indices) > 0:
+            base_rotation_euler = torch.as_tensor(base_rotation_euler, dtype=torch.float32, device=self.device)
+            if base_rotation_euler.ndim == 1:
+                base_rotation_euler = base_rotation_euler.unsqueeze(0)
+            expected_dim = len(self.base_rotation_indices)
+            if base_rotation_euler.shape != (int(q_out.shape[0]), expected_dim):
+                raise ValueError(
+                    f"base_rotation_euler must have shape ({q_out.shape[0]}, {expected_dim}), "
+                    f"got {tuple(base_rotation_euler.shape)}"
+                )
+            q_out[:, self.base_rotation_indices] = base_rotation_euler
+        if squeeze:
+            return q_out[0]
+        return q_out
+
+    def sample_uniform_base_rotation_euler_xyz(
+        self,
+        batch_size: int,
+        generator: Optional[torch.Generator] = None,
+    ) -> torch.Tensor:
+        if len(self.base_rotation_indices) == 0:
+            return torch.zeros((int(batch_size), 0), dtype=torch.float32, device=self.device)
+        if len(self.base_rotation_indices) != 3:
+            raise RuntimeError(
+                f"Uniform SO(3) sampling requires exactly 3 base rotation joints, got {self.base_rotation_indices}"
+            )
+        return _sample_uniform_so3_euler_xyz(
+            int(batch_size),
+            device=self.device,
+            generator=generator,
+        )
+
+    def _build_active_links_from_contact_mask(self, mask: torch.Tensor) -> torch.Tensor:
+        squeeze = False
+        if mask.ndim == 1:
+            mask = mask.unsqueeze(0)
+            squeeze = True
+        if mask.ndim != 2:
+            raise ValueError(f"mask must have shape (B, {self.surface_num_points}), got {tuple(mask.shape)}")
+        if int(mask.shape[-1]) != int(self.surface_num_points):
+            raise ValueError(
+                f"mask last dim must match surface_num_points={self.surface_num_points}, got {mask.shape[-1]}"
+            )
+        mask = mask.to(self.device).bool()
+        active_links = torch.zeros(
+            (int(mask.shape[0]), len(self.mesh_link_names)),
+            dtype=torch.bool,
+            device=self.device,
+        )
+        link_idx = self.surface_template_link_indices.to(self.device)
+        for link_i in range(len(self.mesh_link_names)):
+            surface_mask = link_idx == int(link_i)
+            if bool(surface_mask.any()):
+                active_links[:, link_i] = mask[:, surface_mask].any(dim=1)
+        if squeeze:
+            return active_links.squeeze(0)
+        return active_links
+
+    def get_joint_active_by_contact_mask(self, mask: torch.Tensor) -> torch.Tensor:
+        active_links = self._build_active_links_from_contact_mask(mask)
+        squeeze = False
+        if active_links.ndim == 1:
+            active_links = active_links.unsqueeze(0)
+            squeeze = True
+        joint_active = (
+            active_links.unsqueeze(1)
+            & self.joint_descendant_link_mask.unsqueeze(0)
+        ).any(dim=-1)
+        if squeeze:
+            return joint_active.squeeze(0)
+        return joint_active
+
+    def get_inactive_link_mask_by_contact_mask(
+        self,
+        mask: torch.Tensor,
+        *,
+        ignore_base_pose: bool = True,
+    ) -> torch.Tensor:
+        joint_active = self.get_joint_active_by_contact_mask(mask)
+        squeeze = False
+        if joint_active.ndim == 1:
+            joint_active = joint_active.unsqueeze(0)
+            squeeze = True
+        if ignore_base_pose and len(self.base_pose_indices) > 0:
+            joint_active = joint_active.clone()
+            joint_active[:, self.base_pose_indices] = False
+        affected_links = (
+            joint_active.unsqueeze(-1)
+            & self.joint_descendant_link_mask.unsqueeze(0)
+        ).any(dim=1)
+        inactive_links = ~affected_links
+        if squeeze:
+            return inactive_links.squeeze(0)
+        return inactive_links
 
     def update_status(self, q: torch.Tensor) -> None:
         if q.ndim == 1:
@@ -1871,22 +2088,7 @@ class RobotModel:
         q1 = q1.to(self.device)
         q2 = q2.to(self.device)
         mask = mask.to(self.device).bool()
-
-        active_links = torch.zeros(
-            (mask.shape[0], len(self.mesh_link_names)),
-            dtype=torch.bool,
-            device=self.device,
-        )
-        link_idx = self.surface_template_link_indices.to(self.device)
-        for link_i in range(len(self.mesh_link_names)):
-            surface_mask = link_idx == int(link_i)
-            if bool(surface_mask.any()):
-                active_links[:, link_i] = mask[:, surface_mask].any(dim=1)
-
-        joint_active = (
-            active_links.unsqueeze(1)
-            & self.joint_descendant_link_mask.unsqueeze(0)
-        ).any(dim=-1)
+        joint_active = self.get_joint_active_by_contact_mask(mask)
         mixed = torch.where(joint_active, q2, q1)
         if squeeze:
             return mixed.squeeze(0)

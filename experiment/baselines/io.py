@@ -139,7 +139,7 @@ def _build_model(baseline_type: str, kwargs: Dict[str, Any], device: torch.devic
 def create_model_from_ckpt(
     *,
     ckpt: Dict[str, Any],
-    cfg_arch: Any,
+    cfg_arch: Any | None,
     meta: Dict[str, Any],
     device: torch.device,
 ) -> tuple[torch.nn.Module, Dict[str, Any], str]:
@@ -152,10 +152,11 @@ def create_model_from_ckpt(
     meta_candidate = _candidate_model_kwargs_from_meta(meta)
     if meta_candidate is not None:
         candidates.append(("dataset_meta", meta_candidate))
-    candidates.append(("config_file", _candidate_model_kwargs_from_config(cfg_arch, meta=meta)))
     ckpt_candidate = _candidate_model_kwargs_from_ckpt(ckpt, meta=meta)
     if ckpt_candidate is not None:
         candidates.append(("checkpoint", ckpt_candidate))
+    if cfg_arch is not None:
+        candidates.append(("runtime_config", _candidate_model_kwargs_from_config(cfg_arch, meta=meta)))
 
     errors: list[str] = []
     for source, kwargs in candidates:
