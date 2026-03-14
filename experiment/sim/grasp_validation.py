@@ -37,7 +37,7 @@ class ValidationModelMetadata:
     object_joint_id: int
     object_qpos_adr: int
     object_body_id: int
-    hand_root_body_id: int | None
+    hand_geom_ids: tuple[int, ...]
     object_geom_ids: tuple[int, ...]
     floor_geom_id: int
 
@@ -297,17 +297,18 @@ def _get_virtual_hand_indices(model: mujoco.MjModel) -> tuple[np.ndarray, np.nda
     return np.asarray(qpos_ids, dtype=np.int32), np.asarray(qvel_ids, dtype=np.int32)
 
 
-def _find_hand_root_body_id(model: mujoco.MjModel) -> int | None:
-    object_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "validation_object_body")
-    for body_id in range(1, int(model.nbody)):
-        if body_id == object_body_id:
-            continue
-        if int(model.body_parentid[body_id]) == 0:
-            return body_id
-    for body_id in range(1, int(model.nbody)):
-        if body_id != object_body_id:
-            return body_id
-    return None
+def _get_hand_geom_ids(
+    model: mujoco.MjModel,
+    *,
+    object_geom_ids: tuple[int, ...],
+    floor_geom_id: int,
+) -> tuple[int, ...]:
+    object_geom_set = set(int(geom_id) for geom_id in object_geom_ids)
+    return tuple(
+        int(geom_id)
+        for geom_id in range(int(model.ngeom))
+        if geom_id not in object_geom_set and geom_id != int(floor_geom_id)
+    )
 
 
 def _compute_model_metadata(model: mujoco.MjModel) -> ValidationModelMetadata:
@@ -325,6 +326,11 @@ def _compute_model_metadata(model: mujoco.MjModel) -> ValidationModelMetadata:
     object_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "validation_object_body")
     object_geom_ids = tuple(int(x) for x in np.where(model.geom_bodyid == object_body_id)[0].tolist())
     floor_geom_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_GEOM, "floor")
+    hand_geom_ids = _get_hand_geom_ids(
+        model,
+        object_geom_ids=object_geom_ids,
+        floor_geom_id=int(floor_geom_id),
+    )
     return ValidationModelMetadata(
         hand_qpos_indices=hand_qpos_indices,
         hand_qvel_indices=hand_qvel_indices,
@@ -337,7 +343,7 @@ def _compute_model_metadata(model: mujoco.MjModel) -> ValidationModelMetadata:
         object_joint_id=int(object_joint_id),
         object_qpos_adr=object_qpos_adr,
         object_body_id=int(object_body_id),
-        hand_root_body_id=_find_hand_root_body_id(model),
+        hand_geom_ids=hand_geom_ids,
         object_geom_ids=object_geom_ids,
         floor_geom_id=int(floor_geom_id),
     )
@@ -452,6 +458,19 @@ def _initialise_data(bundle: ValidationModelBundle, q_init: np.ndarray, object_p
     return data
 
 
+def _final_hand_object_distance_cpu(
+    data: mujoco.MjData,
+    meta: ValidationModelMetadata,
+) -> float:
+    if not meta.hand_geom_ids:
+        return float("nan")
+    object_pos = data.xpos[meta.object_body_id].copy()
+    hand_geom_pos = np.asarray(data.geom_xpos[list(meta.hand_geom_ids)], dtype=np.float64)
+    if hand_geom_pos.size == 0:
+        return float("nan")
+    return float(np.linalg.norm(hand_geom_pos - object_pos[None, :], axis=1).min())
+
+
 def _rollout_static_grasp_cpu(
     *,
     bundle: ValidationModelBundle,
@@ -527,12 +546,7 @@ def _rollout_static_grasp_cpu(
     pos_err = np.linalg.norm(sim_obj_pos[:filled_steps] - ref_obj_pos[:filled_steps], axis=1)
     rot_err = quat_error_rad_wxyz(sim_obj_quat[:filled_steps], ref_obj_quat[:filled_steps])
     final_contact = False if unstable else _has_hand_object_contact(bundle.model, data, meta)
-    final_obj_pos = sim_obj_pos[filled_steps - 1]
-    if meta.hand_root_body_id is not None:
-        hand_root_pos = data.xpos[meta.hand_root_body_id].copy()
-        final_hand_obj_dist = float(np.linalg.norm(final_obj_pos - hand_root_pos))
-    else:
-        final_hand_obj_dist = float("nan")
+    final_hand_obj_dist = float("nan") if unstable else _final_hand_object_distance_cpu(data, meta)
     final_in_hand = bool((not unstable) and final_contact and final_hand_obj_dist <= float(in_hand_distance_threshold))
 
     return {

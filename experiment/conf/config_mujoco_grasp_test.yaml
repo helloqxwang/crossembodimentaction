@@ -39,7 +39,7 @@ mujoco:
   object_pose6: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
   sim_dt: 0.005
   steps_per_frame: 1
-  gravity_enabled: true
+  gravity_enabled: false
   in_hand_distance_threshold: 0.25
   object_density: 500.0
 
@@ -48,7 +48,7 @@ mujoco:
   hand_max_force: 10.0
 
   squeezing:
-    enabled: false
+    enabled: true
 
   disturbance:
     enabled: true

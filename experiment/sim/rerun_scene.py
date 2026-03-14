@@ -193,8 +193,16 @@ def build_and_log_scene_from_spec(
             if model_geom_id >= 0:
                 is_collision = bool(model.geom_contype[model_geom_id] != 0 or model.geom_conaffinity[model_geom_id] != 0)
             geom_entity = f"{_get_mesh_group_path(geom_name, entity_root, is_collision=is_collision)}/{body_name}/{geom_name}"
-            local_pos = np.asarray(getattr(geom, "pos", [0.0, 0.0, 0.0]), dtype=np.float32)
-            local_quat = np.asarray(getattr(geom, "quat", [1.0, 0.0, 0.0, 0.0]), dtype=np.float32)
+            if model_geom_id >= 0:
+                local_pos = np.asarray(model.geom_pos[model_geom_id], dtype=np.float32)
+                local_quat = np.asarray(model.geom_quat[model_geom_id], dtype=np.float32)
+                geom_type = int(model.geom_type[model_geom_id])
+                geom_size = np.asarray(model.geom_size[model_geom_id], dtype=np.float32)
+            else:
+                local_pos = np.asarray(getattr(geom, "pos", [0.0, 0.0, 0.0]), dtype=np.float32)
+                local_quat = np.asarray(getattr(geom, "quat", [1.0, 0.0, 0.0, 0.0]), dtype=np.float32)
+                geom_type = int(geom.type)
+                geom_size = np.asarray(getattr(geom, "size", [0.0, 0.0, 0.0]), dtype=np.float32)
             rr.log(
                 geom_entity,
                 rr.Transform3D(translation=local_pos, quaternion=_xyzw_from_wxyz(local_quat)),
@@ -205,13 +213,13 @@ def build_and_log_scene_from_spec(
             rgba = None
             if model_geom_id >= 0:
                 rgba = np.asarray(model.geom_rgba[model_geom_id], dtype=np.float32)
-            if geom.type == mujoco.mjtGeom.mjGEOM_MESH and model_geom_id >= 0:
+            if geom_type == mujoco.mjtGeom.mjGEOM_MESH and model_geom_id >= 0:
                 try:
                     tm = _mujoco_mesh_to_trimesh(model, model_geom_id)
                 except Exception as exc:  # noqa: BLE001
                     warnings.warn(f"Failed to convert mesh geom '{geom_name}': {exc}", stacklevel=1)
             if tm is None and model_geom_id >= 0:
-                tm = _trimesh_from_primitive(int(geom.type), np.asarray(model.geom_size[model_geom_id]), rgba)
+                tm = _trimesh_from_primitive(geom_type, geom_size, rgba)
             if tm is None:
                 continue
             _log_trimesh_entity(geom_entity, tm, fallback_color)

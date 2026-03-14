@@ -22,6 +22,7 @@ from data_process.contact_policy_dataset import (  # noqa: E402
 from train_contact_policy import (  # noqa: E402
     _move_batch_to_device,
     _prepare_device,
+    _resolve_optional_project_path,
     build_contact_policy_common_dataset_kwargs,
     load_contact_policy_checkpoint,
 )
@@ -84,23 +85,58 @@ def _load_visualization_batch(
 
     mode = str(cfg.visualization.mode).strip().lower()
     if mode == "synthesized":
-        dataset = OnTheFlySyntheticContactPolicyDataset(
-            samples_per_epoch=num_samples,
-            buffer_refresh_fraction=float(cfg.dataset.buffer_refresh_fraction),
-            buffer_build_batch_size_per_robot=min(
-                int(cfg.dataset.buffer_build_batch_size_per_robot),
-                num_samples,
-            ),
-            buffer_refresh_batch_size_per_robot=min(
-                int(cfg.dataset.buffer_refresh_batch_size_per_robot),
-                num_samples,
-            ),
-            device=str(_prepare_device(str(cfg.dataset.train_generation_device))),
-            store_full_metadata=True,
-            progress_label="visualize_synth",
-            **common_dataset_kwargs,
-        )
-        indices = list(range(num_samples))
+        synthetic_buffer_path = _resolve_optional_project_path(getattr(cfg.visualization, "synthetic_buffer_path", None))
+        if synthetic_buffer_path is not None:
+            dataset = OnTheFlySyntheticContactPolicyDataset.from_buffer_file(
+                synthetic_buffer_path,
+                device=str(_prepare_device(str(cfg.dataset.train_generation_device))),
+                progress_label="visualize_synth_saved",
+                hparams_path=common_dataset_kwargs["hparams_path"],
+                real_masks_path=common_dataset_kwargs["real_masks_path"],
+                seed=int(cfg.seed),
+                check_template_hash=bool(cfg.dataset.check_template_hash),
+                threshold=float(cfg.dataset.threshold),
+                align_exp_scale=float(cfg.dataset.align_exp_scale),
+                sigmoid_scale=float(cfg.dataset.sigmoid_scale),
+                component_sampling_mode=str(cfg.dataset.component_sampling_mode),
+                anchor_sampling_mode=str(cfg.dataset.anchor_sampling_mode),
+                anchor_temperature=float(cfg.dataset.anchor_temperature),
+                patch_anchor_shift_min=float(cfg.dataset.patch_anchor_shift_min),
+                patch_anchor_shift_max=float(cfg.dataset.patch_anchor_shift_max),
+                patch_extent_min=float(cfg.dataset.patch_extent_min),
+                patch_extent_max=float(cfg.dataset.patch_extent_max),
+                patch_extent_power=float(cfg.dataset.patch_extent_power),
+                patch_shift_power=float(cfg.dataset.patch_shift_power),
+                patch_normal_jitter_max_deg=float(cfg.dataset.patch_normal_jitter_max_deg),
+                patch_points_per_anchor_min=int(cfg.dataset.patch_points_per_anchor_min),
+                patch_points_per_anchor_max=int(cfg.dataset.patch_points_per_anchor_max),
+                patch_penetration_clearance=float(cfg.dataset.patch_penetration_clearance),
+                q2_base_translation_min=[float(x) for x in cfg.dataset.q2_base_translation_min],
+                q2_base_translation_max=[float(x) for x in cfg.dataset.q2_base_translation_max],
+                q2_base_rotation_mode=str(cfg.dataset.q2_base_rotation_mode),
+            )
+            robot_indices = dataset.get_indices_for_robot(robot_name)
+            indices = list(robot_indices[:num_samples])
+            if len(indices) == 0:
+                raise IndexError(f"No saved synthetic samples found for robot={robot_name} in {synthetic_buffer_path}")
+        else:
+            dataset = OnTheFlySyntheticContactPolicyDataset(
+                samples_per_epoch=num_samples,
+                buffer_refresh_fraction=float(cfg.dataset.buffer_refresh_fraction),
+                buffer_build_batch_size_per_robot=min(
+                    int(cfg.dataset.buffer_build_batch_size_per_robot),
+                    num_samples,
+                ),
+                buffer_refresh_batch_size_per_robot=min(
+                    int(cfg.dataset.buffer_refresh_batch_size_per_robot),
+                    num_samples,
+                ),
+                device=str(_prepare_device(str(cfg.dataset.train_generation_device))),
+                store_full_metadata=True,
+                progress_label="visualize_synth",
+                **common_dataset_kwargs,
+            )
+            indices = list(range(num_samples))
     elif mode == "real":
         dataset = RealContactPolicyValDataset(
             cache_processed_samples=False,
@@ -170,7 +206,11 @@ def _render_contact_policy_sample(
     point_size: float,
     hand_opacity: float,
 ) -> None:
-    robot_name = str(batch["robot_name"][sample_idx])
+    if "robot_name" in batch:
+        robot_name = str(batch["robot_name"][sample_idx])
+    else:
+        robot_index = int(batch["robot_index"][sample_idx].item())
+        robot_name = str(dataset.global_robot_names[robot_index])
     model = dataset.robot_specs[robot_name]["model"]
     q1 = _get_local_q(batch, "q1_padded", sample_idx).to(model.device)
     q2 = _get_local_q(batch, "q2_padded", sample_idx).to(model.device)

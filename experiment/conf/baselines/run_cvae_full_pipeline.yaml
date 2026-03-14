@@ -32,7 +32,7 @@ policies:
 validate:
   common_overrides:
     - validation.test_rounds=2
-    - validation.pred_mode=recon
+    - validation.pred_mode=sample
     - validation.recon_use_mean_latent=true
     - validation.compute_chamfer=true
 

@@ -1,0 +1,144 @@
+defaults:
+  - _self_
+
+seed: 42
+
+experiment:
+  name: contact_policy_probe_big_${probe.task}
+
+probe:
+  task: tips_movable_base  # tips_fixed_base, tips_movable_base, patches_movable_base
+  robot_name: shadowhand
+  train_samples: 1000000
+  test_samples: 1000
+  fixed_tip_links:
+    - ffdistal
+    - thdistal
+  supervised_joint_prefixes:
+    - FFJ
+    - THJ
+  allowed_contact_link_names:
+    - palm
+    - ffknuckle
+    - ffproximal
+    - ffmiddle
+    - ffdistal
+    - thbase
+    - thproximal
+    - thmiddle
+    - thdistal
+  component_range: [2, 4]
+  component_count_values: null
+  component_count_distribution: null
+  contact_count_range: [8, 64]
+
+dataset:
+  hparams_path: ./contact_gen/contact_sampler_hparams.yaml
+  real_masks_path: ./contact_gen/contact_points_validate.pt
+  generation_device: cuda
+  check_template_hash: true
+  build_batch_size: 1024
+  batch_size: 512
+  test_batch_size: 512
+  num_workers: 16
+  prefetch_factor: 2
+  pin_memory: true
+  drop_last: false
+  load_saved_buffers: true
+  save_buffers: true
+  train_buffer_path: null
+  test_buffer_path: null
+  max_contact_points: 128
+  threshold: 0.4
+  align_exp_scale: 2.0
+  sigmoid_scale: 10.0
+  component_sampling_mode: uniform
+  anchor_sampling_mode: point_prob
+  anchor_temperature: 1.0
+  patch_anchor_shift_min: 0.0002
+  patch_anchor_shift_max: 0.0030
+  patch_extent_min: 0.006
+  patch_extent_max: 0.050
+  patch_extent_power: 1.0
+  patch_shift_power: 1.0
+  patch_normal_jitter_max_deg: 10.0
+  patch_points_per_anchor_min: 28
+  patch_points_per_anchor_max: 84
+  patch_penetration_clearance: 0.00008
+  q2_base_translation_min: [-0.10, -0.10, -0.10]
+  q2_base_translation_max: [0.10, 0.10, 0.10]
+  q2_base_rotation_mode: uniform_so3
+
+model:
+  contact_encoder:
+    in_channels: 6
+    hidden_dim: 1024
+    out_channels: 1024
+    num_layers: 4
+  obs_hidden_dims: [2048]
+  global_cond_dim: 2048
+  diffusion_step_embed_dim: 1024
+  down_dims: [2048, 4096, 8192]
+  num_inference_steps: 10
+  noise_scheduler:
+    num_train_timesteps: 50
+    beta_start: 0.0001
+    beta_end: 0.02
+    beta_schedule: squaredcos_cap_v2
+    clip_sample: false
+    set_alpha_to_one: true
+    steps_offset: 0
+    prediction_type: sample
+
+training:
+  device: cuda
+  epochs: 100
+  resume: false
+  resume_checkpoint_path: null
+  lr: 1.0e-4
+  betas: [0.95, 0.999]
+  eps: 1.0e-8
+  weight_decay: 1.0e-6
+  lr_scheduler: cosine
+  lr_warmup_steps: 500
+  grad_clip_norm: 1.0
+  use_amp: true
+  amp_dtype: bfloat16
+  contact_geometry_loss_weight: 1.0
+  use_ema: true
+  ema:
+    update_after_step: 0
+    inv_gamma: 1.0
+    power: 0.75
+    min_value: 0.0
+    max_value: 0.9999
+  log_every_n_steps: 10
+  eval_every_n_epochs: 4
+  save_every_n_epoch: 10
+  save_dir: ./checkpoints/contact_policy_probe_big/${probe.task}
+
+wandb:
+  enabled: true
+  project: action_repr
+  entity: null
+  name: contact-policy-probe-big-${probe.task}
+  mode: online
+  resume: allow
+  run_id: null
+
+visualization:
+  split: validate  # train or validate
+  start_index: 0
+  num_samples: 16
+  checkpoint_path: null  # null -> ${training.save_dir}/last.pt
+  checkpoint_prefer_ema: true
+  host: 127.0.0.1
+  port: 8082
+  point_size: 0.005
+  hand_opacity: 0.65
+
+hydra:
+  run:
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}_contact_policy_probe_big
+  job:
+    chdir: false

@@ -867,6 +867,8 @@ class SyntheticContactPolicyDataset(Dataset, _BaseContactPolicyDataset):
         store_aux_metadata: bool = False,
         store_full_metadata: bool = False,
         progress_label: str = "synthetic_buffer",
+        load_buffer_path: str | Path | None = None,
+        load_buffer_payload: Dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> None:
         Dataset.__init__(self)
@@ -876,16 +878,19 @@ class SyntheticContactPolicyDataset(Dataset, _BaseContactPolicyDataset):
         if self.samples_per_epoch <= 0:
             raise ValueError("samples_per_epoch must be positive")
         self.buffer_refresh_fraction = float(buffer_refresh_fraction)
-        if not (0.0 < self.buffer_refresh_fraction <= 1.0):
-            raise ValueError(f"buffer_refresh_fraction must be in (0, 1], got {self.buffer_refresh_fraction}")
+        if not (0.0 <= self.buffer_refresh_fraction <= 1.0):
+            raise ValueError(f"buffer_refresh_fraction must be in [0, 1], got {self.buffer_refresh_fraction}")
 
-        cycle_epochs = int(round(1.0 / self.buffer_refresh_fraction))
-        if abs(self.buffer_refresh_fraction * cycle_epochs - 1.0) > 1e-6:
-            raise ValueError(
-                "buffer_refresh_fraction must be an exact reciprocal for deterministic turnover, "
-                f"got {self.buffer_refresh_fraction}"
-            )
-        self.buffer_refresh_cycle_epochs = cycle_epochs
+        if self.buffer_refresh_fraction == 0.0:
+            self.buffer_refresh_cycle_epochs = 0
+        else:
+            cycle_epochs = int(round(1.0 / self.buffer_refresh_fraction))
+            if abs(self.buffer_refresh_fraction * cycle_epochs - 1.0) > 1e-6:
+                raise ValueError(
+                    "buffer_refresh_fraction must be 0 or an exact reciprocal for deterministic turnover, "
+                    f"got {self.buffer_refresh_fraction}"
+                )
+            self.buffer_refresh_cycle_epochs = cycle_epochs
         self.buffer_build_batch_size_per_robot = int(max(1, buffer_build_batch_size_per_robot))
         if buffer_refresh_batch_size_per_robot is None:
             buffer_refresh_batch_size_per_robot = self.buffer_build_batch_size_per_robot
@@ -894,6 +899,8 @@ class SyntheticContactPolicyDataset(Dataset, _BaseContactPolicyDataset):
         self.store_full_metadata = bool(store_full_metadata)
         self._store_loss_metadata = self.store_aux_metadata or self.store_full_metadata
         self.progress_label = str(progress_label)
+        if load_buffer_path is not None and load_buffer_payload is not None:
+            raise ValueError("Only one of load_buffer_path or load_buffer_payload may be provided")
 
         self.robot_slot_ranges: Dict[str, tuple[int, int]] = {}
         self.robot_refresh_blocks: Dict[str, List[torch.Tensor]] = {}
@@ -971,9 +978,165 @@ class SyntheticContactPolicyDataset(Dataset, _BaseContactPolicyDataset):
             )
 
         self._prepared_epoch = 1
-        build_t0 = time.perf_counter()
-        self._populate_initial_buffer()
-        self.buffer_build_time_s = time.perf_counter() - build_t0
+        if load_buffer_payload is not None:
+            self._load_buffer_payload(load_buffer_payload)
+            self.buffer_build_time_s = 0.0
+        elif load_buffer_path is not None:
+            self._load_buffer_payload(torch.load(str(Path(load_buffer_path).resolve()), map_location="cpu", weights_only=False))
+            self.buffer_build_time_s = 0.0
+        else:
+            build_t0 = time.perf_counter()
+            self._populate_initial_buffer()
+            self.buffer_build_time_s = time.perf_counter() - build_t0
+
+    @staticmethod
+    def _read_buffer_payload(buffer_path: str | Path) -> Dict[str, Any]:
+        payload = torch.load(str(Path(buffer_path).resolve()), map_location="cpu", weights_only=False)
+        if not isinstance(payload, dict) or "meta" not in payload or "buffers" not in payload:
+            raise ValueError(f"Invalid synthetic buffer payload: {buffer_path}")
+        return payload
+
+    @classmethod
+    def from_buffer_file(
+        cls,
+        buffer_path: str | Path,
+        **kwargs: Any,
+    ) -> "SyntheticContactPolicyDataset":
+        payload = cls._read_buffer_payload(buffer_path)
+        meta = payload["meta"]
+        init_kwargs = dict(kwargs)
+        init_kwargs["robot_names"] = [str(x) for x in meta["robot_names"]]
+        init_kwargs["global_robot_names"] = [str(x) for x in meta["global_robot_names"]]
+        init_kwargs["max_contact_points"] = int(meta["max_contact_points"])
+        return cls(
+            samples_per_epoch=int(meta["samples_per_epoch"]),
+            buffer_refresh_fraction=0.0,
+            buffer_build_batch_size_per_robot=1,
+            buffer_refresh_batch_size_per_robot=1,
+            store_aux_metadata=bool(meta["store_aux_metadata"]),
+            store_full_metadata=bool(meta["store_full_metadata"]),
+            load_buffer_payload=payload,
+            **init_kwargs,
+        )
+
+    def get_indices_for_robot(self, robot_name: str) -> List[int]:
+        if robot_name not in self.robot_slot_ranges:
+            raise KeyError(f"Unknown robot_name={robot_name}")
+        start, end = self.robot_slot_ranges[robot_name]
+        return list(range(int(start), int(end)))
+
+    def _build_buffer_payload(self) -> Dict[str, Any]:
+        buffers: Dict[str, torch.Tensor] = {
+            "p_hat": self.buffer_p_hat.detach().cpu(),
+            "contact_cloud": self.buffer_contact_cloud.detach().cpu(),
+            "contact_valid_mask": self.buffer_contact_valid_mask.detach().cpu(),
+            "action": self.buffer_action.detach().cpu(),
+        }
+        if self._store_loss_metadata:
+            if (
+                self.buffer_q1_padded is None
+                or self.buffer_q2_padded is None
+                or self.buffer_contact_point_indices is None
+                or self.buffer_inactive_link_mask is None
+                or self.buffer_local_dof is None
+                or self.buffer_robot_index is None
+            ):
+                raise RuntimeError("Auxiliary metadata buffer storage is not initialized")
+            buffers.update(
+                {
+                    "q1_padded": self.buffer_q1_padded.detach().cpu(),
+                    "q2_padded": self.buffer_q2_padded.detach().cpu(),
+                    "contact_point_indices": self.buffer_contact_point_indices.detach().cpu(),
+                    "inactive_link_mask": self.buffer_inactive_link_mask.detach().cpu(),
+                    "local_dof": self.buffer_local_dof.detach().cpu(),
+                    "robot_index": self.buffer_robot_index.detach().cpu(),
+                }
+            )
+        if self.store_full_metadata:
+            if self.buffer_action_valid_mask is None or self.buffer_contact_mask_surface is None:
+                raise RuntimeError("Full-metadata buffer storage is not initialized")
+            buffers.update(
+                {
+                    "action_valid_mask": self.buffer_action_valid_mask.detach().cpu(),
+                    "contact_mask_surface": self.buffer_contact_mask_surface.detach().cpu(),
+                }
+            )
+        return {
+            "meta": {
+                "samples_per_epoch": int(self.samples_per_epoch),
+                "robot_names": list(self.robot_names),
+                "global_robot_names": list(self.global_robot_names),
+                "max_contact_points": int(self.max_contact_points),
+                "store_aux_metadata": bool(self.store_aux_metadata),
+                "store_full_metadata": bool(self.store_full_metadata),
+            },
+            "buffers": buffers,
+        }
+
+    def save_buffer(self, buffer_path: str | Path) -> None:
+        path = Path(buffer_path).resolve()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(self._build_buffer_payload(), str(path))
+
+    def _load_buffer_payload(self, payload: Dict[str, Any]) -> None:
+        meta = payload["meta"]
+        buffers = payload["buffers"]
+        if int(meta["samples_per_epoch"]) != int(self.samples_per_epoch):
+            raise ValueError(
+                f"Saved buffer samples_per_epoch={meta['samples_per_epoch']} does not match dataset={self.samples_per_epoch}"
+            )
+        if list(meta["robot_names"]) != list(self.robot_names):
+            raise ValueError(f"Saved buffer robot_names mismatch: {meta['robot_names']} vs {self.robot_names}")
+        if list(meta["global_robot_names"]) != list(self.global_robot_names):
+            raise ValueError(
+                f"Saved buffer global_robot_names mismatch: {meta['global_robot_names']} vs {self.global_robot_names}"
+            )
+        if int(meta["max_contact_points"]) != int(self.max_contact_points):
+            raise ValueError(
+                f"Saved buffer max_contact_points mismatch: {meta['max_contact_points']} vs {self.max_contact_points}"
+            )
+        if bool(meta["store_aux_metadata"]) != bool(self.store_aux_metadata):
+            raise ValueError(
+                f"Saved buffer store_aux_metadata mismatch: {meta['store_aux_metadata']} vs {self.store_aux_metadata}"
+            )
+        if bool(meta["store_full_metadata"]) != bool(self.store_full_metadata):
+            raise ValueError(
+                f"Saved buffer store_full_metadata mismatch: {meta['store_full_metadata']} vs {self.store_full_metadata}"
+            )
+
+        self.buffer_p_hat.copy_(torch.as_tensor(buffers["p_hat"], dtype=torch.float32, device="cpu"))
+        self.buffer_contact_cloud.copy_(torch.as_tensor(buffers["contact_cloud"], dtype=torch.float32, device="cpu"))
+        self.buffer_contact_valid_mask.copy_(torch.as_tensor(buffers["contact_valid_mask"], dtype=torch.bool, device="cpu"))
+        self.buffer_action.copy_(torch.as_tensor(buffers["action"], dtype=torch.float32, device="cpu"))
+        if self._store_loss_metadata:
+            if (
+                self.buffer_q1_padded is None
+                or self.buffer_q2_padded is None
+                or self.buffer_contact_point_indices is None
+                or self.buffer_inactive_link_mask is None
+                or self.buffer_local_dof is None
+                or self.buffer_robot_index is None
+            ):
+                raise RuntimeError("Auxiliary metadata buffer storage is not initialized")
+            self.buffer_q1_padded.copy_(torch.as_tensor(buffers["q1_padded"], dtype=torch.float32, device="cpu"))
+            self.buffer_q2_padded.copy_(torch.as_tensor(buffers["q2_padded"], dtype=torch.float32, device="cpu"))
+            self.buffer_contact_point_indices.copy_(
+                torch.as_tensor(buffers["contact_point_indices"], dtype=torch.int16, device="cpu")
+            )
+            self.buffer_inactive_link_mask.copy_(
+                torch.as_tensor(buffers["inactive_link_mask"], dtype=torch.bool, device="cpu")
+            )
+            self.buffer_local_dof.copy_(torch.as_tensor(buffers["local_dof"], dtype=torch.long, device="cpu"))
+            self.buffer_robot_index.copy_(torch.as_tensor(buffers["robot_index"], dtype=torch.long, device="cpu"))
+        if self.store_full_metadata:
+            if self.buffer_action_valid_mask is None or self.buffer_contact_mask_surface is None:
+                raise RuntimeError("Full-metadata buffer storage is not initialized")
+            self.buffer_action_valid_mask.copy_(
+                torch.as_tensor(buffers["action_valid_mask"], dtype=torch.bool, device="cpu")
+            )
+            self.buffer_contact_mask_surface.copy_(
+                torch.as_tensor(buffers["contact_mask_surface"], dtype=torch.bool, device="cpu")
+            )
 
     def __len__(self) -> int:
         return self.samples_per_epoch
@@ -1031,6 +1194,11 @@ class SyntheticContactPolicyDataset(Dataset, _BaseContactPolicyDataset):
             count = base + (1 if i < remainder else 0)
             end = start + count
             self.robot_slot_ranges[robot_name] = (start, end)
+
+            if self.buffer_refresh_cycle_epochs <= 0:
+                self.robot_refresh_blocks[robot_name] = []
+                start = end
+                continue
 
             if count <= 0:
                 self.robot_refresh_blocks[robot_name] = [
@@ -1154,6 +1322,8 @@ class SyntheticContactPolicyDataset(Dataset, _BaseContactPolicyDataset):
             progress.close()
 
     def _refresh_epoch_once(self, epoch: int) -> float:
+        if self.buffer_refresh_cycle_epochs <= 0:
+            return 0.0
         refresh_block_idx = (int(epoch) - 2) % self.buffer_refresh_cycle_epochs
         t0 = time.perf_counter()
         with torch.no_grad():
@@ -1193,6 +1363,9 @@ class SyntheticContactPolicyDataset(Dataset, _BaseContactPolicyDataset):
 
     def prepare_epoch(self, epoch: int) -> float:
         epoch = int(epoch)
+        if self.buffer_refresh_cycle_epochs <= 0:
+            self._prepared_epoch = max(self._prepared_epoch, epoch)
+            return 0.0
         if epoch <= 1:
             self._prepared_epoch = max(self._prepared_epoch, 1)
             return 0.0

@@ -69,6 +69,16 @@ class EMAModel:
                     ema_param.add_(param.data.to(dtype=ema_param.dtype), alpha=1.0 - self.decay)
         self.optimization_step += 1
 
+    def state_dict(self) -> Dict[str, float | int]:
+        return {
+            "decay": float(self.decay),
+            "optimization_step": int(self.optimization_step),
+        }
+
+    def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
+        self.decay = float(state_dict.get("decay", 0.0))
+        self.optimization_step = int(state_dict.get("optimization_step", 0))
+
 
 def _set_seed(seed: int) -> None:
     random.seed(seed)
@@ -87,6 +97,15 @@ def _resolve_project_path(path_str: str) -> str:
     if os.path.isabs(path_str):
         return path_str
     return os.path.abspath(os.path.join(ROOT_DIR, path_str))
+
+
+def _resolve_optional_project_path(path_val: Any) -> str | None:
+    if path_val is None:
+        return None
+    path_str = str(path_val).strip()
+    if path_str == "" or path_str.lower() == "null":
+        return None
+    return _resolve_project_path(path_str)
 
 
 def _move_batch_to_device(batch: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
@@ -158,6 +177,40 @@ def _build_lr_scheduler(
         raise ValueError(f"Unsupported lr_scheduler: {name}")
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
+def _extract_wandb_run_id_from_path(path: str) -> str | None:
+    real_path = os.path.realpath(path)
+    base = os.path.basename(real_path.rstrip(os.sep))
+    if not base.startswith("run-"):
+        return None
+    parts = base.split("-")
+    if len(parts) < 3:
+        return None
+    run_id = parts[-1].strip()
+    return run_id or None
+
+
+def _infer_wandb_run_id(save_dir: str) -> str | None:
+    run_id_path = os.path.join(save_dir, "wandb_run_id.txt")
+    if os.path.isfile(run_id_path):
+        with open(run_id_path, "r", encoding="utf-8") as f:
+            run_id = f.read().strip()
+        if run_id:
+            return run_id
+
+    latest_run_path = os.path.join(ROOT_DIR, "wandb", "latest-run")
+    if os.path.exists(latest_run_path):
+        run_id = _extract_wandb_run_id_from_path(latest_run_path)
+        if run_id is not None:
+            return run_id
+    return None
+
+
+def _mark_buffered_dataset_resumed(dataset: Any, start_epoch: int) -> None:
+    prepared_epoch = max(1, int(start_epoch) - 1)
+    if hasattr(dataset, "_prepared_epoch"):
+        dataset._prepared_epoch = prepared_epoch
 
 
 def _build_action_normalizer_meta(
@@ -704,21 +757,90 @@ def main(cfg: DictConfig) -> None:
         num_warmup_steps=int(cfg.training.lr_warmup_steps),
         num_training_steps=int(total_steps),
     )
+    save_dir = _resolve_project_path(str(cfg.training.save_dir))
+    os.makedirs(save_dir, exist_ok=True)
+    best_metric_key = "validate_real/action_mse_valid"
+    best_val = float("inf")
+    start_epoch = 1
+    global_step = 0
+    resume_ckpt_path = None
+    resume_wandb_run_id = None
+
+    if bool(getattr(cfg.training, "resume", False)):
+        resume_ckpt_path = _resolve_optional_project_path(getattr(cfg.training, "resume_checkpoint_path", None))
+        if resume_ckpt_path is None:
+            resume_ckpt_path = os.path.join(save_dir, "last.pt")
+        if not os.path.isfile(resume_ckpt_path):
+            raise FileNotFoundError(f"Resume checkpoint not found: {resume_ckpt_path}")
+
+        resume_ckpt = torch.load(resume_ckpt_path, map_location=device, weights_only=False)
+        model.load_state_dict(resume_ckpt["model"], strict=True)
+        optimizer.load_state_dict(resume_ckpt["optimizer"])
+        lr_scheduler.load_state_dict(resume_ckpt["lr_scheduler"])
+        if ema_model is not None:
+            if "ema_model" not in resume_ckpt:
+                raise KeyError("Resume checkpoint is missing ema_model but training.use_ema=true")
+            ema_model.load_state_dict(resume_ckpt["ema_model"], strict=True)
+            if ema is not None and "ema_state" in resume_ckpt:
+                ema.load_state_dict(resume_ckpt["ema_state"])
+
+        start_epoch = int(resume_ckpt.get("epoch", 0)) + 1
+        global_step = int(resume_ckpt.get("global_step", 0))
+        best_val = float(resume_ckpt.get("best_val", float("inf")))
+        resume_wandb_run_id = (
+            None
+            if getattr(cfg.wandb, "run_id", None) is None
+            else str(cfg.wandb.run_id)
+        )
+        if resume_wandb_run_id is None:
+            resume_wandb_run_id = resume_ckpt.get("wandb_run_id")
+        if resume_wandb_run_id is None:
+            resume_wandb_run_id = _infer_wandb_run_id(save_dir)
+
+        # Synthetic buffers are regenerated on each launch; skip replaying all previous
+        # epochs and start refreshing from the next epoch to keep resume practical.
+        _mark_buffered_dataset_resumed(train_dataset, start_epoch)
+        _mark_buffered_dataset_resumed(synthetic_val_dataset, start_epoch)
+
+        print(
+            f"Resuming training from checkpoint={resume_ckpt_path} "
+            f"epoch={start_epoch} global_step={global_step}"
+        )
+
+    if bool(getattr(cfg.training, "save_frozen_train_buffer", False)):
+        if float(cfg.dataset.buffer_refresh_fraction) != 0.0:
+            raise ValueError("training.save_frozen_train_buffer requires dataset.buffer_refresh_fraction=0")
+        frozen_train_buffer_path = _resolve_optional_project_path(getattr(cfg.training, "frozen_train_buffer_path", None))
+        if frozen_train_buffer_path is None:
+            frozen_train_buffer_path = os.path.join(save_dir, "frozen_train_buffer.pt")
+        train_dataset.save_buffer(frozen_train_buffer_path)
+        print(f"Saved frozen train buffer to {frozen_train_buffer_path}")
 
     run_name = str(cfg.wandb.name) if cfg.wandb.name is not None else str(cfg.experiment.name)
     if bool(cfg.wandb.enabled):
-        wandb.init(
-            project=str(cfg.wandb.project),
-            entity=None if cfg.wandb.entity is None else str(cfg.wandb.entity),
-            name=run_name,
-            mode=str(cfg.wandb.mode),
-            config=OmegaConf.to_container(cfg, resolve=True),
-        )
+        wandb_init_kwargs = {
+            "project": str(cfg.wandb.project),
+            "entity": None if cfg.wandb.entity is None else str(cfg.wandb.entity),
+            "name": run_name,
+            "mode": str(cfg.wandb.mode),
+            "config": OmegaConf.to_container(cfg, resolve=True),
+        }
+        if bool(getattr(cfg.training, "resume", False)):
+            if resume_wandb_run_id is None and str(getattr(cfg.wandb, "resume", "allow")).lower() == "must":
+                raise ValueError("wandb.resume=must requires a run_id when resuming")
+            if resume_wandb_run_id is not None:
+                wandb_init_kwargs["id"] = str(resume_wandb_run_id)
+                wandb_init_kwargs["resume"] = str(getattr(cfg.wandb, "resume", "allow"))
+        wandb.init(**wandb_init_kwargs)
     else:
         wandb.init(mode="disabled")
 
-    save_dir = _resolve_project_path(str(cfg.training.save_dir))
-    os.makedirs(save_dir, exist_ok=True)
+    active_wandb_run_id = None
+    if bool(cfg.wandb.enabled) and getattr(wandb, "run", None) is not None:
+        active_wandb_run_id = str(wandb.run.id)
+        with open(os.path.join(save_dir, "wandb_run_id.txt"), "w", encoding="utf-8") as f:
+            f.write(active_wandb_run_id)
+
     torch.save(
         {
             "robot_names": list(train_dataset.global_robot_names),
@@ -735,16 +857,21 @@ def main(cfg: DictConfig) -> None:
 
     metric_models = {name: spec["model"] for name, spec in val_dataset.robot_specs.items()}
     train_geometry_models = _build_training_geometry_models(train_dataset, device)
-    best_val = float("inf")
-    best_metric_key = "validate_real/action_mse_valid"
-    global_step = 0
     log_every_n_steps = int(max(1, cfg.training.log_every_n_steps))
     max_train_batches = int(cfg.training.max_train_batches)
     max_val_batches = int(cfg.training.max_val_batches)
     contact_geometry_loss_weight = float(getattr(cfg.training, "contact_geometry_loss_weight", 0.0))
     inactive_geometry_loss_weight = float(getattr(cfg.training, "inactive_geometry_loss_weight", 0.0))
 
-    for epoch in range(1, int(cfg.training.epochs) + 1):
+    if start_epoch > int(cfg.training.epochs):
+        print(
+            f"Checkpoint epoch {start_epoch - 1} already reaches/exceeds configured training.epochs="
+            f"{int(cfg.training.epochs)}. Nothing to do."
+        )
+        wandb.finish()
+        return
+
+    for epoch in range(start_epoch, int(cfg.training.epochs) + 1):
         train_dataset.prepare_epoch(epoch)
         model.train()
         train_losses: list[float] = []
@@ -875,9 +1002,14 @@ def main(cfg: DictConfig) -> None:
 
         wandb.log(epoch_log, step=global_step)
 
+        if float(epoch_log[best_metric_key]) < best_val:
+            best_val = float(epoch_log[best_metric_key])
+
         ckpt = {
             "epoch": epoch,
             "global_step": global_step,
+            "best_val": float(best_val),
+            "wandb_run_id": active_wandb_run_id,
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "lr_scheduler": lr_scheduler.state_dict(),
@@ -885,12 +1017,13 @@ def main(cfg: DictConfig) -> None:
         }
         if ema_model is not None:
             ckpt["ema_model"] = ema_model.state_dict()
+        if ema is not None:
+            ckpt["ema_state"] = ema.state_dict()
 
         torch.save(ckpt, os.path.join(save_dir, "last.pt"))
         if epoch % int(cfg.training.save_every_n_epoch) == 0:
             torch.save(ckpt, os.path.join(save_dir, f"epoch_{epoch}.pt"))
-        if float(epoch_log[best_metric_key]) < best_val:
-            best_val = float(epoch_log[best_metric_key])
+        if float(epoch_log[best_metric_key]) <= best_val:
             torch.save(ckpt, os.path.join(save_dir, "best.pt"))
 
         summary = (

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -88,6 +89,128 @@ def _sim_per_hand(payload: dict[str, Any]) -> dict[str, dict[str, float | int | 
             ),
         }
     return out
+
+
+def _select_sim_records(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for record in payload.get("records", []):
+        if not isinstance(record, dict):
+            continue
+        if record.get("error") is not None or not isinstance(record.get("summary"), dict):
+            continue
+        rows.append(record)
+    return rows
+
+
+def _sim_stats_from_rows(rows: list[dict[str, Any]]) -> dict[str, float | int | None]:
+    if not rows:
+        return {
+            "count": 0,
+            "in_hand_rate": None,
+            "robust_in_hand_rate": None,
+            "final_contact_rate": None,
+            "unstable_rate": None,
+            "pos_err_final_mean": None,
+            "rot_err_final_mean": None,
+            "final_hand_obj_distance_mean": None,
+        }
+    robust = [
+        bool(row.get("disturbance", {}).get("all_directions_in_hand"))
+        for row in rows
+        if isinstance(row.get("disturbance"), dict)
+    ]
+    finite_hand_dist = [
+        float(row["summary"]["final_hand_obj_distance"])
+        for row in rows
+        if np.isfinite(float(row["summary"]["final_hand_obj_distance"]))
+    ]
+    return {
+        "count": len(rows),
+        "in_hand_rate": float(np.mean([bool(row["summary"]["final_in_hand"]) for row in rows])),
+        "robust_in_hand_rate": float(np.mean(robust)) if robust else None,
+        "final_contact_rate": float(np.mean([bool(row["summary"]["final_contact"]) for row in rows])),
+        "unstable_rate": float(np.mean([bool(row.get("unstable", False)) for row in rows])),
+        "pos_err_final_mean": float(np.mean([float(row["summary"]["pos_err_final"]) for row in rows])),
+        "rot_err_final_mean": float(np.mean([float(row["summary"]["rot_err_final"]) for row in rows])),
+        "final_hand_obj_distance_mean": float(np.mean(finite_hand_dist)) if finite_hand_dist else None,
+    }
+
+
+def _sim_per_hand_from_rows(rows: list[dict[str, Any]]) -> dict[str, dict[str, float | int | None]]:
+    per_hand: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        per_hand.setdefault(str(row["robot_name"]), []).append(row)
+    return {hand: _sim_stats_from_rows(hand_rows) for hand, hand_rows in sorted(per_hand.items())}
+
+
+def _sample_lookup_by_result_index(validate_payload: dict[str, Any]) -> dict[int, dict[str, Any]]:
+    lookup: dict[int, dict[str, Any]] = {}
+    for idx, sample in enumerate(validate_payload.get("samples", [])):
+        if not isinstance(sample, dict):
+            continue
+        lookup[int(idx)] = sample
+        sample_id = sample.get("sample_id")
+        if sample_id is not None:
+            lookup[int(sample_id)] = sample
+    return lookup
+
+
+def _gt_match_selectors(
+    *,
+    validate_payload: dict[str, Any],
+    sim_payload: dict[str, Any],
+) -> set[tuple[str, str, int]]:
+    sample_lookup = _sample_lookup_by_result_index(validate_payload)
+    selectors: set[tuple[str, str, int]] = set()
+    for record in _select_sim_records(sim_payload):
+        meta = record.get("meta", {})
+        if not isinstance(meta, dict):
+            meta = {}
+        if str(meta.get("pair_status", "")) != "has-data":
+            continue
+        sample_ref = meta.get("global_index")
+        if sample_ref is None or int(sample_ref) < 0:
+            sample_ref = meta.get("sample_id")
+        if sample_ref is None or int(sample_ref) < 0:
+            continue
+        sample = sample_lookup.get(int(sample_ref))
+        if not isinstance(sample, dict):
+            continue
+        if sample.get("pair_status") != "has-data":
+            continue
+        selectors.add(
+            (
+                str(sample["robot_name"]),
+                str(sample["object_name"]),
+                int(sample["round_idx"]),
+            )
+        )
+    return selectors
+
+
+def _gt_record_sort_key(record: dict[str, Any]) -> tuple[int, int]:
+    meta = record.get("meta", {})
+    dataset_index = -1
+    if isinstance(meta, dict) and meta.get("dataset_index") is not None:
+        dataset_index = int(meta["dataset_index"])
+    return (dataset_index, int(record.get("index", -1)))
+
+
+def _select_gt_records(
+    payload: dict[str, Any],
+    selectors: set[tuple[str, str, int]],
+) -> list[dict[str, Any]]:
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    for record in _select_sim_records(payload):
+        grouped[(str(record["robot_name"]), str(record["object_name"]))].append(record)
+
+    matched: list[dict[str, Any]] = []
+    for (robot_name, object_name), rows in grouped.items():
+        rows_sorted = sorted(rows, key=_gt_record_sort_key)
+        for pair_rank, record in enumerate(rows_sorted):
+            if (robot_name, object_name, int(pair_rank)) in selectors:
+                matched.append(record)
+    return matched
 
 
 def _overall_validate(payload: dict[str, Any]) -> dict[str, float | int | None]:
@@ -200,9 +323,11 @@ def main() -> None:
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     splits = [str(x) for x in manifest["splits"]]
 
+    gt_payloads_by_split: dict[str, dict[str, Any]] = {}
     gt_by_split: dict[str, dict[str, Any]] = {}
     for split in splits:
         gt_sim_payload = _load_pt(str(manifest["gt"][split]["sim_gt_pt"]))
+        gt_payloads_by_split[split] = gt_sim_payload
         gt_by_split[split] = {
             "overall": _overall_sim(gt_sim_payload),
             "per_hand": _sim_per_hand(gt_sim_payload),
@@ -222,7 +347,16 @@ def main() -> None:
             validate_per_hand = _validate_per_hand(validate_payload)
             sim_overall = _overall_sim(sim_payload)
             sim_per_hand = _sim_per_hand(sim_payload)
-            gt_split = gt_by_split[split]
+            selected_selectors = _gt_match_selectors(
+                validate_payload=validate_payload,
+                sim_payload=sim_payload,
+            )
+            gt_rows = _select_gt_records(
+                gt_payloads_by_split[split],
+                selectors=selected_selectors,
+            )
+            gt_overall = _sim_stats_from_rows(gt_rows)
+            gt_per_hand = _sim_per_hand_from_rows(gt_rows)
 
             overall_rows_by_split[split].append(
                 {
@@ -237,16 +371,16 @@ def main() -> None:
                     "sim_pos_err_final_mean": sim_overall["pos_err_final_mean"],
                     "sim_rot_err_final_mean": sim_overall["rot_err_final_mean"],
                     "sim_final_hand_obj_distance_mean": sim_overall["final_hand_obj_distance_mean"],
-                    "gt_in_hand_rate": gt_split["overall"]["in_hand_rate"],
-                    "gt_robust_in_hand_rate": gt_split["overall"]["robust_in_hand_rate"],
+                    "gt_in_hand_rate": gt_overall["in_hand_rate"],
+                    "gt_robust_in_hand_rate": gt_overall["robust_in_hand_rate"],
                 }
             )
 
-            all_hands = sorted(set(validate_per_hand.keys()) | set(sim_per_hand.keys()) | set(gt_split["per_hand"].keys()))
+            all_hands = sorted(set(validate_per_hand.keys()) | set(sim_per_hand.keys()))
             for hand in all_hands:
                 v = validate_per_hand.get(hand, {})
                 s = sim_per_hand.get(hand, {})
-                g = gt_split["per_hand"].get(hand, {})
+                g = gt_per_hand.get(hand, {})
                 per_hand_rows_by_split[split].append(
                     {
                         "model_label": model_label,

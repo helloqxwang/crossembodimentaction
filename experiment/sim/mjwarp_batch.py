@@ -211,6 +211,22 @@ def _final_contact_mask(
     return out
 
 
+def _final_hand_object_distance(
+    runtime: MjWarpRuntime,
+    bundle: ValidationModelBundle,
+    object_pos: torch.Tensor,
+) -> torch.Tensor:
+    if not bundle.meta.hand_geom_ids:
+        return torch.full(
+            (runtime.num_worlds,),
+            float("nan"),
+            dtype=torch.float32,
+            device=runtime.torch_device,
+        )
+    geom_xpos = wp.to_torch(runtime.data_wp.geom_xpos)[:, list(bundle.meta.hand_geom_ids), :]
+    return torch.linalg.vector_norm(geom_xpos - object_pos[:, None, :], dim=2).amin(dim=1)
+
+
 def _rollout_static_batch(
     runtime: MjWarpRuntime,
     bundle: ValidationModelBundle,
@@ -346,16 +362,12 @@ def _rollout_static_batch(
 
     xpos = wp.to_torch(runtime.data_wp.xpos)
     final_contact = _final_contact_mask(runtime, bundle) & (~unstable)
-    if meta.hand_root_body_id is not None:
-        hand_root_pos = xpos[:, meta.hand_root_body_id, :]
-        final_hand_obj_distance = torch.linalg.vector_norm(last_obj_pos - hand_root_pos, dim=1)
-    else:
-        final_hand_obj_distance = torch.full(
-            (num_worlds,),
-            float("nan"),
-            dtype=torch.float32,
-            device=runtime.torch_device,
-        )
+    final_hand_obj_distance = _final_hand_object_distance(runtime, bundle, last_obj_pos)
+    final_hand_obj_distance = torch.where(
+        unstable,
+        torch.full_like(final_hand_obj_distance, float("nan")),
+        final_hand_obj_distance,
+    )
     final_in_hand = (~unstable) & final_contact & (final_hand_obj_distance <= float(in_hand_distance_threshold))
 
     valid_steps_float = valid_steps.to(dtype=torch.float32).clamp(min=1.0)

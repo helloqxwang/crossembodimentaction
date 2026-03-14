@@ -75,7 +75,11 @@ def _aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
         ]
         pos_final = [float(row["summary"]["pos_err_final"]) for row in rows]
         rot_final = [float(row["summary"]["rot_err_final"]) for row in rows]
-        hand_obj_dist = [float(row["summary"]["final_hand_obj_distance"]) for row in rows]
+        hand_obj_dist = [
+            float(row["summary"]["final_hand_obj_distance"])
+            for row in rows
+            if np.isfinite(float(row["summary"]["final_hand_obj_distance"]))
+        ]
         return {
             "count": len(rows),
             "in_hand_rate": float(np.mean(in_hand)),
@@ -86,7 +90,7 @@ def _aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
             "pos_err_final_max": float(np.max(pos_final)),
             "rot_err_final_mean": float(np.mean(rot_final)),
             "rot_err_final_max": float(np.max(rot_final)),
-            "final_hand_obj_distance_mean": float(np.mean(hand_obj_dist)),
+            "final_hand_obj_distance_mean": float(np.mean(hand_obj_dist)) if hand_obj_dist else float("nan"),
         }
 
     aggregate = {
@@ -122,8 +126,16 @@ def _aggregate(records: list[dict[str, Any]]) -> dict[str, Any]:
             float(np.max([float(row["summary"]["rot_err_final"]) for row in valid])) if valid else float("nan")
         ),
         "final_hand_obj_distance_mean": (
-            float(np.mean([float(row["summary"]["final_hand_obj_distance"]) for row in valid]))
-            if valid
+            float(
+                np.mean(
+                    [
+                        float(row["summary"]["final_hand_obj_distance"])
+                        for row in valid
+                        if np.isfinite(float(row["summary"]["final_hand_obj_distance"]))
+                    ]
+                )
+            )
+            if any(np.isfinite(float(row["summary"]["final_hand_obj_distance"])) for row in valid)
             else float("nan")
         ),
         "per_hand": {hand: _stats(rows) for hand, rows in sorted(by_hand.items())},
