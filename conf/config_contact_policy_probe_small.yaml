@@ -4,10 +4,12 @@ defaults:
 seed: 42
 
 experiment:
-  name: contact_policy_probe_big_${probe.task}
+  name: contact_policy_probe_${probe.task}
 
 probe:
-  task: tips_movable_base  # tips_fixed_base, tips_movable_base, patches_movable_base
+  contact_mode: patches  # tips or patches
+  base_mode: movable  # fixed or movable
+  task: ${probe.contact_mode}_${probe.base_mode}_base
   robot_name: shadowhand
   train_samples: 1000000
   test_samples: 1000
@@ -65,8 +67,8 @@ dataset:
   patch_points_per_anchor_min: 28
   patch_points_per_anchor_max: 84
   patch_penetration_clearance: 0.00008
-  q2_base_translation_min: [-0.10, -0.10, -0.10]
-  q2_base_translation_max: [0.10, 0.10, 0.10]
+  q2_base_translation_min: [-0.02, -0.02, -0.02]
+  q2_base_translation_max: [0.02, 0.02, 0.02]
   q2_base_rotation_mode: uniform_so3
 
 model:
@@ -115,13 +117,13 @@ training:
   log_every_n_steps: 10
   eval_every_n_epochs: 4
   save_every_n_epoch: 10
-  save_dir: ./checkpoints/contact_policy_probe_big/${probe.task}
+  save_dir: ./checkpoints/contact_policy_probe/${probe.task}_lessmovable
 
 wandb:
   enabled: true
   project: action_repr
   entity: null
-  name: contact-policy-probe-big-${probe.task}
+  name: contact-policy-probe-${probe.task}
   mode: online
   resume: allow
   run_id: null
@@ -139,6 +141,6 @@ visualization:
 
 hydra:
   run:
-    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}_contact_policy_probe_big
+    dir: outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}_contact_policy_probe
   job:
     chdir: false

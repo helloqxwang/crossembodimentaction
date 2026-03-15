@@ -7,7 +7,9 @@ experiment:
   name: contact_policy_probe_big_${probe.task}
 
 probe:
-  task: tips_movable_base  # tips_fixed_base, tips_movable_base, patches_movable_base
+  contact_mode: patches  # tips or patches
+  base_mode: movable  # fixed or movable
+  task: ${probe.contact_mode}_${probe.base_mode}_base
   robot_name: shadowhand
   train_samples: 1000000
   test_samples: 1000

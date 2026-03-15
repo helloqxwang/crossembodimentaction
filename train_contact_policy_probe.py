@@ -309,7 +309,7 @@ def _compute_probe_test_metrics(
     }
 
 
-@hydra.main(version_base="1.2", config_path="conf", config_name="config_contact_policy_probe")
+@hydra.main(version_base="1.2", config_path="conf", config_name="config_contact_policy_probe_small")
 def main(cfg: DictConfig) -> None:
     print("******************************** [Config] ********************************")
     print(OmegaConf.to_yaml(cfg))
@@ -459,6 +459,8 @@ def main(cfg: DictConfig) -> None:
     torch.save(
         {
             "task": str(cfg.probe.task),
+            "contact_mode": str(getattr(train_dataset, "contact_mode", "")),
+            "base_mode": str(getattr(train_dataset, "base_mode", "")),
             "robot_name": str(cfg.probe.robot_name),
             "action_dim": int(train_dataset.action_dim),
             "surface_num_points": int(train_dataset.surface_num_points),

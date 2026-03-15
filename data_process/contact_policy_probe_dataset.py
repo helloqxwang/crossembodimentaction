@@ -22,8 +22,27 @@ from data_process.contact_policy_dataset import (
 # the original cross-embodiment contact-policy setting.
 class ShadowhandContactPolicyProbeDataset(Dataset, _BaseContactPolicyDataset):
     _TASK_FIXED_TIPS = {"tips_fixed_base", "tips_movable_base"}
-    _TASK_PATCHES = {"patches_movable_base"}
+    _TASK_PATCHES = {"patches_fixed_base", "patches_movable_base"}
     _SUPPORTED_TASKS = _TASK_FIXED_TIPS | _TASK_PATCHES
+
+    @classmethod
+    def _parse_task_modes(cls, task: str) -> tuple[str, str, str]:
+        task_key = str(task).strip().lower()
+        if task_key not in cls._SUPPORTED_TASKS:
+            raise ValueError(f"Unsupported probe task={task}. Expected one of {sorted(cls._SUPPORTED_TASKS)}")
+        if task_key.startswith("tips_"):
+            contact_mode = "tips"
+        elif task_key.startswith("patches_"):
+            contact_mode = "patches"
+        else:
+            raise ValueError(f"Unsupported probe task prefix for {task}")
+        if task_key.endswith("fixed_base"):
+            base_mode = "fixed"
+        elif task_key.endswith("movable_base"):
+            base_mode = "movable"
+        else:
+            raise ValueError(f"Unsupported probe task suffix for {task}")
+        return task_key, contact_mode, base_mode
 
     def __init__(
         self,
@@ -47,9 +66,7 @@ class ShadowhandContactPolicyProbeDataset(Dataset, _BaseContactPolicyDataset):
     ) -> None:
         Dataset.__init__(self)
         # Probe-task identity determines what observation is built and whether the base pose moves.
-        self.task = str(task).strip().lower()
-        if self.task not in self._SUPPORTED_TASKS:
-            raise ValueError(f"Unsupported probe task={task}. Expected one of {sorted(self._SUPPORTED_TASKS)}")
+        self.task, self.contact_mode, self.base_mode = self._parse_task_modes(task)
         self.robot_name = str(robot_name)
         self.samples = int(samples)
         if self.samples <= 0:
@@ -57,7 +74,7 @@ class ShadowhandContactPolicyProbeDataset(Dataset, _BaseContactPolicyDataset):
         self.build_batch_size = int(max(1, build_batch_size))
         self.progress_label = str(progress_label)
         self.fixed_tip_links = tuple(str(x) for x in fixed_tip_links)
-        if self.task in self._TASK_FIXED_TIPS and len(self.fixed_tip_links) != 2:
+        if self.contact_mode == "tips" and len(self.fixed_tip_links) != 2:
             raise ValueError(
                 f"Fixed-tip probe tasks require exactly 2 fixed_tip_links, got {self.fixed_tip_links}"
             )
@@ -75,8 +92,8 @@ class ShadowhandContactPolicyProbeDataset(Dataset, _BaseContactPolicyDataset):
                 "thdistal",
             )
         self.allowed_contact_link_names = tuple(str(x) for x in allowed_contact_link_names)
-        self.supervise_base_pose = self.task != "tips_fixed_base"
-        effective_max_contact_points = 2 if self.task in self._TASK_FIXED_TIPS else int(max_contact_points)
+        self.supervise_base_pose = self.base_mode == "movable"
+        effective_max_contact_points = 2 if self.contact_mode == "tips" else int(max_contact_points)
 
         if load_buffer_path is not None and load_buffer_payload is not None:
             raise ValueError("Only one of load_buffer_path or load_buffer_payload may be provided")
@@ -106,7 +123,7 @@ class ShadowhandContactPolicyProbeDataset(Dataset, _BaseContactPolicyDataset):
         allowed_point_prob = self.spec["point_prob"][self.allowed_surface_indices].float()
         self.allowed_point_prob = allowed_point_prob / allowed_point_prob.sum().clamp_min(1e-8)
         self.fixed_tip_point_indices = (
-            self._resolve_fixed_tip_point_indices() if self.task in self._TASK_FIXED_TIPS else None
+            self._resolve_fixed_tip_point_indices() if self.contact_mode == "tips" else None
         )
 
         self.probe_component_range = tuple(int(x) for x in probe_component_range)
@@ -417,7 +434,7 @@ class ShadowhandContactPolicyProbeDataset(Dataset, _BaseContactPolicyDataset):
         batch_size: int,
         generator: torch.Generator,
     ) -> tuple[Dict[str, torch.Tensor], Dict[str, int]]:
-        if self.task in self._TASK_FIXED_TIPS:
+        if self.contact_mode == "tips":
             return self._build_fixed_tip_batch(int(batch_size), generator)
         return self._build_patch_batch(int(batch_size), generator)
 
@@ -446,7 +463,7 @@ class ShadowhandContactPolicyProbeDataset(Dataset, _BaseContactPolicyDataset):
             offset += cur
             progress.update(cur)
         progress.close()
-        if self.task in self._TASK_PATCHES:
+        if self.contact_mode == "patches":
             print(
                 _format_contact_count_interval_summary(
                     f"{self.progress_label}:{self.robot_name}",
@@ -513,6 +530,8 @@ class ShadowhandContactPolicyProbeDataset(Dataset, _BaseContactPolicyDataset):
         return {
             "meta": {
                 "task": self.task,
+                "contact_mode": self.contact_mode,
+                "base_mode": self.base_mode,
                 "robot_name": self.robot_name,
                 "samples": int(self.samples),
                 "max_contact_points": int(self.max_contact_points),
